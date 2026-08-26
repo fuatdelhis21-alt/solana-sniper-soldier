@@ -1,4 +1,4 @@
-//! # hft-marketdata — Piyasa Verisi Katmanı
+﻿//! # hft-marketdata — Piyasa Verisi Katmanı
 //!
 //! Ultra-low-latency Solana trading platformunun **market data** katmanı. Ham
 //! kaynak (Yellowstone/Geyser gRPC, replay veya simülasyon) olaylarını,
@@ -40,8 +40,10 @@ pub mod dedup;
 pub mod event;
 pub mod geyser;
 pub mod latency;
+pub mod mock_provider;
 pub mod pipeline;
 pub mod ring;
+pub mod solana_ws;
 pub mod source;
 
 // Sık kullanılan tipleri kolay erişim için yeniden dışa aktar (re-export).
@@ -52,3 +54,26 @@ pub use latency::LatencyMonitor;
 pub use pipeline::{MarketDataPipeline, PipelineConfig, PipelineStats};
 pub use ring::SlotRingBuffer;
 pub use source::{MarketDataSource, SimulatedSource, SourcePoll};
+
+// =============================================================================
+// Basit fiyat sorgu arayüzü (mock_provider / solana_ws modülleri için).
+// Remote HSM / pipeline mimarisinden bağımsız, yalnızca fiyat sorgulama
+// amacıyla kullanılan hafif tipler.
+// =============================================================================
+
+use serde::{Deserialize, Serialize};
+
+/// Basit bir fiyat teklifi (symbol → bid/ask).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PriceQuote {
+    pub symbol: String,
+    pub bid: f64,
+    pub ask: f64,
+    pub timestamp_ms: u128,
+}
+
+/// Fiyat akışı sağlayıcıları için ortak arayüz.
+pub trait MarketDataHandler {
+    fn start_stream(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn get_latest_price(&self, symbol: &str) -> Option<PriceQuote>;
+}

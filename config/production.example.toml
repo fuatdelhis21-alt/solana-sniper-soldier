@@ -1,0 +1,10 @@
+# Production example configuration
+[general]
+environment = "production"
+
+[telemetry]
+json_logs = true
+log_level = "info"
+
+[market_data]
+grpc_endpoint = ""

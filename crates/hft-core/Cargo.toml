@@ -1,0 +1,13 @@
+[package]
+name = "hft-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core types and utilities for HFT platform"
+
+[dependencies]
+serde = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }

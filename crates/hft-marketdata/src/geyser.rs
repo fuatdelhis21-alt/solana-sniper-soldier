@@ -521,11 +521,7 @@ mod live {
 
     /// Yellowstone `UpdateOneof` varyantını platformun `MarketEvent`'ine çevirir.
     /// Desteklenmeyen/ilgisiz güncellemeler için `None` döner.
-    fn map_update(
-        oneof: UpdateOneof,
-        sequence: &mut u64,
-        now_ns: u64,
-    ) -> Option<MarketEvent> {
+    fn map_update(oneof: UpdateOneof, sequence: &mut u64, now_ns: u64) -> Option<MarketEvent> {
         use crate::event::MarketEventKind;
 
         match oneof {

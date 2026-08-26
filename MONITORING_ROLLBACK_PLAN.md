@@ -1,4 +1,4 @@
-# Solana HFT Platform — Monitoring & Rollback Strategy
+﻿# Solana HFT Platform — Monitoring & Rollback Strategy
 
 ## Monitoring Setup
 

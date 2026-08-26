@@ -1,9 +1,9 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = [
-    "crates/hft-core",
-    "crates/hft-marketdata",
-    "crates/hft-execution",
+    "crates/*",
+    "solana-sniper",
+    "tools/hsm_server",
 ]
 
 [workspace.package]
@@ -13,7 +13,7 @@ rust-version = "1.75"
 license = "MIT"
 authors = ["Solana HFT Platform Team"]
 repository = "https://github.com/example/solana-hft-platform"
-description = "Ultra-low-latency, production-grade Solana trading platform çekirdeği"
+description = "Ultra-low-latency, production-grade Solana trading platform"
 
 [workspace.dependencies]
 thiserror = "1.0"
@@ -33,25 +33,30 @@ notify = "6.1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["full"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+bincode = "1"
+chrono = "0.4"
+hex = "0.4"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+base64 = "0.22"
+
+# Solana deps
+solana-sdk = "2.2"
+solana-client = "2.2"
+solana-program = "2.2"
+solana-account-decoder = "2.2"
+solana-transaction = "2.2"
+solana-rpc-client = "2.2"
+solana-rpc-client-api = "2.2"
+solana-signature = "2.2"
+solana-pubkey = "2.2"
+solana-commitment-config = "2.2"
+solana-compute-budget-interface = "2.2"
 
 hft-core = { path = "crates/hft-core" }
-hft-config = { path = "crates/hft-config" }
-hft-telemetry = { path = "crates/hft-telemetry" }
 hft-marketdata = { path = "crates/hft-marketdata" }
-hft-signals = { path = "crates/hft-signals" }
-hft-risk = { path = "crates/hft-risk" }
 hft-execution = { path = "crates/hft-execution" }
-hft-security = { path = "crates/hft-security" }
-hft-app = { path = "crates/hft-app" }
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
-[profile.bench]
-opt-level = 3
-lto = "thin"
-debug = true

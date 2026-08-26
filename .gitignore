@@ -1,0 +1,69 @@
+# ===== Secrets — NEVER commit =====
+.env
+.env.*
+!.env.example
+wallet.json
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+*.p12
+*.pfx
+
+# ===== Build artifacts =====
+target/
+**/target/
+*.exe
+*.msi
+*.dll
+*.o
+*.a
+*.so
+*.dylib
+
+# ===== Rust =====
+Cargo.lock.bak
+Cargo.toml.bak
+*.bak
+
+# ===== Runtime data & logs =====
+data/
+logs/
+*.log
+*.jsonl
+
+# ===== IDE / OS =====
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini
+
+# ===== Stale copies / junk =====
+solana-hft-platform/
+Yeni Klasör/
+rustup-init.exe
+build_check.txt
+build_log*.txt
+build_log*.log
+build_output*.txt
+build_output*.log
+build_result*.txt
+build_sniper.log
+client_mtls_*.log
+hsm_mtls_build.log
+hsm_start.log
+dryrun_*.txt
+dryrun_*.log
+test_output.log
+send_transfer_*.txt
+
+# ===== Local machine-specific cargo config =====
+.cargo/config.toml
+
+# ===== HSM cert generation logs =====
+tools/hsm_server/certs/gen_log.txt
+tools/hsm_server/certs/listing.txt
