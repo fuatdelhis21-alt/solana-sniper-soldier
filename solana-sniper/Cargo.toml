@@ -1,0 +1,58 @@
+﻿[package]
+name = "solana-sniper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["Solana HFT Platform Team"]
+repository = "https://github.com/example/solana-hft-platform"
+description = "Ultra-low-latency, production-grade Solana trading platform"
+
+[dependencies]
+hft-core.workspace = true
+hft-marketdata.workspace = true
+hft-execution.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+chrono.workspace = true
+hex.workspace = true
+bincode.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+solana-sdk.workspace = true
+solana-client.workspace = true
+solana-program.workspace = true
+solana-rpc-client.workspace = true
+solana-rpc-client-api.workspace = true
+solana-signature.workspace = true
+solana-pubkey.workspace = true
+solana-commitment-config.workspace = true
+
+sha2.workspace = true
+byteorder.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+
+[[bin]]
+name = "send_transfer"
+path = "src/bin/send_transfer.rs"
+
+[[bin]]
+name = "solana-sniper"
+path = "src/main.rs"
+
+[[bin]]
+name = "sign_test"
+path = "src/bin/sign_test.rs"
+
+[[bin]]
+name = "ledger_sign_test"
+path = "src/bin/ledger_sign_test.rs"

@@ -1,4 +1,4 @@
-# Solana HFT Platform — Deployment Checklist
+﻿# Solana HFT Platform — Deployment Checklist
 
 ## ✅ Tamamlanan
 

@@ -1,88 +1,65 @@
-//! # Jito MEV Bundle Backend
+//! # Standart Solana RPC Backend (Fallback)
 //!
-//! Emirleri **Jito Block Engine** REST API'sine bundle olarak gönderir
-//! (MEV-korumalı, atomik yürütme). Önceden imzalanmış (pre-signed) serialized
-//! transaction bytes'ları bir [`TransactionStore`] içinde `client_order_id`
-//! anahtarıyla saklar.
-//!
-//! ## Neden pre-signed transaction store?
-//! `ExecutionBackend::submit` senkron ve saf tutulur (üst katmandaki
-//! retry/fallback/circuit mantığını deterministik kılmak için). İmzalama ve
-//! serileştirme, gönderimden önce ayrı bir aşamada yapılır; sonuçta oluşan
-//! ham byte'lar `client_order_id` ile store'a yazılır. `submit()` yalnızca bu
-//! byte'ları alıp ağa iletir.
-//!
-//! ## Feature Flag
-//! Gerçek HTTP bağımlılıkları (`reqwest`, `tokio`, `base64`) yalnızca `live`
-//! feature'ı etkinken derlenir. Feature kapalıyken yapılar ve `TransactionStore`
-//! yine kullanılabilir; `submit()` ise ağ katmanının devre dışı olduğunu
-//! bildiren bir `Permanent` sonuç döndürür. Böylece varsayılan `cargo check`
-//! ağır bağımlılıklar olmadan hatasız geçer.
+//! Standart Solana RPC `sendTransaction` çağrısını yapar.
+//! Jito bundle başarısız olduğunda yedek (fallback) yol olarak kullanılır.
 
 use crate::backend::{ExecutionBackend, SubmitResult};
 use crate::order::{ExecutionRoute, Order};
 use crate::TransactionStore;
 
-/// Mainnet Jito Block Engine bundle endpoint'i (varsayılan).
-pub const DEFAULT_JITO_ENDPOINT: &str = "https://mainnet.block-engine.jito.labs";
-
-/// Jito Block Engine bundle backend'i yapılandırması.
+/// Standart Solana RPC backend'i yapılandırması.
 #[derive(Debug, Clone)]
-pub struct JitoConfig {
-    /// Block Engine temel URL'i.
+pub struct RpcConfig {
+    /// RPC endpoint URL'i.
     pub endpoint: String,
-    /// Opsiyonel yetkilendirme token'ı.
-    pub auth_token: Option<String>,
+    /// Opsiyonel API anahtarı.
+    pub api_key: Option<String>,
     /// HTTP isteği zaman aşımı (milisaniye).
     pub timeout_ms: u64,
+    /// Pre-flight simülasyonunu atla.
+    pub skip_preflight: bool,
 }
 
-impl Default for JitoConfig {
+impl Default for RpcConfig {
     fn default() -> Self {
-        JitoConfig {
-            endpoint: DEFAULT_JITO_ENDPOINT.to_string(),
-            auth_token: None,
+        RpcConfig {
+            endpoint: "https://api.mainnet-beta.solana.com".to_string(),
+            api_key: None,
             timeout_ms: 5_000,
+            skip_preflight: true,
         }
     }
 }
 
-impl JitoConfig {
+impl RpcConfig {
     /// Verilen endpoint ile yapılandırma oluşturur.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        JitoConfig {
+        RpcConfig {
             endpoint: endpoint.into(),
             ..Default::default()
         }
     }
-
-    /// Auth token ekler (builder tarzı).
-    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
-        self
-    }
 }
 
-/// Jito bundle yürütme backend'i.
-pub struct JitoBackend {
-    config: JitoConfig,
+/// Standart Solana RPC yürütme backend'i.
+pub struct RpcBackend {
+    config: RpcConfig,
     /// Emir kimliği → serialized tx deposu.
     store: TransactionStore,
-    /// Canlı HTTP istemcisi (yalnızca `live` feature'ında).
     #[cfg(feature = "live")]
     client: reqwest::blocking::Client,
 }
 
-impl JitoBackend {
-    /// Yeni bir Jito backend'i oluşturur.
-    pub fn new(config: JitoConfig) -> Self {
+impl RpcBackend {
+    /// Yeni bir RPC backend'i oluşturur.
+    pub fn new(config: RpcConfig) -> Self {
         #[cfg(feature = "live")]
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
             .expect("reqwest blocking client kurulamadı");
 
-        JitoBackend {
+        RpcBackend {
             config,
             store: TransactionStore::new(),
             #[cfg(feature = "live")]
@@ -105,15 +82,17 @@ impl JitoBackend {
         &mut self.store
     }
 
-    /// `sendBundle` JSON-RPC gövdesini oluşturur.
-    fn build_bundle_body(tx_b64: &str) -> String {
-        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[["{tx_b64}"]]}}"#)
+    /// `sendTransaction` JSON-RPC gövdesini oluşturur.
+    fn build_send_tx_body(tx_b64: &str, skip_preflight: bool) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{tx_b64}",{{"encoding":"base64","skipPreflight":{skip_preflight},"maxRetries":0}}]}}"#
+        )
     }
 }
 
-impl ExecutionBackend for JitoBackend {
+impl ExecutionBackend for RpcBackend {
     fn route(&self) -> ExecutionRoute {
-        ExecutionRoute::JitoBundle
+        ExecutionRoute::Rpc
     }
 
     fn submit(&mut self, order: &Order) -> SubmitResult {
@@ -129,43 +108,39 @@ impl ExecutionBackend for JitoBackend {
             }
         };
 
-        self.submit_bundle(&raw)
+        self.submit_rpc(&raw)
     }
 }
 
-impl JitoBackend {
+impl RpcBackend {
     /// Canlı destek DEVRE DIŞI: ağ yok, kalıcı hata döner.
     #[cfg(not(feature = "live"))]
-    fn submit_bundle(&self, _raw: &[u8]) -> SubmitResult {
-        tracing::warn!(target: "jito", "canlı Jito desteği derlenmedi (feature = live kapalı)");
+    fn submit_rpc(&self, _raw: &[u8]) -> SubmitResult {
+        tracing::warn!(target: "rpc", "canlı RPC desteği derlenmedi (feature = live kapalı)");
         SubmitResult::Permanent {
-            detail: "canlı Jito desteği devre dışı — crate'i `--features live` ile derleyin".into(),
+            detail: "canlı RPC desteği devre dışı — crate'i `--features live` ile derleyin".into(),
         }
     }
 
-    /// Canlı destek ETKİN: transaction'ı base64'e kodla ve Jito'ya gönder.
+    /// Canlı destek ETKİN: transaction'ı RPC sendTransaction ile gönder.
     #[cfg(feature = "live")]
-    fn submit_bundle(&self, raw: &[u8]) -> SubmitResult {
+    fn submit_rpc(&self, raw: &[u8]) -> SubmitResult {
         use base64::Engine;
 
         let tx_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-        let body = Self::build_bundle_body(&tx_b64);
-        let url = format!(
-            "{}/api/v1/bundles",
-            self.config.endpoint.trim_end_matches('/')
-        );
+        let body = Self::build_send_tx_body(&tx_b64, self.config.skip_preflight);
 
         let mut req = self
             .client
-            .post(&url)
+            .post(&self.config.endpoint)
             .header("Content-Type", "application/json")
             .body(body);
 
-        if let Some(token) = &self.config.auth_token {
-            req = req.header("Authorization", token.clone());
+        if let Some(key) = &self.config.api_key {
+            req = req.header("Authorization", key.clone());
         }
 
-        tracing::info!(target: "jito", %url, "Jito bundle gönderiliyor");
+        tracing::info!(target: "rpc", endpoint = %self.config.endpoint, "RPC sendTransaction");
 
         match req.send() {
             Ok(resp) => {
@@ -173,31 +148,26 @@ impl JitoBackend {
                 let text = resp.text().unwrap_or_default();
                 if status.is_success() {
                     match parse_rpc_result(&text) {
-                        Some(bundle_id) => {
-                            tracing::info!(target: "jito", %bundle_id, "bundle kabul edildi");
-                            SubmitResult::Ok {
-                                signature: bundle_id,
-                            }
-                        }
+                        Some(signature) => SubmitResult::Ok { signature },
                         None => SubmitResult::Retryable {
-                            detail: format!("Jito yanıtı ayrıştırılamadı: {text}"),
+                            detail: format!("RPC yanıtı ayrıştırılamadı: {text}"),
                         },
                     }
                 } else if status.is_server_error() || status.as_u16() == 429 {
                     SubmitResult::Retryable {
-                        detail: format!("Jito HTTP {status}: {text}"),
+                        detail: format!("RPC HTTP {status}: {text}"),
                     }
                 } else {
                     SubmitResult::Permanent {
-                        detail: format!("Jito HTTP {status}: {text}"),
+                        detail: format!("RPC HTTP {status}: {text}"),
                     }
                 }
             }
             Err(e) if e.is_timeout() || e.is_connect() => SubmitResult::Retryable {
-                detail: format!("Jito ağ hatası: {e}"),
+                detail: format!("RPC ağ hatası: {e}"),
             },
             Err(e) => SubmitResult::Permanent {
-                detail: format!("Jito istek hatası: {e}"),
+                detail: format!("RPC istek hatası: {e}"),
             },
         }
     }
@@ -234,19 +204,19 @@ mod tests {
             quantity: 1,
             limit_price: 1_000_000_000,
             created_at_ns: 0,
-            route: ExecutionRoute::JitoBundle,
+            route: ExecutionRoute::Rpc,
         }
     }
 
     #[test]
-    fn jito_backend_route() {
-        let b = JitoBackend::new(JitoConfig::default());
-        assert_eq!(b.route(), ExecutionRoute::JitoBundle);
+    fn rpc_backend_route() {
+        let b = RpcBackend::new(RpcConfig::default());
+        assert_eq!(b.route(), ExecutionRoute::Rpc);
     }
 
     #[test]
-    fn jito_kayitsiz_tx_permanent() {
-        let mut b = JitoBackend::new(JitoConfig::default());
+    fn rpc_kayitsiz_tx_permanent() {
+        let mut b = RpcBackend::new(RpcConfig::default());
         assert!(matches!(
             b.submit(&order(1)),
             SubmitResult::Permanent { .. }
@@ -254,15 +224,16 @@ mod tests {
     }
 
     #[test]
-    fn jito_bundle_body_formati() {
-        let body = JitoBackend::build_bundle_body("AAAA");
-        assert!(body.contains("\"method\":\"sendBundle\""));
-        assert!(body.contains("[[\"AAAA\"]]"));
+    fn rpc_send_tx_body_formati() {
+        let body = RpcBackend::build_send_tx_body("AAAA", true);
+        assert!(body.contains("\"method\":\"sendTransaction\""));
+        assert!(body.contains("\"skipPreflight\":true"));
+        assert!(body.contains("\"maxRetries\":0"));
     }
 
     #[test]
     fn register_tx_sonrasi_store_dolu() {
-        let mut b = JitoBackend::new(JitoConfig::new("https://x"));
+        let mut b = RpcBackend::new(RpcConfig::new("https://x"));
         b.register_tx(5, vec![9, 9]);
         assert_eq!(b.store().get(5), Some(&[9, 9][..]));
     }

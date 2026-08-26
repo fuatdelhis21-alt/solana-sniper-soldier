@@ -1,4 +1,4 @@
-//! # Piyasa Verisi Tipleri (Market Data Types)
+﻿//! # Piyasa Verisi Tipleri (Market Data Types)
 //!
 //! Fiyat, order book ve trade gibi temel piyasa verisi yapıları.
 //!

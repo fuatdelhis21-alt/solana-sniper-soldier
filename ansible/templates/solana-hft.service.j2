@@ -1,0 +1,16 @@
+[Unit]
+Description=Solana HFT Platform
+After=network.target
+
+[Service]
+Type=simple
+User=solana
+Group=solana
+WorkingDirectory=/opt/solana-hft
+ExecStart=/opt/solana-hft/bin/solana-hft --config /etc/solana-hft/config.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+---
+ - name: Deploy Solana HFT Platform
+   hosts: hft_nodes
+   become: yes
+   vars:
+     release_dir: /opt/solana-hft
+     service_name: solana-hft
+
+   tasks:
+     - name: Ensure release directory exists
+       file:
+         path: "{{ release_dir }}"
+         state: directory
+         owner: root
+         group: root
+         mode: '0755'
+
+     - name: Upload artifact
+       unarchive:
+         src: "{{ lookup('env','ARTIFACT_PATH') }}"
+         dest: "{{ release_dir }}"
+         remote_src: yes
+
+     - name: Copy systemd unit
+       template:
+         src: solana-hft.service.j2
+         dest: /etc/systemd/system/{{ service_name }}.service
+         owner: root
+         group: root
+         mode: '0644'
+
+     - name: Reload systemd
+       systemd:
+         daemon_reload: yes
+
+     - name: Enable and start service
+       systemd:
+         name: "{{ service_name }}"
+         state: restarted
+         enabled: yes
