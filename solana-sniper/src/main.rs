@@ -34,9 +34,11 @@ mod decision;
 mod executor;
 mod hw_signer;
 mod jito;
+mod metrics;
 mod remote_hsm;
 mod retry;
 mod risk;
+mod strategy;
 mod tx;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
@@ -67,6 +69,11 @@ struct Args {
     /// Live mode: actually submit transactions to the network
     #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
     live: bool,
+
+    /// Paper-trading mode: run the strategy on simulated market data, never
+    /// submit any on-chain transaction. Mutually exclusive with live/dry-run.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["live", "dry_run"])]
+    paper: bool,
 
     /// Number of iterations (simulation mode only)
     #[arg(long, default_value_t = 30)]
@@ -135,12 +142,16 @@ fn load_keypair(path: &PathBuf) -> Result<Keypair, Box<dyn std::error::Error>> {
 fn validate_signing_config(
     live: bool,
     dry_run: bool,
+    paper: bool,
     hsm_endpoint: &Option<String>,
     hsm_ca: &Option<PathBuf>,
     hsm_client_identity: &Option<PathBuf>,
 ) -> Result<(), String> {
     if live && dry_run {
         return Err("--live and --dry-run are mutually exclusive".to_string());
+    }
+    if paper && (live || dry_run) {
+        return Err("--paper is mutually exclusive with --live and --dry-run".to_string());
     }
     if live && hsm_endpoint.is_none() {
         return Err(
@@ -255,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_signing_config(
         args.live,
         args.dry_run,
+        args.paper,
         &args.hsm_endpoint,
         &args.hsm_ca,
         &args.hsm_client_identity,
@@ -264,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The local keyfile is used ONLY for dry-run without a remote HSM. In live
     // mode the remote HSM is mandatory, so the local keyfile is never loaded.
+    // In paper mode no signer is loaded at all (no on-chain transaction).
     let local_signer = if args.dry_run && !hsm_configured {
         let kp = load_keypair(&args.wallet)?;
         tracing::info!(target: "main", pubkey = %kp.pubkey(), "local keypair loaded (dry-run only)");
@@ -287,6 +300,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
                 break;
             }
+            sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        if args.paper {
+            // Paper-trading: run the strategy on simulated market data. No
+            // on-chain transaction is ever built or submitted.
+            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            // Simulated market state for this iteration (deterministic seed).
+            let seed = i as u64;
+            let liquidity = 2_000_000_000_000u64 + (seed % 1_000_000_000_000);
+            let market_cap = 100_000_000_000_000u64 + (seed % 50_000_000_000_000);
+            let holders = 100 + (seed % 400);
+            let candidate = strategy::TokenCandidate {
+                liquidity_lamports: liquidity,
+                market_cap_lamports: market_cap,
+                holders,
+                is_blocklisted: false,
+            };
+            // Simulated sqrt price drifts around the entry to exercise exits.
+            let entry_sqrt = 1u128 << 64;
+            let drift = ((seed % 21) as f64 - 10.0) / 100.0; // -10% .. +10%
+            let current_sqrt = ((entry_sqrt as f64) * (1.0 + drift).sqrt()) as u128;
+
+            let entry = strategy.evaluate(&candidate, entry_sqrt);
+            let exit = strategy.should_exit(entry_sqrt, current_sqrt);
+
+            let mut rec = decision::DecisionRecord::new("simple_snipe", "paper");
+            rec.mode = "paper".to_string();
+            rec.pool_id = format!("paper_pool_{i}");
+            rec.token_in = "SIM".to_string();
+            rec.token_out = "SOL".to_string();
+            rec.sqrt_price = current_sqrt.to_string();
+            rec.liquidity = liquidity.to_string();
+            rec.context = serde_json::json!({
+                "entry": entry.is_some(),
+                "exit": format!("{exit:?}"),
+                "drift_pct": drift * 100.0,
+            });
+            rec.save(&args.data_dir)?;
+
+            tracing::info!(
+                target: "paper",
+                iteration = i + 1,
+                entry = entry.is_some(),
+                exit = ?exit,
+                "paper-trading decision recorded (no on-chain tx)"
+            );
+            successful_trades += 1;
+            total_trades += 1;
             sleep(Duration::from_millis(200)).await;
             continue;
         }
@@ -512,7 +575,7 @@ mod tests {
 
     #[test]
     fn live_requires_hsm() {
-        let err = validate_signing_config(true, false, &None, &None, &None).unwrap_err();
+        let err = validate_signing_config(true, false, false, &None, &None, &None).unwrap_err();
         assert!(err.contains("--hsm-endpoint"), "got: {err}");
     }
 
@@ -520,6 +583,7 @@ mod tests {
     fn live_with_hsm_requires_mtls_certs() {
         let err = validate_signing_config(
             true,
+            false,
             false,
             &Some("https://127.0.0.1:8443".to_string()),
             &None,
@@ -534,6 +598,7 @@ mod tests {
         assert!(validate_signing_config(
             true,
             false,
+            false,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -546,6 +611,7 @@ mod tests {
         let err = validate_signing_config(
             true,
             true,
+            false,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -556,7 +622,7 @@ mod tests {
 
     #[test]
     fn dry_run_without_hsm_ok() {
-        assert!(validate_signing_config(false, true, &None, &None, &None).is_ok());
+        assert!(validate_signing_config(false, true, false, &None, &None, &None).is_ok());
     }
 
     #[test]
@@ -564,11 +630,45 @@ mod tests {
         let err = validate_signing_config(
             false,
             true,
+            false,
             &Some("https://127.0.0.1:8443".to_string()),
             &None,
             &None,
         )
         .unwrap_err();
         assert!(err.contains("--hsm-ca"), "got: {err}");
+    }
+
+    #[test]
+    fn paper_conflicts_with_live() {
+        let err = validate_signing_config(
+            true,
+            false,
+            true,
+            &Some("https://127.0.0.1:8443".to_string()),
+            &opt("ca.pem"),
+            &opt("client_all.pem"),
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn paper_conflicts_with_dry_run() {
+        let err = validate_signing_config(
+            false,
+            true,
+            true,
+            &Some("https://127.0.0.1:8443".to_string()),
+            &opt("ca.pem"),
+            &opt("client_all.pem"),
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn paper_alone_ok() {
+        assert!(validate_signing_config(false, false, true, &None, &None, &None).is_ok());
     }
 }
