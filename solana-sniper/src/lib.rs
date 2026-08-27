@@ -6,6 +6,7 @@ pub mod hw_signer;
 pub mod integration;
 pub mod jito;
 pub mod ledger_signer;
+pub mod metrics;
 pub mod remote_hsm;
 pub mod retry;
 pub mod risk;
