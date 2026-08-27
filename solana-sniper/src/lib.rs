@@ -9,4 +9,5 @@ pub mod ledger_signer;
 pub mod remote_hsm;
 pub mod retry;
 pub mod risk;
+pub mod strategy;
 pub mod tx;
