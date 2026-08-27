@@ -387,6 +387,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
                 let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
                 let mut tx = Transaction::new_unsigned(msg);
+                // Apply the freshly-fetched blockhash before signing; otherwise the
+                // transaction is submitted with a zero blockhash and the RPC rejects
+                // it with "Blockhash not found" during simulation.
+                tx.message.recent_blockhash = blockhash;
                 let sig = hsm_sign(endpoint, ca, identity, &mut tx).await?;
                 tx.signatures = vec![sig];
 
