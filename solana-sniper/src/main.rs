@@ -115,6 +115,19 @@ struct Args {
     /// Token candidate: mark as blocklisted (rejects the token)
     #[arg(long, default_value_t = false)]
     pool_blocklisted: bool,
+
+    /// Jito Block Engine endpoint. When set, live submissions go through Jito
+    /// bundles with RPC fallback.
+    #[arg(long)]
+    jito_endpoint: Option<String>,
+
+    /// Jito bundle tip (lamports). Only used when --jito-endpoint is set.
+    #[arg(long, default_value_t = 0)]
+    jito_tip_lamports: u64,
+
+    /// Jito dry-run: validate the bundle payload but never POST it.
+    #[arg(long, default_value_t = false)]
+    jito_dry_run: bool,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -540,7 +553,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sig = hsm_sign(endpoint, ca, identity, &mut tx).await?;
                 tx.signatures = vec![sig];
 
-                match retry::send_with_retry(&*rpc_client, &tx) {
+                // Submission: if a Jito endpoint is configured, send via Jito
+                // bundle with RPC fallback. Otherwise send directly via RPC.
+                let send_result = if let Some(jito_ep) = &args.jito_endpoint {
+                    let bundle = jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
+                    let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
+                    match client.send_bundle(&bundle).await {
+                        Ok(bundle_id) => {
+                            tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle accepted");
+                            Ok(tx.signatures[0])
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "live", error = %e, "jito bundle failed — falling back to RPC");
+                            jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                        }
+                    }
+                } else {
+                    retry::send_with_retry(&*rpc_client, &tx)
+                };
+
+                match send_result {
                     Ok(sig) => {
                         successful_trades += 1;
                         // Record the completed trade (daily trade counter).
