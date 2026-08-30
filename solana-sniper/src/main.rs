@@ -555,17 +555,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Submission: if a Jito endpoint is configured, send via Jito
                 // bundle with RPC fallback. Otherwise send directly via RPC.
+                //
+                // IMPORTANT: in Jito dry-run mode the bundle is validated but
+                // never POSTed, so the transaction must still be submitted to
+                // the RPC for confirmation. Only a real (non-dry-run) Jito
+                // bundle acceptance counts as a confirmed submission.
                 let send_result = if let Some(jito_ep) = &args.jito_endpoint {
                     let bundle = jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
                     let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
-                    match client.send_bundle(&bundle).await {
-                        Ok(bundle_id) => {
-                            tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle accepted");
-                            Ok(tx.signatures[0])
+                    if args.jito_dry_run {
+                        // Dry-run: validate the bundle, then submit via RPC.
+                        match client.send_bundle(&bundle).await {
+                            Ok(bundle_id) => {
+                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC");
+                                retry::send_with_retry(&*rpc_client, &tx)
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "live", error = %e, "jito dry-run validation failed — submitting via RPC");
+                                retry::send_with_retry(&*rpc_client, &tx)
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(target: "live", error = %e, "jito bundle failed — falling back to RPC");
-                            jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                    } else {
+                        // Live Jito: send the bundle; fall back to RPC on failure.
+                        match client.send_bundle(&bundle).await {
+                            Ok(bundle_id) => {
+                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle accepted");
+                                Ok(tx.signatures[0])
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "live", error = %e, "jito bundle failed — falling back to RPC");
+                                jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                            }
                         }
                     }
                 } else {

@@ -53,6 +53,11 @@ impl BlockhashManager {
 }
 
 /// Send a transaction with up to `max_retries` retries and exponential backoff.
+///
+/// After a successful `send_transaction`, the transaction is confirmed via
+/// `getSignatureStatuses` (confirmed commitment). If the transaction is not
+/// confirmed within `confirm_retries`, an error is returned so the caller does
+/// not report a false "confirmed" for a transaction that was only sent.
 pub fn send_with_retry(
     rpc: &RpcClient,
     tx: &Transaction,
@@ -63,7 +68,14 @@ pub fn send_with_retry(
         match rpc.send_transaction(tx) {
             Ok(sig) => {
                 info!("transaction sent: {sig}");
-                return Ok(sig);
+                // Confirm the transaction actually landed before reporting success.
+                match confirm_transaction(rpc, &sig) {
+                    Ok(()) => return Ok(sig),
+                    Err(e) => {
+                        error!("transaction {sig} not confirmed: {e:#}");
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => {
                 attempt += 1;
@@ -77,4 +89,28 @@ pub fn send_with_retry(
             }
         }
     }
+}
+
+/// Poll `getSignatureStatuses` until the transaction reaches `confirmed`
+/// commitment, or the retry budget is exhausted.
+fn confirm_transaction(rpc: &RpcClient, sig: &Signature) -> Result<(), Box<dyn std::error::Error>> {
+    let max_confirm_retries: u32 = 10;
+    for attempt in 0..max_confirm_retries {
+        let statuses = rpc.get_signature_statuses(&[*sig])?;
+        if let Some(Some(status)) = statuses.value.first() {
+            if let Some(err) = &status.err {
+                return Err(format!("transaction {sig} failed on-chain: {err:?}").into());
+            }
+            if status.confirmation_status
+                == Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
+                || status.confirmation_status
+                    == Some(solana_transaction_status::TransactionConfirmationStatus::Finalized)
+            {
+                info!("transaction {sig} confirmed (slot {})", status.slot);
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Err(format!("transaction {sig} not confirmed after {max_confirm_retries} polls").into())
 }
