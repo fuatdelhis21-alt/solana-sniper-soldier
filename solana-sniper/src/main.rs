@@ -99,6 +99,22 @@ struct Args {
     /// Combined client cert + key PEM presented to the HSM server (mTLS)
     #[arg(long)]
     hsm_client_identity: Option<PathBuf>,
+
+    /// Token candidate: pool liquidity (lamports) for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_liquidity: u64,
+
+    /// Token candidate: market cap (lamports) for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_market_cap: u64,
+
+    /// Token candidate: number of holders for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_holders: u64,
+
+    /// Token candidate: mark as blocklisted (rejects the token)
+    #[arg(long, default_value_t = false)]
+    pool_blocklisted: bool,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -438,6 +454,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let identity = args.hsm_client_identity.as_ref().expect("validated");
             let from = hsm_pubkey(endpoint, ca, identity).await?;
             let to = from; // self-transfer for test
+
+            // Strategy gate: evaluate the token candidate. If the strategy
+            // rejects it (fail-closed), no trade is built or sent this
+            // iteration. This wires SimpleSnipeStrategy into the live path.
+            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            let candidate = strategy::TokenCandidate {
+                liquidity_lamports: args.pool_liquidity,
+                market_cap_lamports: args.pool_market_cap,
+                holders: args.pool_holders,
+                is_blocklisted: args.pool_blocklisted,
+            };
+            let entry_sqrt = 1u128 << 64; // placeholder until real pool price is fetched
+            let entry_signal = strategy.evaluate(&candidate, entry_sqrt);
+
+            let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
+            rec.mode = "live".to_string();
+            rec.pool_id = "live_pool".to_string();
+            rec.token_in = "SOL".to_string();
+            rec.token_out = "SOL".to_string();
+            rec.liquidity = candidate.liquidity_lamports.to_string();
+            rec.context = serde_json::json!({
+                "entry": entry_signal.is_some(),
+                "market_cap": candidate.market_cap_lamports,
+                "holders": candidate.holders,
+                "blocklisted": candidate.is_blocklisted,
+            });
+
+            let Some(entry_signal) = entry_signal else {
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    liquidity = candidate.liquidity_lamports,
+                    market_cap = candidate.market_cap_lamports,
+                    holders = candidate.holders,
+                    blocklisted = candidate.is_blocklisted,
+                    "strategy rejected candidate — no trade this iteration (fail-closed)"
+                );
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            rec.amount_in = entry_signal.position_size_lamports;
+            rec.save(&args.data_dir)?;
 
             // Fresh blockhash per iteration to avoid replay
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
