@@ -5,6 +5,7 @@
 //! ## Program ID
 //! Mainnet: `CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3`
 
+use crate::amm::account_resolver::ResolvedPool;
 use crate::amm::{AmmAdapter, Quote, TradeIntent};
 use sha2::{Digest, Sha256};
 use solana_sdk::hash::Hash;
@@ -48,6 +49,7 @@ pub struct RaydiumV4ClmmAdapter {
     pool_id: String,
     program_id: String,
     accounts: Option<SwapAccounts>,
+    pool: Option<ResolvedPool>,
 }
 
 impl RaydiumV4ClmmAdapter {
@@ -56,6 +58,7 @@ impl RaydiumV4ClmmAdapter {
             pool_id,
             program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
             accounts: None,
+            pool: None,
         }
     }
 
@@ -63,6 +66,17 @@ impl RaydiumV4ClmmAdapter {
     pub fn with_swap_accounts(mut self, accounts: SwapAccounts) -> Self {
         self.accounts = Some(accounts);
         self
+    }
+
+    /// Attach a resolved pool state so `quote` uses the real on-chain price.
+    pub fn with_resolved_pool(mut self, pool: ResolvedPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// The resolved pool state, if attached.
+    pub fn resolved_pool(&self) -> Option<&ResolvedPool> {
+        self.pool.as_ref()
     }
 
     /// Build the Raydium CLMM `swap` instruction.
@@ -120,39 +134,10 @@ impl RaydiumV4ClmmAdapter {
         })
     }
 
-    /// Parse pool state from raw account data (752 bytes CLMM pool layout).
-    /// Extracts key fields for deterministic hashing and price computation.
-    pub fn parse_pool_state(account_data: &[u8]) -> Result<PoolState, Box<dyn std::error::Error>> {
-        if account_data.len() < 88 {
-            return Err("account data too short for CLMM pool (min 88 bytes)".into());
-        }
-        // CLMM pool layout (752 bytes total, first 88 bytes are critical):
-        // offset 0:  padding (8 bytes)
-        // offset 8:  state (u64) â€" 1=uninitialized, 2=initialized, 3=post-liquidity
-        // offset 16: sqrt_price (u128) â€" Q64.64 fixed point
-        // offset 24: liquidity (u128)
-        // offset 40: tick_current_index (i32)
-        // offset 72: fee_rate (u64) â€" in BPS * 100
-        // offset 80: protocol_fee_rate (u64)
-        use byteorder::{LittleEndian, ReadBytesExt};
-        let mut cursor = std::io::Cursor::new(account_data);
-        cursor.set_position(8);
-        let state = cursor.read_u64::<LittleEndian>()?;
-        let sqrt_price = cursor.read_u128::<LittleEndian>()?;
-        let liquidity = cursor.read_u128::<LittleEndian>()?;
-        let tick_current_index = cursor.read_i32::<LittleEndian>()?;
-        cursor.set_position(72);
-        let fee_rate = cursor.read_u64::<LittleEndian>()?;
-        let protocol_fee_rate = cursor.read_u64::<LittleEndian>()?;
-
-        Ok(PoolState {
-            state,
-            sqrt_price,
-            liquidity,
-            tick_current_index,
-            fee_rate,
-            protocol_fee_rate,
-        })
+    /// Parse pool state from raw account data using the real CLMM zero_copy
+    /// layout. Delegates to [`crate::amm::account_resolver::parse_pool_state`].
+    pub fn parse_pool_state(pool_id: &Pubkey, account_data: &[u8]) -> Result<ResolvedPool, String> {
+        crate::amm::account_resolver::parse_pool_state(pool_id, account_data)
     }
 
     /// Convert sqrt_price Q64.64 to f64 price (token1/token0 ratio).
@@ -172,17 +157,6 @@ impl RaydiumV4ClmmAdapter {
     }
 }
 
-/// Parsed CLMM pool state (full production fields).
-#[derive(Debug, Clone)]
-pub struct PoolState {
-    pub state: u64,
-    pub sqrt_price: u128,
-    pub liquidity: u128,
-    pub tick_current_index: i32,
-    pub fee_rate: u64,
-    pub protocol_fee_rate: u64,
-}
-
 impl AmmAdapter for RaydiumV4ClmmAdapter {
     fn protocol_name(&self) -> &'static str {
         "RaydiumV4_CLMM"
@@ -193,15 +167,20 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
         input_amount: u64,
         slippage_bps: u64,
     ) -> Result<Quote, Box<dyn std::error::Error>> {
-        // Real quote computation using sqrt_price and fee_rate
-        // Default values if pool state unavailable
-        let sqrt_price = 103_761_935_475_290_858u128; // ~1 SOL ≈ 10 USDC
-        let fee_rate = 500_00u64; // 0.05% (50000 = 0.05% in BPS*100 format)
+        // Real quote computation using the resolved pool's on-chain sqrt_price.
+        // If no pool is attached, fail closed rather than quote a fabricated price.
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or("no resolved pool attached — call with_resolved_pool before quote")?;
+        let sqrt_price = pool.sqrt_price_x64;
+        // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
+        let fee_rate = 500u64;
         let expected_output = Self::compute_output_amount(input_amount, sqrt_price, fee_rate);
         Ok(Quote {
             pool_id: self.pool_id.clone(),
-            input_mint: "SOL".into(),
-            output_mint: "USDC".into(),
+            input_mint: pool.token_mint_0.to_string(),
+            output_mint: pool.token_mint_1.to_string(),
             input_amount,
             expected_output,
             slippage_bps,
@@ -268,7 +247,28 @@ mod tests {
     #[test]
     fn test_parse_pool_state_too_short() {
         let data = vec![0u8; 10];
-        assert!(RaydiumV4ClmmAdapter::parse_pool_state(&data).is_err());
+        let pool_id = Pubkey::new_unique();
+        assert!(RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).is_err());
+    }
+
+    #[test]
+    fn quote_fails_closed_without_resolved_pool() {
+        let adapter = sample_adapter();
+        assert!(adapter.quote(1_000_000, 100).is_err());
+    }
+
+    #[test]
+    fn quote_uses_resolved_pool_price() {
+        // Build a synthetic pool with sqrt_price = 2^64 (price = 1.0).
+        let mut data = vec![0u8; 273];
+        data[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        let pool_id = Pubkey::new_unique();
+        let pool = RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).unwrap();
+        let adapter = sample_adapter().with_resolved_pool(pool);
+        let quote = adapter.quote(1_000_000, 100).unwrap();
+        // price=1.0, fee 0.05% => output slightly below input.
+        assert!(quote.expected_output < 1_000_000);
+        assert!(quote.expected_output > 990_000);
     }
 
     fn sample_adapter() -> RaydiumV4ClmmAdapter {
@@ -388,6 +388,9 @@ mod tests {
         assert_eq!(tx.message.recent_blockhash, blockhash);
         // Unsigned: the fee-payer signature slot is a default (all-zero) placeholder.
         assert_eq!(tx.signatures.len(), 1);
-        assert_eq!(tx.signatures[0], solana_sdk::signature::Signature::default());
+        assert_eq!(
+            tx.signatures[0],
+            solana_sdk::signature::Signature::default()
+        );
     }
 }

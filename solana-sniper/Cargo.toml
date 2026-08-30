@@ -58,3 +58,7 @@ path = "src/bin/sign_test.rs"
 [[bin]]
 name = "ledger_sign_test"
 path = "src/bin/ledger_sign_test.rs"
+
+[[bin]]
+name = "devnet_swap_test"
+path = "src/bin/devnet_swap_test.rs"

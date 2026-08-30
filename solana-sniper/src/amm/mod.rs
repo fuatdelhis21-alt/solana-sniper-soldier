@@ -50,3 +50,6 @@ pub trait AmmAdapter: Send + Sync {
 
 /// Raydium V4 CLMM module.
 pub mod raydium_v4;
+
+/// Deterministic on-chain account resolution for Raydium CLMM swaps.
+pub mod account_resolver;

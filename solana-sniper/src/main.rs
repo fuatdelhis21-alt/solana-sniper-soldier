@@ -34,12 +34,14 @@ mod decision;
 mod executor;
 mod hw_signer;
 mod jito;
+mod marketdata;
 mod metrics;
 mod remote_hsm;
 mod retry;
 mod risk;
 mod strategy;
 mod tx;
+use amm::AmmAdapter;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
 
@@ -128,6 +130,29 @@ struct Args {
     /// Jito dry-run: validate the bundle payload but never POST it.
     #[arg(long, default_value_t = false)]
     jito_dry_run: bool,
+
+    /// Raydium CLMM pool to trade on. When set, live mode resolves the pool
+    /// state on-chain, feeds the real price into the strategy, and builds a
+    /// real AMM swap transaction. When unset, live mode keeps the safe
+    /// self-transfer test path.
+    #[arg(long)]
+    pool_id: Option<String>,
+
+    /// Input token mint (base58) for the swap. Required with --pool-id.
+    #[arg(long)]
+    input_mint: Option<String>,
+
+    /// Output token mint (base58) for the swap. Required with --pool-id.
+    #[arg(long)]
+    output_mint: Option<String>,
+
+    /// Max slippage in basis points (1/100 of a percent) for the swap.
+    #[arg(long, default_value_t = 100)]
+    max_slippage_bps: u64,
+
+    /// Max spend in SOL for a single trade (security cap).
+    #[arg(long, default_value_t = 0.01)]
+    max_spend_sol: f64,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -466,7 +491,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ca = args.hsm_ca.as_ref().expect("validated");
             let identity = args.hsm_client_identity.as_ref().expect("validated");
             let from = hsm_pubkey(endpoint, ca, identity).await?;
-            let to = from; // self-transfer for test
+            let mut to = from; // self-transfer fallback when no pool is configured
+
+            // When --pool-id is set, resolve the pool on-chain and feed the
+            // real price into the strategy (market data hook). Fail-closed:
+            // any resolution error halts the loop.
+            let mut swap_adapter: Option<amm::raydium_v4::RaydiumV4ClmmAdapter> = None;
+            let mut entry_sqrt = 1u128 << 64; // placeholder when no pool is configured
+            if let Some(pool_id_str) = &args.pool_id {
+                let pool_id =
+                    Pubkey::from_str(pool_id_str).map_err(|e| format!("invalid --pool-id: {e}"))?;
+                let input_mint = args
+                    .input_mint
+                    .as_ref()
+                    .ok_or("--input-mint is required with --pool-id")?;
+                let output_mint = args
+                    .output_mint
+                    .as_ref()
+                    .ok_or("--output-mint is required with --pool-id")?;
+                let input_mint = Pubkey::from_str(input_mint)
+                    .map_err(|e| format!("invalid --input-mint: {e}"))?;
+                let output_mint = Pubkey::from_str(output_mint)
+                    .map_err(|e| format!("invalid --output-mint: {e}"))?;
+
+                // Select the CLMM program id by cluster (devnet vs mainnet).
+                let program_id = if args.rpc.contains("devnet") {
+                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET)
+                        .expect("valid devnet program id")
+                } else {
+                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
+                        .expect("valid mainnet program id")
+                };
+
+                // Market data hook: poll the pool state and feed the real price.
+                let feed = marketdata::PoolPriceFeed::new(rpc_client.clone(), pool_id, program_id);
+                let pool = feed
+                    .refresh()
+                    .map_err(|e| format!("failed to resolve pool state (fail-closed): {e}"))?;
+                entry_sqrt = pool.sqrt_price_x64;
+                tracing::info!(
+                    target: "live",
+                    pool_id = %pool_id,
+                    sqrt_price = entry_sqrt,
+                    liquidity = pool.liquidity,
+                    "resolved pool state — feeding real price into strategy"
+                );
+
+                // Resolve the full swap account set deterministically.
+                let (accounts, resolved) = amm::account_resolver::resolve_swap_accounts(
+                    &rpc_client,
+                    &pool_id,
+                    &from,
+                    &input_mint,
+                    &output_mint,
+                    &program_id,
+                )
+                .map_err(|e| format!("failed to resolve swap accounts (fail-closed): {e}"))?;
+
+                let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+                    .with_swap_accounts(accounts)
+                    .with_resolved_pool(resolved);
+                swap_adapter = Some(adapter);
+            }
 
             // Strategy gate: evaluate the token candidate. If the strategy
             // rejects it (fail-closed), no trade is built or sent this
@@ -478,7 +564,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 holders: args.pool_holders,
                 is_blocklisted: args.pool_blocklisted,
             };
-            let entry_sqrt = 1u128 << 64; // placeholder until real pool price is fetched
             let entry_signal = strategy.evaluate(&candidate, entry_sqrt);
 
             let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
@@ -512,6 +597,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.amount_in = entry_signal.position_size_lamports;
             rec.save(&args.data_dir)?;
 
+            // Security: max spend (SOL) cap enforced before any trade.
+            let max_spend_lamports = solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+            if entry_signal.position_size_lamports > max_spend_lamports {
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    position_size_lamports = entry_signal.position_size_lamports,
+                    max_spend_lamports = max_spend_lamports,
+                    "max spend (SOL) cap exceeded — no trade this iteration (fail-closed)"
+                );
+                rec.context = serde_json::json!({
+                    "entry": true,
+                    "risk_rejected": "max_spend_sol_exceeded",
+                });
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
             // Risk gate: enforce kill switch, daily trade cap, position size,
             // and slippage before building any transaction. Fail-closed: if
             // any limit is exceeded, no trade is built or sent this iteration.
@@ -537,19 +642,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Fresh blockhash per iteration to avoid replay
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
-                // Dynamic compute units per iteration for uniqueness
-                let cu_limit = 400 + (i % 200);
-                let cu_ix =
-                    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-                        cu_limit,
-                    );
-                let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
-                let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
-                let mut tx = Transaction::new_unsigned(msg);
-                // Apply the freshly-fetched blockhash before signing; otherwise the
-                // transaction is submitted with a zero blockhash and the RPC rejects
-                // it with "Blockhash not found" during simulation.
-                tx.message.recent_blockhash = blockhash;
+                // Build the transaction: a real AMM swap when a pool is
+                // configured, otherwise the safe self-transfer test path.
+                let mut tx = if let Some(adapter) = &swap_adapter {
+                    // Real swap: quote from the resolved on-chain price, apply
+                    // slippage (min_amount_out), and build the CLMM swap tx.
+                    let quote = adapter
+                        .quote(entry_signal.position_size_lamports, args.max_slippage_bps)
+                        .map_err(|e| format!("quote failed (fail-closed): {e}"))?;
+                    let intent = adapter
+                        .build_intent(quote)
+                        .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
+                    let mut t = adapter
+                        .build_transaction(&intent, &from, blockhash)
+                        .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?;
+                    t.message.recent_blockhash = blockhash;
+                    t
+                } else {
+                    // Dynamic compute units per iteration for uniqueness
+                    let cu_limit = 400 + (i % 200);
+                    let cu_ix =
+                        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                            cu_limit,
+                        );
+                    let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
+                    let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
+                    let mut t = Transaction::new_unsigned(msg);
+                    // Apply the freshly-fetched blockhash before signing; otherwise the
+                    // transaction is submitted with a zero blockhash and the RPC rejects
+                    // it with "Blockhash not found" during simulation.
+                    t.message.recent_blockhash = blockhash;
+                    t
+                };
                 let sig = hsm_sign(endpoint, ca, identity, &mut tx).await?;
                 tx.signatures = vec![sig];
 
