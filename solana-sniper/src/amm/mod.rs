@@ -5,6 +5,9 @@
 //! Designed to be extensible for Orca Whirlpool and others.
 
 use serde::{Deserialize, Serialize};
+use solana_sdk::hash::Hash;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::transaction::Transaction;
 
 /// A quote for a swap on a given pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,10 +37,15 @@ pub trait AmmAdapter: Send + Sync {
         slippage_bps: u64,
     ) -> Result<Quote, Box<dyn std::error::Error>>;
     fn build_intent(&self, quote: Quote) -> Result<TradeIntent, Box<dyn std::error::Error>>;
+    /// Build an unsigned transaction for the given intent, signed by `signer`
+    /// and using `blockhash`. The returned transaction is ready to be signed
+    /// by the HSM (fail-closed: no local keyfile in live mode).
     fn build_transaction(
         &self,
         intent: &TradeIntent,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>>;
+        signer: &Pubkey,
+        blockhash: Hash,
+    ) -> Result<Transaction, Box<dyn std::error::Error>>;
 }
 
 /// Raydium V4 CLMM module.
