@@ -499,6 +499,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.amount_in = entry_signal.position_size_lamports;
             rec.save(&args.data_dir)?;
 
+            // Risk gate: enforce kill switch, daily trade cap, position size,
+            // and slippage before building any transaction. Fail-closed: if
+            // any limit is exceeded, no trade is built or sent this iteration.
+            if let Err(e) = risk_manager.pre_trade_check(
+                entry_signal.position_size_lamports,
+                entry_signal.slippage_bps,
+            ) {
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    error = %e,
+                    "risk gate rejected trade — no trade this iteration (fail-closed)"
+                );
+                rec.context = serde_json::json!({
+                    "entry": true,
+                    "risk_rejected": e,
+                });
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
             // Fresh blockhash per iteration to avoid replay
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
                 // Dynamic compute units per iteration for uniqueness
@@ -520,6 +543,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match retry::send_with_retry(&*rpc_client, &tx) {
                     Ok(sig) => {
                         successful_trades += 1;
+                        // Record the completed trade (daily trade counter).
+                        risk_manager.record_trade();
                         tracing::info!(target: "live", signature = %sig, "transaction confirmed");
                         let cluster = if args.rpc.contains("devnet") {
                             "devnet"
