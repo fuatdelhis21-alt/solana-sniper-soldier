@@ -21,6 +21,11 @@ use crate::{MarketDataHandler, PriceQuote};
 /// Raydium V4 CLMM program ID (mainnet)
 pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3";
 
+/// Real Raydium CLMM `PoolState` account size (zero_copy layout, including
+/// the 8-byte Anchor discriminator). Mirrors
+/// `solana-sniper::amm::account_resolver`'s verified layout.
+pub const CLMM_POOL_STATE_SIZE: usize = 1544;
+
 /// A parsed Raydium V4 CLMM pool state from WebSocket account update.
 #[derive(Debug, Clone)]
 pub struct ClmmPoolState {
@@ -55,6 +60,12 @@ impl SolanaWsProvider {
     }
 
     /// Build the `programSubscribe` JSON-RPC request for Raydium CLMM.
+    ///
+    /// Filters on `dataSize` only (real CLMM `PoolState` account size, 1544
+    /// bytes including the 8-byte Anchor discriminator). No discriminator
+    /// memcmp filter is applied — computing the correct Anchor discriminator
+    /// bytes is unnecessary since `dataSize` already narrows the subscription
+    /// to CLMM-pool-shaped accounts under this program.
     fn build_subscribe_request() -> String {
         format!(
             r#"{{
@@ -67,13 +78,12 @@ impl SolanaWsProvider {
                         "encoding": "base64",
                         "commitment": "processed",
                         "filters": [
-                            {{ "memcmp": {{ "offset": 0, "bytes": "2w" }} }},
-                            {{ "dataSize": 752 }}
+                            {{ "dataSize": {} }}
                         ]
                     }}
                 ]
             }}"#,
-            RAYDIUM_CLMM_PROGRAM_ID
+            RAYDIUM_CLMM_PROGRAM_ID, CLMM_POOL_STATE_SIZE
         )
     }
 
@@ -93,37 +103,27 @@ impl SolanaWsProvider {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64_data)
             .ok()?;
-        if bytes.len() < 80 {
+        if bytes.len() < 273 {
             return None;
         }
 
         use byteorder::{LittleEndian, ReadBytesExt};
         let mut cursor = std::io::Cursor::new(&bytes);
 
-        // CLMM pool layout:
-        // offset 8: state (u64)
-        // offset 16: sqrt_price (u128)
-        // offset 24: liquidity (u128)
-        // offset 40: tick_current_index (i32)
-        // offset 72: fee_rate (u64)
-        // offset 80: protocol_fee_rate (u64)
-        cursor.set_position(8);
-        let _state = cursor.read_u64::<LittleEndian>().ok()?;
-
-        cursor.set_position(16);
-        let sqrt_price = cursor.read_u128::<LittleEndian>().ok()?;
-
-        cursor.set_position(24);
+        // Real CLMM `PoolState` zero_copy layout (8-byte Anchor discriminator
+        // prefix). Verified against raydium-io/raydium-clmm
+        // `programs/amm/src/states/pool.rs`; mirrors
+        // `solana-sniper::amm::account_resolver::parse_pool_state`.
+        // offset 233: mint_decimals_0 (u8) / 234: mint_decimals_1 (u8)
+        // offset 235: tick_spacing (u16)
+        // offset 237: liquidity (u128)
+        // offset 253: sqrt_price_x64 (u128)
+        // offset 269: tick_current (i32)
+        cursor.set_position(235);
+        let _tick_spacing = cursor.read_u16::<LittleEndian>().ok()?;
         let liquidity = cursor.read_u128::<LittleEndian>().ok()?;
-
-        cursor.set_position(40);
+        let sqrt_price = cursor.read_u128::<LittleEndian>().ok()?;
         let tick_current_index = cursor.read_i32::<LittleEndian>().ok()?;
-
-        cursor.set_position(72);
-        let fee_rate = cursor.read_u64::<LittleEndian>().ok()?;
-
-        cursor.set_position(80);
-        let protocol_fee_rate = cursor.read_u64::<LittleEndian>().ok()?;
 
         Some(ClmmPoolState {
             pool_id: pubkey_str.to_string(),
@@ -131,8 +131,8 @@ impl SolanaWsProvider {
             sqrt_price,
             liquidity,
             tick_current_index,
-            fee_rate,
-            protocol_fee_rate,
+            fee_rate: 0,
+            protocol_fee_rate: 0,
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -287,5 +287,78 @@ impl MarketDataHandler for SolanaWsProvider {
 
     fn get_latest_price(&self, symbol: &str) -> Option<PriceQuote> {
         self.prices.read().get(symbol).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic `programNotification` message with a 273-byte
+    /// `PoolState` payload (real CLMM zero_copy layout) at known offsets.
+    fn synthetic_notification(sqrt_price: u128, liquidity: u128, tick: i32) -> Value {
+        let mut data = vec![0u8; 273];
+        data[235..237].copy_from_slice(&10u16.to_le_bytes());
+        data[237..253].copy_from_slice(&liquidity.to_le_bytes());
+        data[253..269].copy_from_slice(&sqrt_price.to_le_bytes());
+        data[269..273].copy_from_slice(&tick.to_le_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+        serde_json::json!({
+            "method": "programNotification",
+            "params": {
+                "result": {
+                    "value": {
+                        "slot": 123u64,
+                        "account": {
+                            "pubkey": "11111111111111111111111111111111",
+                            "data": [b64, "base64"]
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parse_account_update_extracts_real_layout_fields() {
+        let sqrt_price = 1u128 << 64;
+        let liquidity = 42_000u128;
+        let tick = 7;
+        let notif = synthetic_notification(sqrt_price, liquidity, tick);
+
+        let state = SolanaWsProvider::parse_account_update(&notif).unwrap();
+        assert_eq!(state.sqrt_price, sqrt_price);
+        assert_eq!(state.liquidity, liquidity);
+        assert_eq!(state.tick_current_index, tick);
+        assert_eq!(state.slot, 123);
+    }
+
+    #[test]
+    fn parse_account_update_rejects_short_payload() {
+        let data = vec![0u8; 10];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let notif = serde_json::json!({
+            "method": "programNotification",
+            "params": {
+                "result": {
+                    "value": {
+                        "slot": 1u64,
+                        "account": {
+                            "pubkey": "11111111111111111111111111111111",
+                            "data": [b64, "base64"]
+                        }
+                    }
+                }
+            }
+        });
+        assert!(SolanaWsProvider::parse_account_update(&notif).is_none());
+    }
+
+    #[test]
+    fn subscribe_request_uses_real_pool_state_size() {
+        let req = SolanaWsProvider::build_subscribe_request();
+        assert!(req.contains(&CLMM_POOL_STATE_SIZE.to_string()));
+        assert!(!req.contains("752"));
     }
 }

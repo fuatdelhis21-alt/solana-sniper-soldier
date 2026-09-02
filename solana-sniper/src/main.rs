@@ -31,11 +31,13 @@ use solana_sdk::transaction::Transaction;
 mod amm;
 mod config;
 mod decision;
+mod discovery;
 mod executor;
 mod hw_signer;
 mod jito;
 mod marketdata;
 mod metrics;
+mod onchain_risk;
 mod remote_hsm;
 mod retry;
 mod risk;
@@ -153,6 +155,37 @@ struct Args {
     /// Max spend in SOL for a single trade (security cap).
     #[arg(long, default_value_t = 0.01)]
     max_spend_sol: f64,
+
+    /// When set with --pool-id, replaces the static --pool-liquidity /
+    /// --pool-holders CLI values with real on-chain data read via RPC
+    /// (input vault balance + getTokenLargestAccounts/getTokenSupply).
+    /// Fail-closed: an RPC error here halts the loop.
+    #[arg(long, default_value_t = false)]
+    live_risk_data: bool,
+
+    /// Path to a local blocklist file (one base58 mint per line, `#`
+    /// comments allowed). Only used with --live-risk-data. Missing file is
+    /// treated as an empty blocklist, not an error.
+    #[arg(long)]
+    blocklist_file: Option<PathBuf>,
+
+    /// Reject a candidate if the single largest holder (excluding the
+    /// pool's own vault) holds more than this percent of supply. Only used
+    /// with --live-risk-data.
+    #[arg(long, default_value_t = 50.0)]
+    max_top_holder_pct: f64,
+
+    /// Optional DexScreener cross-check for logging only. Never used to
+    /// gate a trade — a DexScreener failure only logs a warning.
+    #[arg(long, default_value_t = false)]
+    dexscreener_check: bool,
+
+    /// Optional WebSocket endpoint for real-time `programSubscribe` pool
+    /// updates (lower latency than RPC polling). Falls back to the
+    /// existing RPC-polled market data hook when unset or not yet
+    /// connected.
+    #[arg(long)]
+    ws_endpoint: Option<String>,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -343,6 +376,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut successful_trades: u64 = 0;
     let mut total_latency_ms: u128 = 0;
 
+    // Optional local blocklist, loaded once. Missing file => empty set (not
+    // a fail-closed condition — it just means this extra gate is inactive).
+    let blocklist: std::collections::HashSet<Pubkey> = match &args.blocklist_file {
+        Some(path) => onchain_risk::load_blocklist(path)?,
+        None => std::collections::HashSet::new(),
+    };
+
+    // Optional real-time WebSocket feed. Starts a background reconnect loop
+    // via `MarketDataHandler::start_stream`; the existing RPC-polled
+    // `PoolPriceFeed` remains the fail-closed fallback whenever the WS feed
+    // has no fresher data yet.
+    let ws_provider: Option<Arc<hft_marketdata::solana_ws::SolanaWsProvider>> = if let Some(
+        ws_url,
+    ) =
+        &args.ws_endpoint
+    {
+        let provider = Arc::new(hft_marketdata::solana_ws::SolanaWsProvider::new(
+            ws_url, &args.rpc,
+        ));
+        hft_marketdata::MarketDataHandler::start_stream(provider.as_ref())
+            .map_err(|e| format!("failed to start WebSocket market data stream: {e}"))?;
+        tracing::info!(target: "main", ws_endpoint = %ws_url, "WebSocket market data stream started");
+        Some(provider)
+    } else {
+        None
+    };
+
     for i in 0..args.iterations {
         let iteration_start = std::time::Instant::now();
 
@@ -498,6 +558,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // any resolution error halts the loop.
             let mut swap_adapter: Option<amm::raydium_v4::RaydiumV4ClmmAdapter> = None;
             let mut entry_sqrt = 1u128 << 64; // placeholder when no pool is configured
+            let mut live_liquidity: Option<u64> = None;
+            let mut live_holder_stats: Option<onchain_risk::HolderStats> = None;
+            let mut live_blocklisted = false;
             if let Some(pool_id_str) = &args.pool_id {
                 let pool_id =
                     Pubkey::from_str(pool_id_str).map_err(|e| format!("invalid --pool-id: {e}"))?;
@@ -523,17 +586,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .expect("valid mainnet program id")
                 };
 
-                // Market data hook: poll the pool state and feed the real price.
-                let feed = marketdata::PoolPriceFeed::new(rpc_client.clone(), pool_id, program_id);
-                let pool = feed
-                    .refresh()
-                    .map_err(|e| format!("failed to resolve pool state (fail-closed): {e}"))?;
-                entry_sqrt = pool.sqrt_price_x64;
+                // Market data hook: prefer a fresh WebSocket update (lower
+                // latency) when the feed is connected and has data for this
+                // pool; otherwise fall back to the fail-closed RPC-polled hook.
+                let ws_state = ws_provider
+                    .as_ref()
+                    .filter(|p| p.is_connected())
+                    .and_then(|p| p.get_pool_state(pool_id_str));
+                let (pool, used_ws) = if let Some(state) = ws_state {
+                    entry_sqrt = state.sqrt_price;
+                    (None, true)
+                } else {
+                    let feed =
+                        marketdata::PoolPriceFeed::new(rpc_client.clone(), pool_id, program_id);
+                    let pool = feed
+                        .refresh()
+                        .map_err(|e| format!("failed to resolve pool state (fail-closed): {e}"))?;
+                    entry_sqrt = pool.sqrt_price_x64;
+                    (Some(pool), false)
+                };
                 tracing::info!(
                     target: "live",
                     pool_id = %pool_id,
                     sqrt_price = entry_sqrt,
-                    liquidity = pool.liquidity,
+                    source = if used_ws { "websocket" } else { "rpc_poll" },
                     "resolved pool state — feeding real price into strategy"
                 );
 
@@ -548,6 +624,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .map_err(|e| format!("failed to resolve swap accounts (fail-closed): {e}"))?;
 
+                if args.live_risk_data {
+                    // Fail-closed: any RPC error here halts the loop. This
+                    // replaces the static --pool-liquidity / --pool-holders
+                    // CLI values with real on-chain data.
+                    let liquidity =
+                        onchain_risk::fetch_vault_liquidity(&rpc_client, &accounts.input_vault)
+                            .map_err(|e| format!("live risk data (fail-closed): {e}"))?;
+                    let holder_stats = onchain_risk::fetch_holder_stats(
+                        &rpc_client,
+                        &input_mint,
+                        &accounts.input_vault,
+                    )
+                    .map_err(|e| format!("live risk data (fail-closed): {e}"))?;
+                    tracing::info!(
+                        target: "live",
+                        liquidity,
+                        top_holder_pct = holder_stats.top_holder_pct,
+                        sampled_holders = holder_stats.sampled_holders,
+                        "fetched real on-chain liquidity + holder concentration"
+                    );
+                    live_blocklisted =
+                        blocklist.contains(&input_mint) || blocklist.contains(&output_mint);
+                    live_liquidity = Some(liquidity);
+                    live_holder_stats = Some(holder_stats);
+                }
+
+                if args.dexscreener_check {
+                    // Advisory only — never gates the trade. A failure here
+                    // is only logged as a warning.
+                    match discovery::fetch_snapshot(pool_id_str) {
+                        Ok(snapshot) => tracing::info!(
+                            target: "live",
+                            liquidity_usd = snapshot.liquidity_usd,
+                            fdv = snapshot.fdv,
+                            volume_24h_usd = snapshot.volume_24h_usd,
+                            "dexscreener advisory snapshot (not used for trading gate)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "live",
+                            error = %e,
+                            "dexscreener advisory check failed — ignored, not gating trade"
+                        ),
+                    }
+                }
+
                 let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
                     .with_swap_accounts(accounts)
                     .with_resolved_pool(resolved);
@@ -559,10 +680,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // iteration. This wires SimpleSnipeStrategy into the live path.
             let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
             let candidate = strategy::TokenCandidate {
-                liquidity_lamports: args.pool_liquidity,
+                liquidity_lamports: live_liquidity.unwrap_or(args.pool_liquidity),
                 market_cap_lamports: args.pool_market_cap,
-                holders: args.pool_holders,
-                is_blocklisted: args.pool_blocklisted,
+                holders: live_holder_stats
+                    .as_ref()
+                    .map(|h| h.sampled_holders)
+                    .unwrap_or(args.pool_holders),
+                is_blocklisted: args.pool_blocklisted
+                    || live_blocklisted
+                    || live_holder_stats
+                        .as_ref()
+                        .is_some_and(|h| h.top_holder_pct > args.max_top_holder_pct),
             };
             let entry_signal = strategy.evaluate(&candidate, entry_sqrt);
 
