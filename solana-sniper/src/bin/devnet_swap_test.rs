@@ -264,9 +264,9 @@ fn main() -> Result<()> {
 /// Submit a transaction and poll for on-chain confirmation, returning the
 /// confirmed signature. Fail-closed: any error propagates.
 fn submit_and_confirm(rpc: &RpcClient, tx: &Transaction) -> Result<Signature> {
-    let sig = rpc.send_transaction(tx).map_err(|e| {
-        anyhow!("failed to send transaction: {e}")
-    })?;
+    let sig = rpc
+        .send_transaction(tx)
+        .map_err(|e| anyhow!("failed to send transaction: {e}"))?;
     tracing::info!(signature = %sig, "transaction submitted, waiting for confirmation");
 
     for _ in 0..30 {
