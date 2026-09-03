@@ -32,6 +32,25 @@ pub struct Metrics {
     pub hsm_latency_hist: Histogram,
     pub kill_switch_active: Gauge,
     pub last_trade_ts: Gauge,
+    /// Every time the risk gate is evaluated for a candidate trade,
+    /// regardless of outcome.
+    pub trade_attempt_total: IntCounter,
+    /// Rejections, labeled by machine-readable `RejectReason::code()`
+    /// (stale_price, slippage_exceeded, max_spend_exceeded,
+    /// daily_trade_cap, daily_loss_limit, circuit_breaker_open,
+    /// token_authority_risk, holder_concentration_exceeded,
+    /// insufficient_liquidity, hsm_unavailable, ...).
+    pub trade_rejected_total: IntCounterVec,
+    /// Trades that were actually built, signed, and submitted successfully.
+    pub trade_executed_total: IntCounter,
+    /// Circuit breaker state gauge (1=open/tripped, 0=closed/normal).
+    pub circuit_breaker_state: Gauge,
+    /// Realized P&L for the current UTC day, in lamports (loss-only today —
+    /// see final report for the known gap: no exit-execution path exists to
+    /// compute realized wins).
+    pub daily_realized_pnl: Gauge,
+    /// Number of currently tracked open positions.
+    pub open_position_count: Gauge,
 }
 
 impl Metrics {
@@ -57,6 +76,28 @@ impl Metrics {
             Gauge::new("hft_kill_switch_active", "Kill switch state (1=active)").unwrap();
         let last_trade_ts = Gauge::new("hft_last_trade_ts", "Unix ms of last trade").unwrap();
 
+        let trade_attempt_total =
+            IntCounter::new("trade_attempt_total", "Total risk-gate evaluations").unwrap();
+        let trade_rejected_total = IntCounterVec::new(
+            Opts::new("trade_rejected_total", "Rejected trades by reason code"),
+            &["reason"],
+        )
+        .unwrap();
+        let trade_executed_total =
+            IntCounter::new("trade_executed_total", "Trades successfully submitted").unwrap();
+        let circuit_breaker_state = Gauge::new(
+            "circuit_breaker_state",
+            "Circuit breaker state (1=open/tripped, 0=closed)",
+        )
+        .unwrap();
+        let daily_realized_pnl = Gauge::new(
+            "daily_realized_pnl",
+            "Realized P&L for the current day, in lamports",
+        )
+        .unwrap();
+        let open_position_count =
+            Gauge::new("open_position_count", "Currently tracked open positions").unwrap();
+
         registry.register(Box::new(trades_total.clone())).ok();
         registry.register(Box::new(trades_success.clone())).ok();
         registry.register(Box::new(trades_failed.clone())).ok();
@@ -66,6 +107,22 @@ impl Metrics {
         registry.register(Box::new(hsm_latency_hist.clone())).ok();
         registry.register(Box::new(kill_switch_active.clone())).ok();
         registry.register(Box::new(last_trade_ts.clone())).ok();
+        registry
+            .register(Box::new(trade_attempt_total.clone()))
+            .ok();
+        registry
+            .register(Box::new(trade_rejected_total.clone()))
+            .ok();
+        registry
+            .register(Box::new(trade_executed_total.clone()))
+            .ok();
+        registry
+            .register(Box::new(circuit_breaker_state.clone()))
+            .ok();
+        registry.register(Box::new(daily_realized_pnl.clone())).ok();
+        registry
+            .register(Box::new(open_position_count.clone()))
+            .ok();
         Arc::new(Self {
             registry,
             trades_total,
@@ -77,6 +134,12 @@ impl Metrics {
             hsm_latency_hist,
             kill_switch_active,
             last_trade_ts,
+            trade_attempt_total,
+            trade_rejected_total,
+            trade_executed_total,
+            circuit_breaker_state,
+            daily_realized_pnl,
+            open_position_count,
         })
     }
 
@@ -163,6 +226,42 @@ pub fn set_kill_switch(metrics: &Metrics, active: bool) {
         .set(if active { 1.0 } else { 0.0 });
 }
 
+/// Convenience: record a risk-gate evaluation attempt.
+pub fn record_trade_attempt(metrics: &Metrics) {
+    metrics.trade_attempt_total.inc();
+}
+
+/// Convenience: record a rejection with its machine-readable reason code
+/// (e.g. `RejectReason::code()` from `risk.rs`).
+pub fn record_trade_rejected(metrics: &Metrics, reason_code: &str) {
+    metrics
+        .trade_rejected_total
+        .with_label_values(&[reason_code])
+        .inc();
+}
+
+/// Convenience: record a successfully submitted trade.
+pub fn record_trade_executed(metrics: &Metrics) {
+    metrics.trade_executed_total.inc();
+}
+
+/// Convenience: refresh the circuit-breaker/open-position/PNL gauges from
+/// the current risk manager state.
+pub fn set_risk_gauges(
+    metrics: &Metrics,
+    circuit_breaker_active: bool,
+    daily_realized_pnl_lamports: i64,
+    open_position_count: u64,
+) {
+    metrics
+        .circuit_breaker_state
+        .set(if circuit_breaker_active { 1.0 } else { 0.0 });
+    metrics
+        .daily_realized_pnl
+        .set(daily_realized_pnl_lamports as f64);
+    metrics.open_position_count.set(open_position_count as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +286,26 @@ mod tests {
         assert!(m.render().contains("hft_kill_switch_active 1"));
         set_kill_switch(&m, false);
         assert!(m.render().contains("hft_kill_switch_active 0"));
+    }
+
+    #[test]
+    fn risk_metrics_render_with_reason_label() {
+        let m = Metrics::new();
+        record_trade_attempt(&m);
+        record_trade_attempt(&m);
+        record_trade_rejected(&m, "stale_price");
+        record_trade_rejected(&m, "stale_price");
+        record_trade_rejected(&m, "daily_loss_limit");
+        record_trade_executed(&m);
+        set_risk_gauges(&m, true, -150_000_000, 1);
+        let out = m.render();
+        assert!(out.contains("trade_attempt_total 2"));
+        assert!(out.contains("trade_rejected_total{reason=\"stale_price\"} 2"));
+        assert!(out.contains("trade_rejected_total{reason=\"daily_loss_limit\"} 1"));
+        assert!(out.contains("trade_executed_total 1"));
+        assert!(out.contains("circuit_breaker_state 1"));
+        assert!(out.contains("daily_realized_pnl -150000000"));
+        assert!(out.contains("open_position_count 1"));
     }
 
     #[tokio::test]
