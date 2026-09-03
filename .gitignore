@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 wallet.json
+mainnet_keypair.json
 *.pem
 *.key
 *.crt

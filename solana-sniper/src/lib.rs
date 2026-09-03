@@ -1,12 +1,15 @@
 pub mod amm;
 pub mod config;
 pub mod decision;
+pub mod discovery;
 pub mod executor;
 pub mod hw_signer;
 pub mod integration;
 pub mod jito;
 pub mod ledger_signer;
+pub mod marketdata;
 pub mod metrics;
+pub mod onchain_risk;
 pub mod remote_hsm;
 pub mod retry;
 pub mod risk;

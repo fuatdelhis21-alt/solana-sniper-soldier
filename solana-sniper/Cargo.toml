@@ -12,6 +12,8 @@ description = "Ultra-low-latency, production-grade Solana trading platform"
 hft-core.workspace = true
 hft-marketdata.workspace = true
 hft-execution.workspace = true
+spl-associated-token-account.workspace = true
+spl-token.workspace = true
 
 anyhow.workspace = true
 serde.workspace = true
@@ -34,6 +36,7 @@ solana-rpc-client-api.workspace = true
 solana-signature.workspace = true
 solana-pubkey.workspace = true
 solana-commitment-config.workspace = true
+solana-transaction-status.workspace = true
 
 sha2.workspace = true
 byteorder.workspace = true
@@ -57,3 +60,7 @@ path = "src/bin/sign_test.rs"
 [[bin]]
 name = "ledger_sign_test"
 path = "src/bin/ledger_sign_test.rs"
+
+[[bin]]
+name = "devnet_swap_test"
+path = "src/bin/devnet_swap_test.rs"

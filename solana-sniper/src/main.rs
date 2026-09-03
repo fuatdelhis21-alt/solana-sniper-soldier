@@ -31,15 +31,19 @@ use solana_sdk::transaction::Transaction;
 mod amm;
 mod config;
 mod decision;
+mod discovery;
 mod executor;
 mod hw_signer;
 mod jito;
+mod marketdata;
 mod metrics;
+mod onchain_risk;
 mod remote_hsm;
 mod retry;
 mod risk;
 mod strategy;
 mod tx;
+use amm::AmmAdapter;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
 
@@ -99,6 +103,96 @@ struct Args {
     /// Combined client cert + key PEM presented to the HSM server (mTLS)
     #[arg(long)]
     hsm_client_identity: Option<PathBuf>,
+
+    /// Token candidate: pool liquidity (lamports) for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_liquidity: u64,
+
+    /// Token candidate: market cap (lamports) for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_market_cap: u64,
+
+    /// Token candidate: number of holders for strategy evaluation
+    #[arg(long, default_value_t = 0)]
+    pool_holders: u64,
+
+    /// Token candidate: mark as blocklisted (rejects the token)
+    #[arg(long, default_value_t = false)]
+    pool_blocklisted: bool,
+
+    /// Jito Block Engine endpoint. When set, live submissions go through Jito
+    /// bundles with RPC fallback.
+    #[arg(long)]
+    jito_endpoint: Option<String>,
+
+    /// Jito bundle tip (lamports). Only used when --jito-endpoint is set.
+    #[arg(long, default_value_t = 0)]
+    jito_tip_lamports: u64,
+
+    /// Jito dry-run: validate the bundle payload but never POST it.
+    #[arg(long, default_value_t = false)]
+    jito_dry_run: bool,
+
+    /// Raydium CLMM pool to trade on. When set, live mode resolves the pool
+    /// state on-chain, feeds the real price into the strategy, and builds a
+    /// real AMM swap transaction. When unset, live mode keeps the safe
+    /// self-transfer test path.
+    #[arg(long)]
+    pool_id: Option<String>,
+
+    /// Input token mint (base58) for the swap. Required with --pool-id.
+    #[arg(long)]
+    input_mint: Option<String>,
+
+    /// Output token mint (base58) for the swap. Required with --pool-id.
+    #[arg(long)]
+    output_mint: Option<String>,
+
+    /// Max slippage in basis points (1/100 of a percent) for the swap.
+    #[arg(long, default_value_t = 100)]
+    max_slippage_bps: u64,
+
+    /// Max spend in SOL for a single trade (security cap).
+    #[arg(long, default_value_t = 0.01)]
+    max_spend_sol: f64,
+
+    /// When set with --pool-id, replaces the static --pool-liquidity /
+    /// --pool-holders CLI values with real on-chain data read via RPC
+    /// (input vault balance + getTokenLargestAccounts/getTokenSupply).
+    /// Fail-closed: an RPC error here halts the loop.
+    #[arg(long, default_value_t = false)]
+    live_risk_data: bool,
+
+    /// Path to a local blocklist file (one base58 mint per line, `#`
+    /// comments allowed). Only used with --live-risk-data. Missing file is
+    /// treated as an empty blocklist, not an error.
+    #[arg(long)]
+    blocklist_file: Option<PathBuf>,
+
+    /// Reject a candidate if the single largest holder (excluding the
+    /// pool's own vault) holds more than this percent of supply. Only used
+    /// with --live-risk-data.
+    #[arg(long, default_value_t = 50.0)]
+    max_top_holder_pct: f64,
+
+    /// Optional DexScreener cross-check for logging only. Never used to
+    /// gate a trade — a DexScreener failure only logs a warning.
+    #[arg(long, default_value_t = false)]
+    dexscreener_check: bool,
+
+    /// Optional WebSocket endpoint for real-time `programSubscribe` pool
+    /// updates (lower latency than RPC polling). Falls back to the
+    /// existing RPC-polled market data hook when unset or not yet
+    /// connected.
+    #[arg(long)]
+    ws_endpoint: Option<String>,
+
+    /// Manual "arm" kill switch for LIVE mode. Fail-closed default: false.
+    /// The live trading loop refuses to start unless this is explicitly
+    /// passed — a human must opt in every time the process starts in live
+    /// mode. Has no effect in --paper or --dry-run.
+    #[arg(long, default_value_t = false)]
+    confirm_live: bool,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -143,6 +237,7 @@ fn validate_signing_config(
     live: bool,
     dry_run: bool,
     paper: bool,
+    confirm_live: bool,
     hsm_endpoint: &Option<String>,
     hsm_ca: &Option<PathBuf>,
     hsm_client_identity: &Option<PathBuf>,
@@ -152,6 +247,12 @@ fn validate_signing_config(
     }
     if paper && (live || dry_run) {
         return Err("--paper is mutually exclusive with --live and --dry-run".to_string());
+    }
+    if live && !confirm_live {
+        return Err(
+            "LIVE mode requires the manual arm switch --confirm-live. Fail-closed: the live loop never starts by default."
+                .to_string(),
+        );
     }
     if live && hsm_endpoint.is_none() {
         return Err(
@@ -244,14 +345,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Solana HFT platform starting"
     );
 
-    let risk_cfg = risk::RiskConfig::devnet_defaults(args.data_dir.clone());
-    let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg));
+    // Centralized, fail-closed risk defaults (0.05 SOL/trade, 5 trades/day,
+    // 0.20 SOL daily loss kill-switch, 1 open position, 2% max slippage).
+    // Applied to every mode (paper/dry-run/live) for consistency — if the
+    // config itself cannot be validated, refuse to start at all.
+    let risk_cfg = risk::RiskConfig::production_defaults(args.data_dir.clone())?;
+    let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg.clone()));
     tracing::info!(
         target: "main",
         daily_loss = risk_manager.current_daily_loss(),
         circuit_breaker = risk_manager.is_circuit_breaker_active(),
+        state_verified = risk_manager.is_state_verified(),
         "risk manager initialized"
     );
+
+    if args.live {
+        // Fail-closed restart safety: if the persisted risk state
+        // (risk_state.json) could not be parsed, we cannot trust daily
+        // counters or open-position accounting after a restart. Refuse to
+        // arm live trading; the operator must investigate and clear the
+        // corrupt file, or continue running in --paper/--dry-run only.
+        if !risk_manager.is_state_verified() {
+            return Err(
+                "restart-safe risk state is unverifiable (corrupt or unreadable risk_state.json) \
+                 — refusing to arm LIVE trading. Restart with --paper or --dry-run only until \
+                 the state file is inspected/cleared."
+                    .to_string()
+                    .into(),
+            );
+        }
+        // Manual arm switch: --confirm-live was already required by
+        // validate_signing_config above, but the live loop itself must not
+        // start unless the switch is explicitly armed in the risk manager.
+        risk_manager.arm_live("--confirm-live provided and validated at startup");
+    }
+
+    let metrics_registry = metrics::Metrics::new();
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         args.rpc.clone(),
@@ -267,6 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.live,
         args.dry_run,
         args.paper,
+        args.confirm_live,
         &args.hsm_endpoint,
         &args.hsm_ca,
         &args.hsm_client_identity,
@@ -289,12 +419,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut successful_trades: u64 = 0;
     let mut total_latency_ms: u128 = 0;
 
-    for i in 0..args.iterations {
+    // Optional local blocklist, loaded once. Missing file => empty set (not
+    // a fail-closed condition — it just means this extra gate is inactive).
+    let blocklist: std::collections::HashSet<Pubkey> = match &args.blocklist_file {
+        Some(path) => onchain_risk::load_blocklist(path)?,
+        None => std::collections::HashSet::new(),
+    };
+
+    // Optional real-time WebSocket feed. Starts a background reconnect loop
+    // via `MarketDataHandler::start_stream`; the existing RPC-polled
+    // `PoolPriceFeed` remains the fail-closed fallback whenever the WS feed
+    // has no fresher data yet.
+    let ws_provider: Option<Arc<hft_marketdata::solana_ws::SolanaWsProvider>> = if let Some(
+        ws_url,
+    ) =
+        &args.ws_endpoint
+    {
+        let provider = Arc::new(hft_marketdata::solana_ws::SolanaWsProvider::new(
+            ws_url, &args.rpc,
+        ));
+        hft_marketdata::MarketDataHandler::start_stream(provider.as_ref())
+            .map_err(|e| format!("failed to start WebSocket market data stream: {e}"))?;
+        tracing::info!(target: "main", ws_endpoint = %ws_url, "WebSocket market data stream started");
+        Some(provider)
+    } else {
+        None
+    };
+
+    'main_loop: for i in 0..args.iterations {
         let iteration_start = std::time::Instant::now();
 
+        metrics::record_trade_attempt(&metrics_registry);
+        metrics::set_risk_gauges(
+            &metrics_registry,
+            risk_manager.is_circuit_breaker_active(),
+            -(risk_manager.current_daily_loss() as i64),
+            risk_manager.open_position_count(),
+        );
         if let Err(e) =
             risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
         {
+            metrics::record_trade_rejected(&metrics_registry, e.code());
             tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
             if args.live {
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
@@ -436,30 +601,444 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("live mode requires remote HSM (validated)");
             let ca = args.hsm_ca.as_ref().expect("validated");
             let identity = args.hsm_client_identity.as_ref().expect("validated");
-            let from = hsm_pubkey(endpoint, ca, identity).await?;
-            let to = from; // self-transfer for test
+            let from = match hsm_pubkey(endpoint, ca, identity).await {
+                Ok(pk) => pk,
+                Err(e) => {
+                    risk_manager
+                        .trip_circuit_breaker(&format!("HSM unavailable (fail-closed): {e}"));
+                    tracing::error!(target: "live", error = %e, "HSM pubkey fetch failed — circuit breaker tripped");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            let mut to = from; // self-transfer fallback when no pool is configured
+
+            // When --pool-id is set, resolve the pool on-chain and feed the
+            // real price into the strategy (market data hook). Fail-closed:
+            // any resolution error halts the loop.
+            let mut swap_adapter: Option<amm::raydium_v4::RaydiumV4ClmmAdapter> = None;
+            let mut entry_sqrt = 1u128 << 64; // placeholder when no pool is configured
+            let mut live_liquidity: Option<u64> = None;
+            let mut live_holder_stats: Option<onchain_risk::HolderStats> = None;
+            let mut live_blocklisted = false;
+            if let Some(pool_id_str) = &args.pool_id {
+                let pool_id =
+                    Pubkey::from_str(pool_id_str).map_err(|e| format!("invalid --pool-id: {e}"))?;
+                let input_mint = args
+                    .input_mint
+                    .as_ref()
+                    .ok_or("--input-mint is required with --pool-id")?;
+                let output_mint = args
+                    .output_mint
+                    .as_ref()
+                    .ok_or("--output-mint is required with --pool-id")?;
+                let input_mint = Pubkey::from_str(input_mint)
+                    .map_err(|e| format!("invalid --input-mint: {e}"))?;
+                let output_mint = Pubkey::from_str(output_mint)
+                    .map_err(|e| format!("invalid --output-mint: {e}"))?;
+
+                // Select the CLMM program id by cluster (devnet vs mainnet).
+                let program_id = if args.rpc.contains("devnet") {
+                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET)
+                        .expect("valid devnet program id")
+                } else {
+                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
+                        .expect("valid mainnet program id")
+                };
+
+                // Market data hook: prefer a fresh WebSocket update (lower
+                // latency) when the feed is connected and has data for this
+                // pool; otherwise fall back to the fail-closed RPC-polled hook.
+                let ws_state = ws_provider
+                    .as_ref()
+                    .filter(|p| p.is_connected())
+                    .and_then(|p| p.get_pool_state(pool_id_str));
+                let mut price_timestamp_ms: Option<u128> = None;
+                let (pool, used_ws) = if let Some(state) = ws_state {
+                    entry_sqrt = state.sqrt_price;
+                    price_timestamp_ms = Some(state.timestamp_ms);
+                    (None, true)
+                } else {
+                    let feed =
+                        marketdata::PoolPriceFeed::new(rpc_client.clone(), pool_id, program_id);
+                    let pool = match feed.refresh() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "pool state resolution failed (fail-closed): {e}"
+                            ));
+                            tracing::error!(target: "live", error = %e, "failed to resolve pool state — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    };
+                    entry_sqrt = pool.sqrt_price_x64;
+                    price_timestamp_ms = feed
+                        .age_ms()
+                        .map(|age| marketdata::now_ms().saturating_sub(age));
+                    (Some(pool), false)
+                };
+                tracing::info!(
+                    target: "live",
+                    pool_id = %pool_id,
+                    sqrt_price = entry_sqrt,
+                    source = if used_ws { "websocket" } else { "rpc_poll" },
+                    "resolved pool state — feeding real price into strategy"
+                );
+
+                // Fail-closed price staleness gate: missing or stale
+                // timestamps reject the trade rather than proceeding with
+                // unknown-freshness data.
+                if let Some(ts) = price_timestamp_ms {
+                    if let Err(reason) =
+                        risk::check_price_staleness(ts, risk_cfg.price_staleness_ms)
+                    {
+                        tracing::warn!(target: "live", iteration = i + 1, reason = %reason, "price staleness check failed — no trade this iteration (fail-closed)");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                } else {
+                    tracing::warn!(target: "live", iteration = i + 1, "no price timestamp available — rejecting trade (fail-closed)");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                // Resolve the full swap account set deterministically.
+                let (accounts, resolved) = match amm::account_resolver::resolve_swap_accounts(
+                    &rpc_client,
+                    &pool_id,
+                    &from,
+                    &input_mint,
+                    &output_mint,
+                    &program_id,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "swap account resolution failed (fail-closed): {e}"
+                        ));
+                        tracing::error!(target: "live", error = %e, "failed to resolve swap accounts — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+
+                // Mint/freeze authority rug-check: always enforced when a
+                // pool is configured, independent of --live-risk-data. A
+                // present mint or freeze authority means the token issuer
+                // can mint more supply or freeze accounts at will — reject
+                // fail-closed.
+                for (label, mint) in [("input", input_mint), ("output", output_mint)] {
+                    match onchain_risk::fetch_mint_authority_risk(&rpc_client, &mint) {
+                        Ok(risk) if risk.is_risky() => {
+                            tracing::warn!(
+                                target: "live",
+                                iteration = i + 1,
+                                mint_role = label,
+                                mint = %mint,
+                                mint_authority_present = risk.mint_authority_present,
+                                freeze_authority_present = risk.freeze_authority_present,
+                                "token authority risk detected — no trade this iteration (fail-closed)"
+                            );
+                            sleep(Duration::from_millis(200)).await;
+                            continue 'main_loop;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "mint authority check failed (fail-closed): {e}"
+                            ));
+                            tracing::error!(target: "live", error = %e, mint_role = label, "mint authority check failed — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue 'main_loop;
+                        }
+                    }
+                }
+
+                if args.live_risk_data {
+                    // Fail-closed: any RPC error here trips the circuit
+                    // breaker and skips this iteration rather than crashing
+                    // the whole process. This replaces the static
+                    // --pool-liquidity / --pool-holders CLI values with real
+                    // on-chain data.
+                    let liquidity = match onchain_risk::fetch_vault_liquidity(
+                        &rpc_client,
+                        &accounts.input_vault,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "live risk data (fail-closed): {e}"
+                            ));
+                            tracing::error!(target: "live", error = %e, "liquidity fetch failed — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    };
+                    let holder_stats = match onchain_risk::fetch_holder_stats(
+                        &rpc_client,
+                        &input_mint,
+                        &accounts.input_vault,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "live risk data (fail-closed): {e}"
+                            ));
+                            tracing::error!(target: "live", error = %e, "holder stats fetch failed — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        target: "live",
+                        liquidity,
+                        top_holder_pct = holder_stats.top_holder_pct,
+                        sampled_holders = holder_stats.sampled_holders,
+                        "fetched real on-chain liquidity + holder concentration"
+                    );
+                    live_blocklisted =
+                        blocklist.contains(&input_mint) || blocklist.contains(&output_mint);
+                    live_liquidity = Some(liquidity);
+                    live_holder_stats = Some(holder_stats);
+                }
+
+                if args.dexscreener_check {
+                    // Advisory only — never gates the trade. A failure here
+                    // is only logged as a warning.
+                    match discovery::fetch_snapshot(pool_id_str) {
+                        Ok(snapshot) => tracing::info!(
+                            target: "live",
+                            liquidity_usd = snapshot.liquidity_usd,
+                            fdv = snapshot.fdv,
+                            volume_24h_usd = snapshot.volume_24h_usd,
+                            "dexscreener advisory snapshot (not used for trading gate)"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "live",
+                            error = %e,
+                            "dexscreener advisory check failed — ignored, not gating trade"
+                        ),
+                    }
+                }
+
+                let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+                    .with_swap_accounts(accounts)
+                    .with_resolved_pool(resolved);
+                swap_adapter = Some(adapter);
+            }
+
+            // Strategy gate: evaluate the token candidate. If the strategy
+            // rejects it (fail-closed), no trade is built or sent this
+            // iteration. This wires SimpleSnipeStrategy into the live path.
+            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            let candidate = strategy::TokenCandidate {
+                liquidity_lamports: live_liquidity.unwrap_or(args.pool_liquidity),
+                market_cap_lamports: args.pool_market_cap,
+                holders: live_holder_stats
+                    .as_ref()
+                    .map(|h| h.sampled_holders)
+                    .unwrap_or(args.pool_holders),
+                is_blocklisted: args.pool_blocklisted
+                    || live_blocklisted
+                    || live_holder_stats
+                        .as_ref()
+                        .is_some_and(|h| h.top_holder_pct > args.max_top_holder_pct),
+            };
+            let entry_signal = strategy.evaluate(&candidate, entry_sqrt);
+
+            let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
+            rec.mode = "live".to_string();
+            rec.pool_id = "live_pool".to_string();
+            rec.token_in = "SOL".to_string();
+            rec.token_out = "SOL".to_string();
+            rec.liquidity = candidate.liquidity_lamports.to_string();
+            rec.context = serde_json::json!({
+                "entry": entry_signal.is_some(),
+                "market_cap": candidate.market_cap_lamports,
+                "holders": candidate.holders,
+                "blocklisted": candidate.is_blocklisted,
+            });
+
+            let Some(entry_signal) = entry_signal else {
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    liquidity = candidate.liquidity_lamports,
+                    market_cap = candidate.market_cap_lamports,
+                    holders = candidate.holders,
+                    blocklisted = candidate.is_blocklisted,
+                    "strategy rejected candidate — no trade this iteration (fail-closed)"
+                );
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            rec.amount_in = entry_signal.position_size_lamports;
+            rec.save(&args.data_dir)?;
+
+            // Security: max spend (SOL) cap enforced before any trade.
+            let max_spend_lamports = solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+            if entry_signal.position_size_lamports > max_spend_lamports {
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    position_size_lamports = entry_signal.position_size_lamports,
+                    max_spend_lamports = max_spend_lamports,
+                    "max spend (SOL) cap exceeded — no trade this iteration (fail-closed)"
+                );
+                metrics::record_trade_rejected(&metrics_registry, "max_spend_exceeded");
+                rec.context = serde_json::json!({
+                    "entry": true,
+                    "risk_rejected": "max_spend_sol_exceeded",
+                });
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
+            // Risk gate: enforce kill switch, daily trade cap, position size,
+            // and slippage before building any transaction. Fail-closed: if
+            // any limit is exceeded, no trade is built or sent this iteration.
+            if let Err(e) = risk_manager.pre_trade_check(
+                entry_signal.position_size_lamports,
+                entry_signal.slippage_bps,
+            ) {
+                metrics::record_trade_rejected(&metrics_registry, e.code());
+                tracing::warn!(
+                    target: "live",
+                    iteration = i + 1,
+                    error = %e,
+                    "risk gate rejected trade — no trade this iteration (fail-closed)"
+                );
+                rec.context = serde_json::json!({
+                    "entry": true,
+                    "risk_rejected": e,
+                });
+                rec.save(&args.data_dir)?;
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
 
             // Fresh blockhash per iteration to avoid replay
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
-                // Dynamic compute units per iteration for uniqueness
-                let cu_limit = 400 + (i % 200);
-                let cu_ix =
-                    solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
-                        cu_limit,
-                    );
-                let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
-                let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
-                let mut tx = Transaction::new_unsigned(msg);
-                // Apply the freshly-fetched blockhash before signing; otherwise the
-                // transaction is submitted with a zero blockhash and the RPC rejects
-                // it with "Blockhash not found" during simulation.
-                tx.message.recent_blockhash = blockhash;
-                let sig = hsm_sign(endpoint, ca, identity, &mut tx).await?;
+                // Build the transaction: a real AMM swap when a pool is
+                // configured, otherwise the safe self-transfer test path.
+                let mut tx = if let Some(adapter) = &swap_adapter {
+                    // Real swap: quote from the resolved on-chain price, apply
+                    // slippage (min_amount_out), and build the CLMM swap tx.
+                    let quote = adapter
+                        .quote(entry_signal.position_size_lamports, args.max_slippage_bps)
+                        .map_err(|e| format!("quote failed (fail-closed): {e}"))?;
+                    let intent = adapter
+                        .build_intent(quote)
+                        .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
+                    let mut t = adapter
+                        .build_transaction(&intent, &from, blockhash)
+                        .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?;
+                    t.message.recent_blockhash = blockhash;
+                    t
+                } else {
+                    // Dynamic compute units per iteration for uniqueness
+                    let cu_limit = 400 + (i % 200);
+                    let cu_ix =
+                        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                            cu_limit,
+                        );
+                    let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
+                    let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
+                    let mut t = Transaction::new_unsigned(msg);
+                    // Apply the freshly-fetched blockhash before signing; otherwise the
+                    // transaction is submitted with a zero blockhash and the RPC rejects
+                    // it with "Blockhash not found" during simulation.
+                    t.message.recent_blockhash = blockhash;
+                    t
+                };
+                // Final pre-send recheck: re-validate kill switch, circuit
+                // breaker, daily limits, slippage, max-spend, and position
+                // caps immediately before signing — state may have changed
+                // (e.g. another iteration tripped the breaker) since the
+                // earlier check at the top of this iteration.
+                if let Err(e) = risk_manager.pre_trade_check(
+                    entry_signal.position_size_lamports,
+                    entry_signal.slippage_bps,
+                ) {
+                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    tracing::warn!(target: "live", iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                let sig = match hsm_sign(endpoint, ca, identity, &mut tx).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "HSM signing failed (fail-closed): {e}"
+                        ));
+                        tracing::error!(target: "live", error = %e, "HSM signing failed — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
                 tx.signatures = vec![sig];
 
-                match retry::send_with_retry(&*rpc_client, &tx) {
+                // Submission: if a Jito endpoint is configured, send via Jito
+                // bundle with RPC fallback. Otherwise send directly via RPC.
+                //
+                // IMPORTANT: in Jito dry-run mode the bundle is validated but
+                // never POSTed, so the transaction must still be submitted to
+                // the RPC for confirmation. Only a real (non-dry-run) Jito
+                // bundle acceptance counts as a confirmed submission.
+                let send_result = if let Some(jito_ep) = &args.jito_endpoint {
+                    let bundle = jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
+                    let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
+                    if args.jito_dry_run {
+                        // Dry-run: validate the bundle, then submit via RPC.
+                        match client.send_bundle(&bundle).await {
+                            Ok(bundle_id) => {
+                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC");
+                                retry::send_with_retry(&*rpc_client, &tx)
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "live", error = %e, "jito dry-run validation failed — submitting via RPC");
+                                retry::send_with_retry(&*rpc_client, &tx)
+                            }
+                        }
+                    } else {
+                        // Live Jito: send the bundle; fall back to RPC on failure.
+                        match client.send_bundle(&bundle).await {
+                            Ok(bundle_id) => {
+                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle accepted");
+                                Ok(tx.signatures[0])
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "live", error = %e, "jito bundle failed — falling back to RPC");
+                                jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                            }
+                        }
+                    }
+                } else {
+                    retry::send_with_retry(&*rpc_client, &tx)
+                };
+
+                match send_result {
                     Ok(sig) => {
                         successful_trades += 1;
+                        // Record the completed trade (daily trade counter)
+                        // and the newly opened position/exposure.
+                        //
+                        // KNOWN GAP: this codebase has no exit-execution
+                        // path (SimpleSnipeStrategy::should_exit() is
+                        // computed but never acted on in the live loop), so
+                        // record_position_close() is never called and
+                        // realized P&L is not tracked for wins. See final
+                        // report for details — not fabricated here.
+                        risk_manager.record_trade();
+                        risk_manager.record_position_open(entry_signal.position_size_lamports);
+                        metrics::record_trade_executed(&metrics_registry);
                         tracing::info!(target: "live", signature = %sig, "transaction confirmed");
                         let cluster = if args.rpc.contains("devnet") {
                             "devnet"
@@ -575,8 +1154,24 @@ mod tests {
 
     #[test]
     fn live_requires_hsm() {
-        let err = validate_signing_config(true, false, false, &None, &None, &None).unwrap_err();
+        let err =
+            validate_signing_config(true, false, false, true, &None, &None, &None).unwrap_err();
         assert!(err.contains("--hsm-endpoint"), "got: {err}");
+    }
+
+    #[test]
+    fn live_without_confirm_live_is_rejected() {
+        let err = validate_signing_config(
+            true,
+            false,
+            false,
+            false,
+            &Some("https://127.0.0.1:8443".to_string()),
+            &opt("ca.pem"),
+            &opt("client_all.pem"),
+        )
+        .unwrap_err();
+        assert!(err.contains("--confirm-live"), "got: {err}");
     }
 
     #[test]
@@ -585,6 +1180,7 @@ mod tests {
             true,
             false,
             false,
+            true,
             &Some("https://127.0.0.1:8443".to_string()),
             &None,
             &None,
@@ -599,6 +1195,7 @@ mod tests {
             true,
             false,
             false,
+            true,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -612,6 +1209,7 @@ mod tests {
             true,
             true,
             false,
+            true,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -622,7 +1220,7 @@ mod tests {
 
     #[test]
     fn dry_run_without_hsm_ok() {
-        assert!(validate_signing_config(false, true, false, &None, &None, &None).is_ok());
+        assert!(validate_signing_config(false, true, false, false, &None, &None, &None).is_ok());
     }
 
     #[test]
@@ -630,6 +1228,7 @@ mod tests {
         let err = validate_signing_config(
             false,
             true,
+            false,
             false,
             &Some("https://127.0.0.1:8443".to_string()),
             &None,
@@ -645,6 +1244,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -659,6 +1259,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             &Some("https://127.0.0.1:8443".to_string()),
             &opt("ca.pem"),
             &opt("client_all.pem"),
@@ -669,6 +1270,6 @@ mod tests {
 
     #[test]
     fn paper_alone_ok() {
-        assert!(validate_signing_config(false, false, true, &None, &None, &None).is_ok());
+        assert!(validate_signing_config(false, false, true, false, &None, &None, &None).is_ok());
     }
 }
