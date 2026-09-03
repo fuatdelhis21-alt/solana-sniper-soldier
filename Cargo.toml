@@ -57,6 +57,8 @@ solana-pubkey = "2.2"
 solana-commitment-config = "2.2"
 solana-compute-budget-interface = "2.2"
 solana-transaction-status = "2.2"
+spl-associated-token-account = "7.0"
+spl-token = "8.0"
 
 hft-core = { path = "crates/hft-core" }
 hft-marketdata = { path = "crates/hft-marketdata" }

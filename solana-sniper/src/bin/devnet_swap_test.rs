@@ -23,8 +23,8 @@ use clap::Parser;
 use serde::Serialize;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, message::Message, pubkey::Pubkey, signature::Signature,
-    transaction::Transaction,
+    commitment_config::CommitmentConfig, instruction::Instruction, message::Message,
+    native_token::LAMPORTS_PER_SOL, pubkey::Pubkey, signature::Signature, transaction::Transaction,
 };
 use solana_sniper::amm::account_resolver::{
     resolve_swap_accounts, RAYDIUM_CLMM_PROGRAM_ID, RAYDIUM_CLMM_PROGRAM_ID_DEVNET,
@@ -65,6 +65,11 @@ struct Args {
     /// Max slippage in basis points.
     #[arg(long, default_value_t = 100)]
     slippage_bps: u64,
+
+    /// Security cap: maximum SOL that may be spent in a single real swap.
+    /// Fail-closed — refuses to build the transaction above this cap.
+    #[arg(long, default_value_t = 0.05)]
+    max_spend_sol: f64,
 
     /// Remote HSM endpoint (mTLS).
     #[arg(long)]
@@ -153,6 +158,18 @@ fn main() -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow!("--output-mint is required unless --mock"))?;
 
+        // Fail-closed security cap: refuse to build a transaction that would
+        // spend more SOL than explicitly allowed.
+        let max_spend_lamports = (args.max_spend_sol * LAMPORTS_PER_SOL as f64) as u64;
+        if args.amount_lamports > max_spend_lamports {
+            return Err(anyhow!(
+                "amount_lamports ({}) exceeds --max-spend-sol cap ({} lamports / {} SOL) — refusing (fail-closed)",
+                args.amount_lamports,
+                max_spend_lamports,
+                args.max_spend_sol
+            ));
+        }
+
         let pool_id =
             Pubkey::from_str(pool_id_str).map_err(|e| anyhow!("invalid --pool-id: {e}"))?;
         let input_mint =
@@ -193,17 +210,67 @@ fn main() -> Result<()> {
 
         let adapter = RaydiumV4ClmmAdapter::new(pool_id_str.clone())
             .with_swap_accounts(accounts)
-            .with_resolved_pool(pool);
+            .with_resolved_pool(pool)
+            .with_program_id(program_id.to_string());
 
         let quote = adapter
             .quote(args.amount_lamports, args.slippage_bps)
             .map_err(|e| anyhow!("quote failed: {e}"))?;
+        tracing::info!(
+            input_amount = quote.input_amount,
+            expected_output = quote.expected_output,
+            slippage_bps = quote.slippage_bps,
+            "quote computed from real on-chain pool state"
+        );
         let intent = adapter
             .build_intent(quote)
             .map_err(|e| anyhow!("build_intent failed: {e}"))?;
-        let mut t = adapter
-            .build_transaction(&intent, &from, blockhash)
-            .map_err(|e| anyhow!("build_transaction failed: {e}"))?;
+        tracing::info!(
+            min_output = intent.min_output,
+            "minimum output computed (slippage protection)"
+        );
+        let swap_ix = adapter
+            .build_swap_instruction(&intent, &from)
+            .map_err(|e| anyhow!("build_swap_instruction failed: {e}"))?;
+
+        // Preamble: ensure both ATAs exist (idempotent create), and if the
+        // input mint is native SOL, wrap the exact swap amount into the
+        // input ATA before the swap instruction runs.
+        let mut ixs: Vec<Instruction> = Vec::new();
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &from,
+                &from,
+                &input_mint,
+                &spl_token::ID,
+            ),
+        );
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &from,
+                &from,
+                &output_mint,
+                &spl_token::ID,
+            ),
+        );
+        let native_mint = spl_token::native_mint::ID;
+        if input_mint == native_mint {
+            let input_ata =
+                spl_associated_token_account::get_associated_token_address(&from, &input_mint);
+            ixs.push(solana_sdk::system_instruction::transfer(
+                &from,
+                &input_ata,
+                args.amount_lamports,
+            ));
+            ixs.push(
+                spl_token::instruction::sync_native(&spl_token::ID, &input_ata)
+                    .map_err(|e| anyhow!("failed to build sync_native instruction: {e}"))?,
+            );
+        }
+        ixs.push(swap_ix);
+
+        let message = Message::new(&ixs, Some(&from));
+        let mut t = Transaction::new_unsigned(message);
         t.message.recent_blockhash = blockhash;
         t
     };

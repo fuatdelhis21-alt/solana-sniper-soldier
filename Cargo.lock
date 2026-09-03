@@ -5476,6 +5476,8 @@ dependencies = [
  "solana-sdk",
  "solana-signature",
  "solana-transaction-status",
+ "spl-associated-token-account",
+ "spl-token",
  "tokio",
  "toml 0.8.23",
  "tracing",

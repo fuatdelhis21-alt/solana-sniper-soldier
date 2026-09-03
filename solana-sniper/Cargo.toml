@@ -12,6 +12,8 @@ description = "Ultra-low-latency, production-grade Solana trading platform"
 hft-core.workspace = true
 hft-marketdata.workspace = true
 hft-execution.workspace = true
+spl-associated-token-account.workspace = true
+spl-token.workspace = true
 
 anyhow.workspace = true
 serde.workspace = true

@@ -68,6 +68,13 @@ impl RaydiumV4ClmmAdapter {
         self
     }
 
+    /// Override the CLMM program id used to build the swap instruction.
+    /// Required for devnet (mainnet program id does not exist on devnet).
+    pub fn with_program_id(mut self, program_id: String) -> Self {
+        self.program_id = program_id;
+        self
+    }
+
     /// Attach a resolved pool state so `quote` uses the real on-chain price.
     pub fn with_resolved_pool(mut self, pool: ResolvedPool) -> Self {
         self.pool = Some(pool);
@@ -122,9 +129,9 @@ impl RaydiumV4ClmmAdapter {
             AccountMeta::new(accounts.output_token_account, false),
             AccountMeta::new(accounts.input_vault, false),
             AccountMeta::new(accounts.output_vault, false),
-            AccountMeta::new_readonly(accounts.observation_state, false),
+            AccountMeta::new(accounts.observation_state, false),
             AccountMeta::new_readonly(token_program, false),
-            AccountMeta::new_readonly(accounts.tick_array, false),
+            AccountMeta::new(accounts.tick_array, false),
         ];
 
         Ok(Instruction {

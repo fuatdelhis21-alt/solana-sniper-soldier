@@ -83,7 +83,10 @@ impl ResolvedPool {
     /// The tick-array start index for the current tick.
     pub fn tick_array_start_index(&self) -> i32 {
         let ticks_in_array = TICK_ARRAY_SIZE * i32::from(self.tick_spacing);
-        (self.tick_current / ticks_in_array) * ticks_in_array
+        // Floor division (not truncation) — required for negative ticks, since
+        // Rust's `/` truncates toward zero and Raydium's on-chain program
+        // expects the mathematical floor of tick_current / ticks_in_array.
+        self.tick_current.div_euclid(ticks_in_array) * ticks_in_array
     }
 
     /// Derive the tick-array PDA for the current tick.
@@ -314,6 +317,27 @@ mod tests {
         let pool = parse_pool_state(&pool_id, &data).unwrap();
         // ticks_in_array = 60 * 10 = 600; start = (125/600)*600 = 0
         assert_eq!(pool.tick_array_start_index(), 0);
+    }
+
+    #[test]
+    fn tick_array_start_index_floors_negative_tick() {
+        let pool_id = Pubkey::new_unique();
+        let data = synthetic_pool_data(
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            1u128 << 64,
+            0,
+            -19234, // tick (negative)
+            60,     // tick_spacing
+        );
+        let pool = parse_pool_state(&pool_id, &data).unwrap();
+        // ticks_in_array = 60 * 60 = 3600; naive truncating division gives
+        // -18000 (wrong, rounds toward zero); the correct floored start is -21600.
+        assert_eq!(pool.tick_array_start_index(), -21600);
     }
 
     #[test]
