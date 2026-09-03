@@ -21,6 +21,17 @@ pub struct PoolPriceFeed {
     pool_id: Pubkey,
     program_id: Pubkey,
     last: Mutex<Option<ResolvedPool>>,
+    /// Unix ms timestamp of the last successful `refresh()`. `None` means
+    /// no snapshot has ever been fetched — used by `age_ms`/`is_stale` to
+    /// fail closed on data that was never actually retrieved.
+    last_refreshed_ms: Mutex<Option<u128>>,
+}
+
+pub fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 impl PoolPriceFeed {
@@ -30,6 +41,7 @@ impl PoolPriceFeed {
             pool_id,
             program_id,
             last: Mutex::new(None),
+            last_refreshed_ms: Mutex::new(None),
         }
     }
 
@@ -38,7 +50,24 @@ impl PoolPriceFeed {
     pub fn refresh(&self) -> Result<ResolvedPool, String> {
         let pool = fetch_pool_state(&self.rpc, &self.pool_id)?;
         *self.last.lock().unwrap() = Some(pool.clone());
+        *self.last_refreshed_ms.lock().unwrap() = Some(now_ms());
         Ok(pool)
+    }
+
+    /// Age (ms) of the cached snapshot, or `None` if nothing has ever been
+    /// fetched (treated as maximally stale by callers).
+    pub fn age_ms(&self) -> Option<u128> {
+        let ts = (*self.last_refreshed_ms.lock().unwrap())?;
+        Some(now_ms().saturating_sub(ts))
+    }
+
+    /// Fail-closed staleness check: missing data (never fetched) is always
+    /// stale, regardless of `max_age_ms`.
+    pub fn is_stale(&self, max_age_ms: u64) -> bool {
+        match self.age_ms() {
+            Some(age) => age > max_age_ms as u128,
+            None => true,
+        }
     }
 
     /// The most recent successfully-fetched pool snapshot.
@@ -59,14 +88,14 @@ impl PoolPriceFeed {
     /// Convert the latest pool snapshot to a [`PriceQuote`] (token1/token0).
     pub fn to_quote(&self) -> Option<PriceQuote> {
         let pool = self.latest()?;
+        // Use the actual last-fetch timestamp (not "now") so a downstream
+        // staleness check reflects when the data was really retrieved.
+        let timestamp_ms = (*self.last_refreshed_ms.lock().unwrap()).unwrap_or(0);
         Some(PriceQuote {
             symbol: format!("{}/{}", pool.token_mint_0, pool.token_mint_1),
             bid: pool.price(),
             ask: pool.price(),
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
+            timestamp_ms,
         })
     }
 }
@@ -99,5 +128,14 @@ mod tests {
         assert!(feed.to_quote().is_none());
         // Refresh against a dead RPC must fail closed (Err), not panic.
         assert!(feed.refresh().is_err());
+    }
+
+    #[test]
+    fn never_fetched_is_always_stale() {
+        let rpc = Arc::new(RpcClient::new("http://127.0.0.1:8899".to_string()));
+        let feed = PoolPriceFeed::new(rpc, Pubkey::new_unique(), Pubkey::new_unique());
+        assert!(feed.age_ms().is_none());
+        // Even a huge max age must not make "never fetched" pass — fail-closed.
+        assert!(feed.is_stale(u64::MAX));
     }
 }
