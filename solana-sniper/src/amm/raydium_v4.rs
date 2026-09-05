@@ -50,6 +50,11 @@ pub struct RaydiumV4ClmmAdapter {
     program_id: String,
     accounts: Option<SwapAccounts>,
     pool: Option<ResolvedPool>,
+    /// Which of the pool's two mints is the swap *input*. `None` keeps the
+    /// legacy default direction token0 → token1. `Some(mint)` makes
+    /// `quote` compute the direction-aware output (token1 → token0 flips the
+    /// price) and report input/output mints that match the actual swap.
+    input_mint: Option<Pubkey>,
 }
 
 impl RaydiumV4ClmmAdapter {
@@ -59,12 +64,22 @@ impl RaydiumV4ClmmAdapter {
             program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
             accounts: None,
             pool: None,
+            input_mint: None,
         }
     }
 
     /// Set the full swap account set. Required before `build_transaction`.
     pub fn with_swap_accounts(mut self, accounts: SwapAccounts) -> Self {
         self.accounts = Some(accounts);
+        self
+    }
+
+    /// Declare which of the pool's mints is the input side of the swap, so
+    /// `quote` prices the correct direction (selling token1 for token0 must
+    /// divide by the token0/token1 price, not multiply). Fail-closed at
+    /// quote time if the mint is not one of the pool's two mints.
+    pub fn with_input_mint(mut self, mint: Pubkey) -> Self {
+        self.input_mint = Some(mint);
         self
     }
 
@@ -183,11 +198,52 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
         let sqrt_price = pool.sqrt_price_x64;
         // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
         let fee_rate = 500u64;
-        let expected_output = Self::compute_output_amount(input_amount, sqrt_price, fee_rate);
+
+        // Direction-aware pricing: the tx always sells `input_mint` (when
+        // declared). token0 → token1 multiplies by price; token1 → token0
+        // divides by it. The legacy default (input_mint = None) keeps the
+        // token0 → token1 convention for backward compatibility.
+        let (input_mint_str, output_mint_str, expected_output) = match self.input_mint {
+            Some(m) if m == pool.token_mint_0 => (
+                pool.token_mint_0.to_string(),
+                pool.token_mint_1.to_string(),
+                Self::compute_output_amount(input_amount, sqrt_price, fee_rate),
+            ),
+            Some(m) if m == pool.token_mint_1 => {
+                let price = Self::sqrt_price_to_price(sqrt_price);
+                // Fail-closed: a zero/non-finite price cannot price the
+                // reverse direction — never fabricate an output.
+                if !(price > 0.0) || !price.is_finite() {
+                    return Err(format!(
+                        "cannot price token1 → token0: pool price is not positive/finite (sqrt={sqrt_price})"
+                    )
+                    .into());
+                }
+                let gross_output = ((input_amount as f64) / price) as u64;
+                let fee = gross_output.saturating_mul(fee_rate) / 1_000_000;
+                (
+                    pool.token_mint_1.to_string(),
+                    pool.token_mint_0.to_string(),
+                    gross_output.saturating_sub(fee),
+                )
+            }
+            Some(_) => {
+                return Err(
+                    "input mint is not one of the pool's two mints — refusing to quote (fail-closed)"
+                        .into(),
+                );
+            }
+            None => (
+                pool.token_mint_0.to_string(),
+                pool.token_mint_1.to_string(),
+                Self::compute_output_amount(input_amount, sqrt_price, fee_rate),
+            ),
+        };
+
         Ok(Quote {
             pool_id: self.pool_id.clone(),
-            input_mint: pool.token_mint_0.to_string(),
-            output_mint: pool.token_mint_1.to_string(),
+            input_mint: input_mint_str,
+            output_mint: output_mint_str,
             input_amount,
             expected_output,
             slippage_bps,
@@ -276,6 +332,66 @@ mod tests {
         // price=1.0, fee 0.05% => output slightly below input.
         assert!(quote.expected_output < 1_000_000);
         assert!(quote.expected_output > 990_000);
+    }
+
+    #[test]
+    fn quote_token1_to_token0_divides_by_price() {
+        let pool = synthetic_pool_with(1u128 << 65); // price = 4.0
+        let adapter = sample_adapter()
+            .with_resolved_pool(pool.clone())
+            .with_input_mint(pool.token_mint_1);
+        // Selling 1_000_000 of token1 at price 4.0 (token1 per token0) =>
+        // ~250_000 token0 before the 0.05% fee.
+        let quote = adapter.quote(1_000_000, 100).unwrap();
+        assert_eq!(quote.input_mint, pool.token_mint_1.to_string());
+        assert_eq!(quote.output_mint, pool.token_mint_0.to_string());
+        assert!(quote.expected_output < 250_000);
+        assert!(quote.expected_output > 248_000);
+    }
+
+    #[test]
+    fn quote_token0_to_token1_multiplies_by_price() {
+        let pool = synthetic_pool_with(1u128 << 65); // price = 4.0
+        let adapter = sample_adapter()
+            .with_resolved_pool(pool.clone())
+            .with_input_mint(pool.token_mint_0);
+        // Selling 1_000_000 of token0 at price 4.0 => ~4_000_000 token1.
+        let quote = adapter.quote(1_000_000, 100).unwrap();
+        assert_eq!(quote.input_mint, pool.token_mint_0.to_string());
+        assert_eq!(quote.output_mint, pool.token_mint_1.to_string());
+        assert!(quote.expected_output > 3_980_000);
+        assert!(quote.expected_output < 4_000_000);
+    }
+
+    #[test]
+    fn quote_rejects_input_mint_not_in_pool() {
+        let pool = synthetic_pool_with(1u128 << 64);
+        let adapter = sample_adapter()
+            .with_resolved_pool(pool)
+            .with_input_mint(Pubkey::new_unique());
+        assert!(adapter.quote(1_000_000, 100).is_err());
+    }
+
+    #[test]
+    fn quote_token1_to_token0_rejects_zero_price() {
+        // sqrt_price = 0 => price = 0; reverse pricing must fail closed.
+        let pool = synthetic_pool_with(0);
+        let adapter = sample_adapter()
+            .with_resolved_pool(pool.clone())
+            .with_input_mint(pool.token_mint_1);
+        assert!(adapter.quote(1_000_000, 100).is_err());
+    }
+
+    /// Synthetic pool state with distinct token mints (mint_0 @ byte 73,
+    /// mint_1 @ byte 105 per the real CLMM zero_copy layout) so direction
+    /// arms can be exercised independently.
+    fn synthetic_pool_with(sqrt_price_x64: u128) -> ResolvedPool {
+        let mut data = vec![0u8; 273];
+        data[73..105].copy_from_slice(&[7u8; 32]); // token_mint_0
+        data[105..137].copy_from_slice(&[9u8; 32]); // token_mint_1
+        data[253..269].copy_from_slice(&sqrt_price_x64.to_le_bytes());
+        let pool_id = Pubkey::new_unique();
+        RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).unwrap()
     }
 
     fn sample_adapter() -> RaydiumV4ClmmAdapter {
