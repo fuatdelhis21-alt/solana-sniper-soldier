@@ -330,6 +330,39 @@ fn resolve_blockhash(
     }
 }
 
+/// Read the raw token balance (u64 `amount` field, little-endian at byte
+/// offset 64 of an SPL token account) of the owner's ATA for `mint`.
+/// Returns `Ok(None)` when the ATA does not exist yet, `Err` on RPC failure
+/// or malformed data (fail-closed callers decide what None means — for a
+/// position that should hold tokens, None is treated as zero/absent, never
+/// as a fabricated balance).
+///
+/// NOTE: synchronous RPC (blocking) — matches the codebase convention of
+/// using the blocking `RpcClient` inside the tokio runtime (see
+/// `PoolPriceFeed::refresh`).
+fn token_account_balance_raw(
+    rpc: &RpcClient,
+    owner: &Pubkey,
+    mint: &Pubkey,
+) -> Result<Option<u64>, String> {
+    let ata = amm::account_resolver::resolve_user_ata(owner, mint);
+    let resp = rpc
+        .get_account_with_commitment(&ata, CommitmentConfig::confirmed())
+        .map_err(|e| format!("failed to fetch token account {ata}: {e}"))?;
+    let Some(account) = resp.value else {
+        return Ok(None);
+    };
+    if account.data.len() < 72 {
+        return Err(format!(
+            "token account {ata} data too short: {} bytes (< 72)",
+            account.data.len()
+        ));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&account.data[64..72]);
+    Ok(Some(u64::from_le_bytes(buf)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -453,20 +486,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics::set_risk_gauges(
             &metrics_registry,
             risk_manager.is_circuit_breaker_active(),
-            -(risk_manager.current_daily_loss() as i64),
+            risk_manager.realized_pnl(),
             risk_manager.open_position_count(),
         );
-        if let Err(e) =
-            risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
-        {
-            metrics::record_trade_rejected(&metrics_registry, e.code());
-            tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
-            if args.live {
-                eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
-                break;
+        // Entry gates apply only when no position is open. With an open
+        // position this is an EXIT-management iteration: the exit path below
+        // enforces its own fail-closed gates (pre_exit_check), and opening a
+        // second position is impossible by construction (max 1 open
+        // position), so the entry pre_trade_check would only false-positive
+        // and halt the loop right after a successful entry.
+        if risk_manager.open_position_count() == 0 {
+            if let Err(e) =
+                risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
+            {
+                metrics::record_trade_rejected(&metrics_registry, e.code());
+                tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
+                if args.live {
+                    eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
+                    break;
+                }
+                sleep(Duration::from_millis(200)).await;
+                continue;
             }
-            sleep(Duration::from_millis(200)).await;
-            continue;
         }
 
         if args.paper {
@@ -621,6 +662,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut live_liquidity: Option<u64> = None;
             let mut live_holder_stats: Option<onchain_risk::HolderStats> = None;
             let mut live_blocklisted = false;
+            // Direction metadata hoisted out of the pool block: the confirmed
+            // entry needs the real mint pubkeys for on-chain balance
+            // measurement (position accounting), and the exit path needs them
+            // to build the reversed swap.
+            let mut live_input_mint: Option<Pubkey> = None;
+            let mut live_output_mint: Option<Pubkey> = None;
+            let mut live_program_id: Option<Pubkey> = None;
             if let Some(pool_id_str) = &args.pool_id {
                 let pool_id =
                     Pubkey::from_str(pool_id_str).map_err(|e| format!("invalid --pool-id: {e}"))?;
@@ -636,6 +684,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("invalid --input-mint: {e}"))?;
                 let output_mint = Pubkey::from_str(output_mint)
                     .map_err(|e| format!("invalid --output-mint: {e}"))?;
+                live_input_mint = Some(input_mint);
+                live_output_mint = Some(output_mint);
 
                 // Select the CLMM program id by cluster (devnet vs mainnet).
                 let program_id = if args.rpc.contains("devnet") {
@@ -645,6 +695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
                         .expect("valid mainnet program id")
                 };
+                live_program_id = Some(program_id);
 
                 // Market data hook: prefer a fresh WebSocket update (lower
                 // latency) when the feed is connected and has data for this
@@ -824,8 +875,358 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
                     .with_swap_accounts(accounts)
-                    .with_resolved_pool(resolved);
+                    .with_resolved_pool(resolved)
+                    .with_program_id(program_id.to_string())
+                    .with_input_mint(input_mint);
                 swap_adapter = Some(adapter);
+            }
+
+            // ================================================================
+            // EXIT MANAGEMENT — position close on TP/SL signal
+            // ================================================================
+            // An open position makes this an EXIT-management iteration: new
+            // entries are impossible until the position is closed (max 1 open
+            // position, enforced by pre_trade_check / record_entry). The exit
+            // path mirrors the entry path's fail-closed discipline: price
+            // freshness, pool re-resolution, slippage/min-output, risk gates,
+            // a final pre-send recheck, HSM signing, on-chain confirmation —
+            // and only then is the position closed with the REAL measured
+            // proceeds and the realized P&L booked.
+            if risk_manager.open_position_count() > 0 {
+                let pos = risk_manager
+                    .current_position()
+                    .expect("open_position_count > 0 implies a recorded position");
+
+                // The bot trades one pool per process run; a position opened
+                // on another pool cannot be managed here (fail-closed halt).
+                let Some(pool_id_str) = &args.pool_id else {
+                    tracing::error!(target: "live", "open position but --pool-id is not set — cannot manage exit (fail-closed)");
+                    eprintln!("[CRITICAL] Open position exists but --pool-id is not set. Cannot manage exit. Stopping.");
+                    break;
+                };
+                if pool_id_str != &pos.pool_id {
+                    tracing::error!(target: "live", position_pool = %pos.pool_id, configured_pool = %pool_id_str, "open position belongs to a different pool than --pool-id — cannot manage exit (fail-closed)");
+                    eprintln!(
+                        "[CRITICAL] Open position pool != --pool-id. Cannot manage exit. Stopping."
+                    );
+                    break;
+                }
+
+                // Exit signal from the EXISTING SimpleSnipeStrategy (TP/SL
+                // thresholds from StrategyConfig — no new strategy invented).
+                let strategy =
+                    strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+                let exit_decision = strategy.should_exit(pos.entry_sqrt_price, entry_sqrt);
+
+                let mut rec = decision::DecisionRecord::new("simple_snipe", "live_exit");
+                rec.mode = "live".to_string();
+                rec.pool_id = pos.pool_id.clone();
+                rec.token_in = pos.token_mint.clone();
+                rec.token_out = pos.quote_mint.clone();
+                rec.amount_in = pos.token_amount_raw;
+                rec.sqrt_price = entry_sqrt.to_string();
+
+                if matches!(exit_decision, strategy::ExitDecision::Hold) {
+                    tracing::info!(
+                        target: "live",
+                        iteration = i + 1,
+                        exit = ?exit_decision,
+                        entry_sqrt = pos.entry_sqrt_price,
+                        current_sqrt = entry_sqrt,
+                        "position open — no exit signal, holding (no new entry while open)"
+                    );
+                    rec.context = serde_json::json!({ "exit": "hold" });
+                    rec.save(&args.data_dir)?;
+                    total_trades += 1;
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                // 1) Parse the position's mints; they must be resolvable.
+                let token_mint = match Pubkey::from_str(&pos.token_mint) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "position token mint unparseable (fail-closed)");
+                        eprintln!("[CRITICAL] Position token mint unparseable. Stopping.");
+                        break;
+                    }
+                };
+                let quote_mint = match Pubkey::from_str(&pos.quote_mint) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "position quote mint unparseable (fail-closed)");
+                        eprintln!("[CRITICAL] Position quote mint unparseable. Stopping.");
+                        break;
+                    }
+                };
+                let pool_id = match Pubkey::from_str(pool_id_str) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "--pool-id unparseable (fail-closed)");
+                        eprintln!("[CRITICAL] --pool-id unparseable. Stopping.");
+                        break;
+                    }
+                };
+                let Some(program_id) = live_program_id else {
+                    tracing::error!(target: "live", "no resolved program id for exit (fail-closed)");
+                    eprintln!("[CRITICAL] No resolved program id for exit. Stopping.");
+                    break;
+                };
+
+                // 2) Exit risk gate (kill switch, circuit breaker, daily loss,
+                //    daily trade cap, slippage) — fail-closed.
+                if let Err(e) = risk_manager.pre_exit_check(args.max_slippage_bps) {
+                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    tracing::warn!(target: "live", iteration = i + 1, error = %e, "pre-exit check failed — exit rejected this iteration (fail-closed)");
+                    rec.context = serde_json::json!({
+                        "exit": format!("{exit_decision:?}"),
+                        "risk_rejected": e,
+                    });
+                    rec.save(&args.data_dir)?;
+                    total_trades += 1;
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                // 3) Measure the ACTUAL token balance to sell (raw units).
+                //    Fail-closed: unmeasurable or zero balance = no exit (the
+                //    position stays recorded-open and no new entry can occur).
+                let sell_amount = match token_account_balance_raw(&rpc_client, &from, &token_mint) {
+                    Ok(Some(b)) if b > 0 => b,
+                    Ok(_) => {
+                        tracing::error!(target: "live", token_mint = %token_mint, "exit aborted: token balance is zero or account missing — position may have been moved manually (fail-closed)");
+                        risk_manager.trip_circuit_breaker(
+                            "exit aborted: zero token balance while position recorded open",
+                        );
+                        eprintln!("[CRITICAL] Exit aborted: zero token balance while position recorded open. Stopping.");
+                        break;
+                    }
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "token balance measurement failed (fail-closed): {e}"
+                        ));
+                        tracing::error!(target: "live", error = %e, "token balance measurement failed — circuit breaker tripped");
+                        eprintln!("[CRITICAL] Token balance measurement failed. Stopping.");
+                        break;
+                    }
+                };
+
+                // 4) Re-resolve the swap account set for the REVERSED
+                //    direction (sell token → quote). Account resolution is
+                //    direction-aware: input vault / token account follow the
+                //    mint arguments.
+                let (accounts, resolved) = match amm::account_resolver::resolve_swap_accounts(
+                    &rpc_client,
+                    &pool_id,
+                    &from,
+                    &token_mint,
+                    &quote_mint,
+                    &program_id,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "exit account resolution failed (fail-closed): {e}"
+                        ));
+                        tracing::error!(target: "live", error = %e, "exit account resolution failed — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+
+                // 5) Direction-aware quote (sell token → quote): the adapter
+                //    divides by the pool price when the input is token1.
+                let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+                    .with_swap_accounts(accounts)
+                    .with_resolved_pool(resolved)
+                    .with_program_id(program_id.to_string())
+                    .with_input_mint(token_mint);
+                let quote = match adapter.quote(sell_amount, args.max_slippage_bps) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, sell_amount, "exit quote failed — no exit this iteration (fail-closed)");
+                        rec.context = serde_json::json!({
+                            "exit": format!("{exit_decision:?}"),
+                            "error": format!("{e}"),
+                        });
+                        rec.save(&args.data_dir)?;
+                        total_trades += 1;
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let intent = match adapter.build_intent(quote) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "exit intent build failed (fail-closed)");
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "exit intent build failed (fail-closed): {e}"
+                        ));
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let swap_ix = match adapter.build_swap_instruction(&intent, &from) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "exit swap instruction failed (fail-closed)");
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "exit swap instruction failed (fail-closed): {e}"
+                        ));
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+
+                // 6) Preamble: idempotent ATA creation for both mints so the
+                //    proceeds have a destination (the token ATA already
+                //    exists from the entry; re-creating is a no-op). No SOL
+                //    wrap is needed — we are selling tokens, not wrapping.
+                let mut ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
+                ixs.push(
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &from, &from, &token_mint, &spl_token::ID,
+                    ),
+                );
+                ixs.push(
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &from, &from, &quote_mint, &spl_token::ID,
+                    ),
+                );
+                ixs.push(swap_ix);
+
+                // 7) Fresh blockhash, then the unsigned exit transaction.
+                let blockhash = resolve_blockhash(&args, &blockhash_mgr)?;
+                let msg = solana_sdk::message::Message::new(&ixs, Some(&from));
+                let mut tx = Transaction::new_unsigned(msg);
+                tx.message.recent_blockhash = blockhash;
+
+                // 8) FINAL pre-send recheck — state may have changed (e.g.
+                //    the kill switch tripped) since the earlier check.
+                if let Err(e) = risk_manager.pre_exit_check(args.max_slippage_bps) {
+                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    tracing::warn!(target: "live", iteration = i + 1, error = %e, "final pre-send exit recheck failed — aborting send (fail-closed)");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                // 9) HSM signing (fail-closed: signing failure trips the
+                //    circuit breaker and skips the iteration; the position
+                //    stays open for a later retry).
+                let sig = match hsm_sign(endpoint, ca, identity, &mut tx).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "HSM signing failed on exit (fail-closed): {e}"
+                        ));
+                        tracing::error!(target: "live", error = %e, "exit HSM signing failed — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                tx.signatures = vec![sig];
+
+                // 10) Submission via plain RPC retry. Jito bundles are an
+                //     entry-side latency optimization; exits prioritize
+                //     reliability and simplicity (fail-closed is unchanged).
+                match retry::send_with_retry(&*rpc_client, &tx) {
+                    Ok(sig) => {
+                        // 11) On-chain confirmation: measure the REAL quote
+                        //     proceeds (balance delta on the quote ATA) and
+                        //     book the realized P&L. Fail-closed: an
+                        //     unmeasurable or zero-proceeds outcome does NOT
+                        //     close the position (no fabricated P&L).
+                        let quote_ata = amm::account_resolver::resolve_user_ata(&from, &quote_mint);
+                        let quote_after = match token_account_balance_raw(
+                            &rpc_client,
+                            &from,
+                            &quote_mint,
+                        ) {
+                            Ok(Some(v)) => v,
+                            Ok(None) => 0,
+                            Err(e) => {
+                                risk_manager.trip_circuit_breaker(&format!(
+                                    "post-exit quote balance measurement failed (fail-closed): {e}"
+                                ));
+                                tracing::error!(target: "live", error = %e, "post-exit quote balance measurement failed — circuit breaker tripped");
+                                eprintln!("[CRITICAL] Post-exit quote balance measurement failed. Stopping.");
+                                break;
+                            }
+                        };
+                        let proceeds = quote_after.saturating_sub(pos.quote_balance_after_entry);
+                        if proceeds == 0 {
+                            tracing::error!(target: "live", quote_ata = %quote_ata, "exit confirmed but zero proceeds measured — position NOT closed (fail-closed; operator intervention required)");
+                            risk_manager.trip_circuit_breaker(
+                                "exit confirmed with zero measured proceeds — refusing to book P&L",
+                            );
+                            eprintln!("[CRITICAL] Exit confirmed but zero proceeds measured. Position left open. Stopping.");
+                            break;
+                        }
+                        match risk_manager.close_position(proceeds) {
+                            Ok(_) => {
+                                let pnl = risk_manager.realized_pnl();
+                                risk_manager.record_trade();
+                                successful_trades += 1;
+                                metrics::record_trade_executed(&metrics_registry);
+                                metrics::set_risk_gauges(
+                                    &metrics_registry,
+                                    risk_manager.is_circuit_breaker_active(),
+                                    pnl,
+                                    risk_manager.open_position_count(),
+                                );
+                                tracing::info!(
+                                    target: "live",
+                                    signature = %sig,
+                                    exit = ?exit_decision,
+                                    sell_amount,
+                                    proceeds,
+                                    realized_pnl_lamports = pnl,
+                                    "exit transaction confirmed — position closed, realized P&L booked"
+                                );
+                                rec.context = serde_json::json!({
+                                    "exit": format!("{exit_decision:?}"),
+                                    "sell_amount": sell_amount,
+                                    "proceeds_lamports": proceeds,
+                                    "realized_pnl_lamports": pnl,
+                                    "signature": sig.to_string(),
+                                });
+                                rec.save(&args.data_dir)?;
+                                let cluster = if args.rpc.contains("devnet") {
+                                    "devnet"
+                                } else {
+                                    "mainnet-beta"
+                                };
+                                println!(
+                                    "[LIVE] iter {}: EXIT confirmed: https://explorer.solana.com/tx/{}?cluster={} (pnl={} lamports)",
+                                    i + 1,
+                                    sig,
+                                    cluster,
+                                    pnl
+                                );
+                            }
+                            Err(e) => {
+                                // close_position failed (should not happen —
+                                // the position was open); fail-closed halt.
+                                tracing::error!(target: "live", error = %e, "close_position failed after confirmed exit (fail-closed)");
+                                eprintln!("[CRITICAL] close_position failed after confirmed exit: {e}. Stopping.");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Failed exit: the position stays OPEN — never mark
+                        // it closed on a failed transaction (fail-closed).
+                        tracing::error!(target: "live", error = %e, "exit transaction failed after retries — position remains open");
+                        eprintln!(
+                            "[LIVE] iter {}: EXIT TX failed: {} — position stays open",
+                            i + 1,
+                            e
+                        );
+                    }
+                }
+                total_trades += 1;
+                sleep(Duration::from_millis(200)).await;
+                continue;
             }
 
             // Strategy gate: evaluate the token candidate. If the strategy
@@ -923,22 +1324,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            // Position accounting is denominated in SOL lamports: entry spend,
+            // exit proceeds and realized P&L are only comparable when the
+            // quote side of the pool IS native SOL. A pool quoted in any other
+            // asset cannot be managed by this risk engine — reject the entry
+            // fail-closed instead of opening an unmeasurable position.
+            if let Some(q_mint) = live_input_mint {
+                if q_mint != spl_token::native_mint::ID {
+                    metrics::record_trade_rejected(&metrics_registry, "unsupported_quote_mint");
+                    tracing::warn!(
+                        target: "live",
+                        iteration = i + 1,
+                        quote_mint = %q_mint,
+                        "entry rejected: quote side is not native SOL — P&L cannot be booked in SOL lamports (fail-closed)"
+                    );
+                    total_trades += 1;
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            }
+
             // Fresh blockhash per iteration to avoid replay
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
                 // Build the transaction: a real AMM swap when a pool is
                 // configured, otherwise the safe self-transfer test path.
                 let mut tx = if let Some(adapter) = &swap_adapter {
                     // Real swap: quote from the resolved on-chain price, apply
-                    // slippage (min_amount_out), and build the CLMM swap tx.
+                    // slippage (min_amount_out), and build the CLMM swap tx
+                    // together with the on-chain preamble: idempotent ATA
+                    // creation for both mints, plus a native-SOL wrap +
+                    // sync_native when the input side is SOL (the CLMM vault
+                    // side holds wrapped SOL, so the input ATA must be funded).
                     let quote = adapter
                         .quote(entry_signal.position_size_lamports, args.max_slippage_bps)
                         .map_err(|e| format!("quote failed (fail-closed): {e}"))?;
                     let intent = adapter
                         .build_intent(quote)
                         .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
-                    let mut t = adapter
-                        .build_transaction(&intent, &from, blockhash)
-                        .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?;
+                    let swap_ix = adapter
+                        .build_swap_instruction(&intent, &from)
+                        .map_err(|e| format!("build_swap_instruction failed (fail-closed): {e}"))?;
+                    let buy_input_mint = live_input_mint.expect("set when swap_adapter is set");
+                    let buy_output_mint = live_output_mint.expect("set when swap_adapter is set");
+                    let mut ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
+                    ixs.push(
+                        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                            &from,
+                            &from,
+                            &buy_input_mint,
+                            &spl_token::ID,
+                        ),
+                    );
+                    ixs.push(
+                        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                            &from,
+                            &from,
+                            &buy_output_mint,
+                            &spl_token::ID,
+                        ),
+                    );
+                    if buy_input_mint == spl_token::native_mint::ID {
+                        let input_ata = spl_associated_token_account::get_associated_token_address(
+                            &from,
+                            &buy_input_mint,
+                        );
+                        ixs.push(solana_sdk::system_instruction::transfer(
+                            &from,
+                            &input_ata,
+                            entry_signal.position_size_lamports,
+                        ));
+                        ixs.push(
+                            spl_token::instruction::sync_native(&spl_token::ID, &input_ata)
+                                .map_err(|e| format!("sync_native failed: {e}"))?,
+                        );
+                    }
+                    ixs.push(swap_ix);
+                    let msg = solana_sdk::message::Message::new(&ixs, Some(&from));
+                    let mut t = Transaction::new_unsigned(msg);
+                    // Apply the freshly-fetched blockhash before signing; otherwise the
+                    // transaction is submitted with a zero blockhash and the RPC rejects
+                    // it with "Blockhash not found" during simulation.
                     t.message.recent_blockhash = blockhash;
                     t
                 } else {
@@ -1027,33 +1492,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match send_result {
                     Ok(sig) => {
                         successful_trades += 1;
-                        // Record the completed trade (daily trade counter)
-                        // and the newly opened position/exposure.
-                        //
-                        // KNOWN GAP: this codebase has no exit-execution
-                        // path (SimpleSnipeStrategy::should_exit() is
-                        // computed but never acted on in the live loop), so
-                        // record_position_close() is never called and
-                        // realized P&L is not tracked for wins. See final
-                        // report for details — not fabricated here.
-                        risk_manager.record_trade();
-                        risk_manager.record_position_open(entry_signal.position_size_lamports);
-                        metrics::record_trade_executed(&metrics_registry);
-                        tracing::info!(target: "live", signature = %sig, "transaction confirmed");
-                        let cluster = if args.rpc.contains("devnet") {
-                            "devnet"
-                        } else {
-                            "mainnet-beta"
+                        // On-chain confirmation: measure the REAL received
+                        // token amount and the quote-account balance AFTER the
+                        // entry (baseline for the exit proceeds delta).
+                        // Fail-closed: if the position cannot be measured it
+                        // is NOT recorded as open (never invent amounts), the
+                        // circuit breaker is tripped and the loop halts so an
+                        // operator investigates before any further entry.
+                        let buy_output_mint = match live_output_mint {
+                            Some(m) => m,
+                            None => {
+                                tracing::error!(target: "live", "entry confirmed but output mint unknown — cannot measure position (fail-closed)");
+                                risk_manager.trip_circuit_breaker(
+                                    "entry confirmed with unknown output mint — position measurement impossible",
+                                );
+                                eprintln!(
+                                    "[CRITICAL] Entry confirmed but output mint unknown. Stopping."
+                                );
+                                break;
+                            }
                         };
-                        println!(
-                            "[LIVE] iter {}: TX confirmed: https://explorer.solana.com/tx/{}?cluster={}",
-                            i + 1,
-                            sig,
-                            cluster
-                        );
+                        let buy_input_mint = match live_input_mint {
+                            Some(m) => m,
+                            None => {
+                                tracing::error!(target: "live", "entry confirmed but input mint unknown — cannot measure position (fail-closed)");
+                                risk_manager.trip_circuit_breaker(
+                                    "entry confirmed with unknown input mint — position measurement impossible",
+                                );
+                                eprintln!(
+                                    "[CRITICAL] Entry confirmed but input mint unknown. Stopping."
+                                );
+                                break;
+                            }
+                        };
+                        let token_amount_raw = match token_account_balance_raw(
+                            &rpc_client,
+                            &from,
+                            &buy_output_mint,
+                        ) {
+                            Ok(Some(v)) if v > 0 => v,
+                            Ok(_) => {
+                                tracing::error!(target: "live", token_mint = %buy_output_mint, "entry confirmed but received token balance is zero — not recording a position (fail-closed)");
+                                risk_manager.trip_circuit_breaker(
+                                        "entry confirmed with zero received token balance — position measurement impossible",
+                                    );
+                                eprintln!("[CRITICAL] Entry confirmed with zero received tokens. Stopping.");
+                                break;
+                            }
+                            Err(e) => {
+                                risk_manager.trip_circuit_breaker(&format!(
+                                        "post-entry token balance measurement failed (fail-closed): {e}"
+                                    ));
+                                tracing::error!(target: "live", error = %e, "post-entry token balance measurement failed — circuit breaker tripped");
+                                eprintln!("[CRITICAL] Post-entry token balance measurement failed. Stopping.");
+                                break;
+                            }
+                        };
+                        let quote_balance_after_entry = match token_account_balance_raw(
+                            &rpc_client,
+                            &from,
+                            &buy_input_mint,
+                        ) {
+                            Ok(Some(v)) => v,
+                            Ok(None) => 0,
+                            Err(e) => {
+                                tracing::error!(target: "live", error = %e, "post-entry quote balance measurement failed — circuit breaker tripped");
+                                risk_manager.trip_circuit_breaker(&format!(
+                                    "post-entry quote balance measurement failed (fail-closed): {e}"
+                                ));
+                                eprintln!("[CRITICAL] Post-entry quote balance measurement failed. Stopping.");
+                                break;
+                            }
+                        };
+                        let position = risk::OpenPosition {
+                            pool_id: args
+                                .pool_id
+                                .clone()
+                                .expect("entry confirmed on a pool implies --pool-id was set"),
+                            token_mint: buy_output_mint.to_string(),
+                            quote_mint: buy_input_mint.to_string(),
+                            token_amount_raw,
+                            quote_balance_after_entry,
+                            spend_lamports: entry_signal.position_size_lamports,
+                            entry_sqrt_price: entry_sqrt,
+                            opened_at_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis(),
+                            entry_sig: sig.to_string(),
+                        };
+                        match risk_manager.record_entry(position) {
+                            Ok(()) => {
+                                risk_manager.record_trade();
+                                metrics::record_trade_executed(&metrics_registry);
+                                metrics::set_risk_gauges(
+                                    &metrics_registry,
+                                    risk_manager.is_circuit_breaker_active(),
+                                    risk_manager.realized_pnl(),
+                                    risk_manager.open_position_count(),
+                                );
+                                tracing::info!(target: "live", signature = %sig, token_amount_raw, quote_balance_after_entry, "entry transaction confirmed — position recorded (open)");
+                                let cluster = if args.rpc.contains("devnet") {
+                                    "devnet"
+                                } else {
+                                    "mainnet-beta"
+                                };
+                                println!(
+                                    "[LIVE] iter {}: TX confirmed: https://explorer.solana.com/tx/{}?cluster={}",
+                                    i + 1,
+                                    sig,
+                                    cluster
+                                );
+                            }
+                            Err(e) => {
+                                // The trade executed on-chain but the position
+                                // could not be recorded (e.g. cap reached) —
+                                // never leave an unrecorded open position.
+                                tracing::error!(target: "live", error = %e, "entry confirmed but position record failed (fail-closed)");
+                                risk_manager.trip_circuit_breaker(&format!(
+                                    "entry confirmed but record_entry failed: {e}"
+                                ));
+                                eprintln!("[CRITICAL] Entry confirmed but position record failed. Stopping.");
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
-                        let _ = risk_manager.record_loss(1_000);
+                        // No on-chain confirmation: nothing was spent on a
+                        // position. Failed entries are NOT booked as losses
+                        // (only realized exit losses feed daily_loss via
+                        // close_position) — audit and retry next iteration.
                         tracing::error!(target: "live", error = %e, "transaction failed after retries");
                         eprintln!("[LIVE] iter {}: TX failed: {}", i + 1, e);
                     }
