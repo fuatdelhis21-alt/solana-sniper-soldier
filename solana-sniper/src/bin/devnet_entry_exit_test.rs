@@ -423,13 +423,18 @@ fn main() -> Result<()> {
 
     // Book the realized P&L through the real risk engine and assert the
     // idempotency guard (a second close of the same event must be rejected).
+    // Exits are counted separately from entries (never consuming the daily
+    // entry cap) — same accounting as the live loop.
     risk.close_position(proceeds)
         .map_err(|e| anyhow!("close_position failed (fail-closed): {e}"))?;
+    risk.record_exit();
     let double_close_rejected = risk.close_position(proceeds).is_err();
     let pnl = risk.realized_pnl();
     tracing::info!(
         proceeds,
         realized_pnl_lamports = pnl,
+        daily_entries = risk.current_daily_trades(),
+        daily_exits = risk.current_daily_exits(),
         open_positions = risk.open_position_count(),
         double_close_rejected,
         "position closed, realized P&L booked"

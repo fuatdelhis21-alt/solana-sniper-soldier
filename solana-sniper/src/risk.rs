@@ -256,6 +256,12 @@ struct PersistedRiskState {
     /// P&L was ever booked — falls back to `date`).
     #[serde(default)]
     realized_date: String,
+    /// Number of closed positions (exits) today — informational/observability
+    /// only. NEVER gates entries: the daily entry cap (`daily_trades`) must
+    /// not be consumed by mandatory TP/SL exits, and exits must remain
+    /// possible after the entry cap is reached.
+    #[serde(default)]
+    daily_exits: u64,
 }
 
 /// A fully-detailed, currently-open position. Recorded on-chain after a
@@ -316,6 +322,10 @@ pub struct RiskManager {
     realized_pnl: Mutex<i64>,
     /// Calendar date the `realized_pnl` accumulator belongs to.
     realized_pnl_date: Mutex<String>,
+    /// Closed-position (exit) counter for the current day. Distinct from
+    /// `daily_trades` (the ENTRY counter): exits must never consume or gate
+    /// on the daily entry cap.
+    daily_exits: Mutex<DailyTrades>,
     /// Whether restart-safe state (daily counters, open positions) was
     /// verified at startup — either a fresh (no prior state file) start, or
     /// a successfully-parsed prior state file. `false` means the prior state
@@ -335,6 +345,10 @@ impl RiskManager {
             daily_trades: Mutex::new(DailyTrades {
                 date: state.date.clone(),
                 count: state.daily_trades,
+            }),
+            daily_exits: Mutex::new(DailyTrades {
+                date: state.date.clone(),
+                count: state.daily_exits,
             }),
             circuit_breaker_active: Mutex::new(false),
             last_breaker_reset: Mutex::new(Instant::now()),
@@ -405,6 +419,10 @@ impl RiskManager {
         let position = { self.position.lock().unwrap().clone() };
         let realized_pnl_lamports = *self.realized_pnl.lock().unwrap();
         let realized_date = { self.realized_pnl_date.lock().unwrap().clone() };
+        let daily_exits = {
+            let t = self.daily_exits.lock().unwrap();
+            t.count
+        };
         let state = PersistedRiskState {
             date,
             daily_trades,
@@ -414,6 +432,7 @@ impl RiskManager {
             position,
             realized_pnl_lamports,
             realized_date,
+            daily_exits,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
@@ -647,8 +666,10 @@ impl RiskManager {
         *self.kill_switch_active.lock().unwrap()
     }
 
-    /// Pre-trade check: kill switch, circuit breaker, size, slippage, daily
-    /// loss, and daily trade cap.
+    /// Pre-ENTRY trade check: kill switch, circuit breaker, size, slippage,
+    /// daily loss, and the daily ENTRY trade cap (`max_daily_trades` counts
+    /// entries only — exits are gated by `pre_exit_check` and counted by
+    /// `record_exit`, independent of this cap).
     pub fn pre_trade_check(
         &self,
         trade_size_lamports: u64,
@@ -691,13 +712,20 @@ impl RiskManager {
         Ok(())
     }
 
-    /// Pre-EXIT check: the gates a position close must pass before an exit
-    /// transaction is built. Distinct from `pre_trade_check` because an exit
-    /// legitimately happens while the open-position cap is already reached
-    /// (closing the single open position), so size/cap checks do not apply —
-    /// but kill switch, circuit breaker, daily loss, and daily trade cap are
-    /// still enforced fail-closed (no new on-chain activity while any of them
-    /// is active), as is the slippage bound.
+    /// Pre-EXIT check: the gates a mandatory position close (TP/SL) must
+    /// pass before an exit transaction is built. Distinct from
+    /// `pre_trade_check` in two deliberate ways:
+    /// - Position/exposure caps do NOT apply (an exit legitimately runs
+    ///   while the open-position cap is reached — it closes that position).
+    /// - The daily ENTRY trade cap does NOT apply: closing an open position
+    ///   to protect capital (stop-loss/take-profit) must remain possible
+    ///   even after the entry limit for the day is exhausted. Exits are
+    ///   counted separately (`record_exit`/`current_daily_exits`) and never
+    ///   consume or double-count the entry counter.
+    /// Kill switch, circuit breaker, daily-loss limit, and the slippage
+    /// bound are still enforced fail-closed: no exit while any of them is
+    /// active (only the operator can release a kill switch; the breaker
+    /// auto-resets after its duration).
     pub fn pre_exit_check(&self, slippage_bps: u64) -> Result<(), RejectReason> {
         if !self.is_state_verified() {
             return Err(RejectReason::UnverifiableRestartState);
@@ -715,17 +743,14 @@ impl RiskManager {
         if daily.loss_lamports > self.config.daily_loss_limit_lamports {
             return Err(RejectReason::DailyLossLimit);
         }
-        drop(daily);
-        let trades = self.daily_trades.lock().unwrap();
-        if trades.count >= self.config.max_daily_trades {
-            return Err(RejectReason::DailyTradeCap);
-        }
-        drop(trades);
         Ok(())
     }
 
-    /// Record a completed trade. If the daily trade cap is exceeded, the kill
-    /// switch is triggered automatically and the event is audited.
+    /// Record a completed ENTRY trade. This is the ONLY counter that gates
+    /// new entries (`pre_trade_check`'s `DailyTradeCap`). Exits MUST use
+    /// `record_exit` instead — an exit recorded here would consume the daily
+    /// entry cap and could even trip the defensive kill switch below,
+    /// freezing the bot (including mandatory stops) for the rest of the day.
     pub fn record_trade(&self) {
         let mut trades = self.daily_trades.lock().unwrap();
         let today = Self::today();
@@ -734,12 +759,15 @@ impl RiskManager {
             trades.count = 0;
         }
         trades.count += 1;
+        // Defensive: only reachable if the entry gate was bypassed — normal
+        // flow caps entries in pre_trade_check before record_trade is ever
+        // called, so a healthy bot never trips here.
         let exceeded = trades.count > self.config.max_daily_trades;
         drop(trades);
         self.persist_state();
         if exceeded {
             self.trigger_kill_switch(&format!(
-                "daily trade cap exceeded (> {})",
+                "daily entry cap exceeded (> {})",
                 self.config.max_daily_trades
             ));
         }
@@ -751,6 +779,34 @@ impl RiskManager {
             return 0;
         }
         trades.count
+    }
+
+    /// Record a completed EXIT (position close). Kept in a counter SEPARATE
+    /// from the entry counter (`record_trade`): exits never consume the
+    /// daily entry cap, never gate on it, and never trip the kill switch —
+    /// a stop-loss/take-profit close must stay possible after the daily
+    /// entry limit is exhausted (mandatory capital protection). The exit
+    /// counter is informational (observability/metrics) and is persisted for
+    /// restart safety.
+    pub fn record_exit(&self) {
+        let mut exits = self.daily_exits.lock().unwrap();
+        let today = Self::today();
+        if exits.date != today {
+            exits.date = today;
+            exits.count = 0;
+        }
+        exits.count += 1;
+        drop(exits);
+        self.persist_state();
+    }
+
+    /// Number of exits (closed positions) today.
+    pub fn current_daily_exits(&self) -> u64 {
+        let exits = self.daily_exits.lock().unwrap();
+        if exits.date != Self::today() {
+            return 0;
+        }
+        exits.count
     }
 
     /// Record a loss and potentially trigger circuit breaker.
@@ -1237,15 +1293,123 @@ mod tests {
         rm.trigger_kill_switch("unit test");
         assert_eq!(rm.pre_exit_check(50), Err(RejectReason::KillSwitchActive));
         rm.release_kill_switch();
-        // Daily trade cap: 3 recorded trades => cap reached (3 >= 3).
-        rm.record_trade();
-        rm.record_trade();
-        rm.record_trade();
-        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::DailyTradeCap));
-        // And a plain pre_trade_check still passes the cap gate only when
-        // under it — verify the exit gate is independent of position caps.
+        // The daily ENTRY cap does NOT gate exits (see
+        // entry_cap_full_does_not_block_exit below) — even with the cap
+        // exhausted, pre_exit_check must still pass all remaining gates.
         let rm = RiskManager::new(test_config());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
         assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn daily_entry_cap_full_blocks_new_entries_only() {
+        // max_daily_trades = 3 in test_config. 3 completed entries => the
+        // 4th entry is rejected with DailyTradeCap.
+        let rm = RiskManager::new(test_config());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::DailyTradeCap)
+        );
+        // The SAME exhausted cap must not block an exit.
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn entry_cap_full_tp_sl_exit_still_closes_position() {
+        // A position is open and the daily entry cap is exhausted (e.g. the
+        // position was opened as the 5th entry). A TP/SL exit must still be
+        // executable and book its P&L exactly once.
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
+        assert!(rm.pre_exit_check(50).is_ok());
+        let closed = rm.close_position(50_000_000).unwrap();
+        assert_eq!(closed.spend_lamports, 40_000_000);
+        assert_eq!(rm.realized_pnl(), 10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+        assert!(rm.close_position(50_000_000).is_err()); // idempotent
+    }
+
+    #[test]
+    fn record_exit_never_consumes_entry_cap_or_trips_kill_switch() {
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
+        assert!(!rm.is_kill_switch_active());
+
+        // Exits after the cap is full: counted separately, no kill switch,
+        // entry counter untouched.
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit(); // arbitrarily many exits
+        assert_eq!(rm.current_daily_trades(), 3, "entry cap must not move");
+        assert_eq!(rm.current_daily_exits(), 4);
+        assert!(!rm.is_kill_switch_active());
+        // Entries stay blocked, exits stay open.
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::DailyTradeCap)
+        );
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn exit_records_do_not_double_count_after_restart() {
+        // record_exit persists; a restart restores the exit counter without
+        // touching the entry counter (no double counting of either).
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit();
+        drop(rm);
+
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        assert_eq!(rm2.current_daily_trades(), 2);
+        assert_eq!(rm2.current_daily_exits(), 3);
+        // New exit after restart still does not consume the entry cap.
+        rm2.record_exit();
+        assert_eq!(rm2.current_daily_trades(), 2);
+        assert_eq!(rm2.current_daily_exits(), 4);
+    }
+
+    #[test]
+    fn unverified_state_blocks_entry_and_exit_gates() {
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        std::fs::write(cfg.data_dir.join("risk_state.json"), "{ corrupt").unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_state_verified());
+        // Neither a new entry nor an exit may proceed on unverified state.
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+        assert_eq!(
+            rm.pre_exit_check(50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::UnverifiableRestartState)
+        );
     }
 
     #[test]

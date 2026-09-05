@@ -806,7 +806,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if args.live_risk_data {
+                // ENTRY-only live risk data (holder concentration, vault
+                // liquidity, blocklist). Skipped while a position is open:
+                // these fetches gate NEW entries — a mandatory TP/SL exit
+                // must not be blocked by an entry-scoring RPC failure.
+                if args.live_risk_data && risk_manager.open_position_count() == 0 {
                     // Fail-closed: any RPC error here trips the circuit
                     // breaker and skips this iteration rather than crashing
                     // the whole process. This replaces the static
@@ -1165,7 +1169,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match risk_manager.close_position(proceeds) {
                             Ok(_) => {
                                 let pnl = risk_manager.realized_pnl();
-                                risk_manager.record_trade();
+                                // Exits are counted separately from entries:
+                                // record_exit() never consumes the daily
+                                // entry cap and can never trip the defensive
+                                // kill switch — a mandatory TP/SL close stays
+                                // possible after 5 entries.
+                                risk_manager.record_exit();
                                 successful_trades += 1;
                                 metrics::record_trade_executed(&metrics_registry);
                                 metrics::set_risk_gauges(
