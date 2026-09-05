@@ -237,10 +237,63 @@ struct KillSwitchAudit {
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct PersistedRiskState {
     date: String,
+    #[serde(default)]
     daily_trades: u64,
+    #[serde(default)]
     daily_loss_lamports: u64,
+    #[serde(default)]
     open_positions: u64,
+    #[serde(default)]
     open_exposure_lamports: u64,
+    /// Fully-detailed open position (mint, amount, entry price, spend),
+    /// if one is currently open. `None` = no open position.
+    #[serde(default)]
+    position: Option<OpenPosition>,
+    /// Net realized P&L (lamports; negative = loss) accumulated today.
+    #[serde(default)]
+    realized_pnl_lamports: i64,
+    /// Calendar date the realized-P&L accumulator belongs to (empty when no
+    /// P&L was ever booked — falls back to `date`).
+    #[serde(default)]
+    realized_date: String,
+}
+
+/// A fully-detailed, currently-open position. Recorded on-chain after a
+/// confirmed entry and consumed (only once) by `close_position` on exit.
+#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+pub struct OpenPosition {
+    /// Pool the position was opened on (CLMM pool id).
+    pub pool_id: String,
+    /// The mint the position holds (the token bought at entry).
+    pub token_mint: String,
+    /// The mint used as quote (SOL side) — what the position is valued in.
+    pub quote_mint: String,
+    /// Actual token amount received on-chain at entry (raw units, incl. all
+    /// decimals), read from the token account after confirmation.
+    pub token_amount_raw: u64,
+    /// Quote-account balance right after entry (raw quote units). Subtracted
+    /// from the post-exit balance to compute the REAL received quote amount.
+    pub quote_balance_after_entry: u64,
+    /// SOL (quote) lamports spent to open the position.
+    pub spend_lamports: u64,
+    /// Entry reference price (Q64.64 sqrt) for stop-loss / take-profit.
+    pub entry_sqrt_price: u128,
+    /// Unix ms when the entry transaction confirmed.
+    pub opened_at_ms: u128,
+    /// Entry transaction signature.
+    pub entry_sig: String,
+}
+
+impl OpenPosition {
+    /// Average realized entry price = spend / tokens received (quote per
+    /// token, raw-unit ratio). `None` when the amount is zero (fail-closed:
+    /// a zero-amount position cannot be valued).
+    pub fn avg_entry_price(&self) -> Option<f64> {
+        if self.token_amount_raw == 0 {
+            return None;
+        }
+        Some(self.spend_lamports as f64 / self.token_amount_raw as f64)
+    }
 }
 
 /// Risk manager with circuit breaker, daily trade cap, and kill switch.
@@ -257,6 +310,12 @@ pub struct RiskManager {
     live_armed: Mutex<bool>,
     open_positions: Mutex<u64>,
     open_exposure_lamports: Mutex<u64>,
+    /// The single fully-detailed open position, when one exists.
+    position: Mutex<Option<OpenPosition>>,
+    /// Net realized P&L for today (lamports; negative = loss).
+    realized_pnl: Mutex<i64>,
+    /// Calendar date the `realized_pnl` accumulator belongs to.
+    realized_pnl_date: Mutex<String>,
     /// Whether restart-safe state (daily counters, open positions) was
     /// verified at startup — either a fresh (no prior state file) start, or
     /// a successfully-parsed prior state file. `false` means the prior state
@@ -268,7 +327,7 @@ pub struct RiskManager {
 impl RiskManager {
     pub fn new(config: RiskConfig) -> Self {
         let (state, verified) = Self::load_state(&config.data_dir);
-        let rm = Self {
+        let mut rm = Self {
             daily_loss: Mutex::new(DailyLoss {
                 date: state.date.clone(),
                 loss_lamports: state.daily_loss_lamports,
@@ -283,6 +342,13 @@ impl RiskManager {
             live_armed: Mutex::new(false),
             open_positions: Mutex::new(state.open_positions),
             open_exposure_lamports: Mutex::new(state.open_exposure_lamports),
+            position: Mutex::new(state.position.clone()),
+            realized_pnl: Mutex::new(state.realized_pnl_lamports),
+            realized_pnl_date: Mutex::new(if state.realized_date.is_empty() {
+                state.date.clone()
+            } else {
+                state.realized_date.clone()
+            }),
             state_verified: verified,
             config,
         };
@@ -291,6 +357,17 @@ impl RiskManager {
                 "restart_state_unverifiable",
                 "risk_state.json exists but could not be parsed",
             );
+        } else if state.open_positions > 0 && state.position.is_none() {
+            // A state written by an older build may have counter-only open
+            // positions with no detail — the position can never be
+            // reconstructed, so it must not be traded around blindly.
+            // Fail-closed: refuse live trading until the operator inspects
+            // and clears the state file.
+            rm.write_audit(
+                "restart_state_unverifiable",
+                "open_positions > 0 but position detail missing — state predates position tracking or is inconsistent",
+            );
+            rm.state_verified = false;
         }
         rm
     }
@@ -325,12 +402,18 @@ impl RiskManager {
         let daily_loss_lamports = self.daily_loss.lock().unwrap().loss_lamports;
         let open_positions = *self.open_positions.lock().unwrap();
         let open_exposure_lamports = *self.open_exposure_lamports.lock().unwrap();
+        let position = { self.position.lock().unwrap().clone() };
+        let realized_pnl_lamports = *self.realized_pnl.lock().unwrap();
+        let realized_date = { self.realized_pnl_date.lock().unwrap().clone() };
         let state = PersistedRiskState {
             date,
             daily_trades,
             daily_loss_lamports,
             open_positions,
             open_exposure_lamports,
+            position,
+            realized_pnl_lamports,
+            realized_date,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
@@ -379,8 +462,9 @@ impl RiskManager {
     }
 
     /// Record a newly-opened position (increments both the open-position
-    /// count and the exposure total). Persisted immediately for restart
-    /// safety.
+    /// count and the exposure total). Counter-only bookkeeping — prefer
+    /// `record_entry` (which stores the full position detail) for real
+    /// entries. Persisted immediately for restart safety.
     pub fn record_position_open(&self, lamports: u64) {
         *self.open_positions.lock().unwrap() += 1;
         *self.open_exposure_lamports.lock().unwrap() += lamports;
@@ -388,7 +472,9 @@ impl RiskManager {
     }
 
     /// Record a closed position, freeing its exposure. Saturating: never
-    /// underflows below zero even if called out of order.
+    /// underflows below zero even if called out of order. Counter-only
+    /// bookkeeping — prefer `close_position` (which also computes and
+    /// books the realized P&L).
     pub fn record_position_close(&self, lamports: u64) {
         let mut positions = self.open_positions.lock().unwrap();
         *positions = positions.saturating_sub(1);
@@ -397,6 +483,112 @@ impl RiskManager {
         *exposure = exposure.saturating_sub(lamports);
         drop(exposure);
         self.persist_state();
+    }
+
+    /// Record a fully-detailed position entry. Fail-closed:
+    /// - rejected when restart state is unverifiable,
+    /// - rejected when a position is already open (idempotency guard —
+    ///   a single duplicate record must never double-count exposure),
+    /// - rejected when the open-position cap is already reached.
+    /// On success the counters are bumped and the detail is persisted.
+    pub fn record_entry(&self, pos: OpenPosition) -> Result<(), RejectReason> {
+        if !self.is_state_verified() {
+            return Err(RejectReason::UnverifiableRestartState);
+        }
+        let spend = pos.spend_lamports;
+        {
+            let mut slot = self.position.lock().unwrap();
+            if slot.is_some() {
+                return Err(RejectReason::OpenPositionCapExceeded);
+            }
+            *slot = Some(pos);
+        }
+        self.record_position_open(spend);
+        Ok(())
+    }
+
+    /// The currently-open position detail, if any.
+    pub fn current_position(&self) -> Option<OpenPosition> {
+        self.position.lock().unwrap().clone()
+    }
+
+    /// Close the open position with the *actual* realized proceeds
+    /// (quote raw units measured on-chain after confirmation) and book the
+    /// realized P&L:
+    /// - P&L = proceeds − spend, computed in i128 and clamped to i64
+    ///   (overflow-safe; a saturating result is audited).
+    /// - A realized loss is fed into the daily-loss accumulator
+    ///   (`record_loss`), which triggers the hard kill switch when the
+    ///   daily limit is exceeded (fail-closed).
+    /// - Idempotent: the position slot is consumed via `Option::take`;
+    ///   a second call returns an error and changes nothing.
+    ///
+    /// `proceeds_quote_raw` must be in the same unit as `spend_lamports`
+    /// (native-SOL/WSOL quote with 9 decimals). The caller measures it
+    /// on-chain; unmeasurable proceeds must NOT be passed as zero.
+    pub fn close_position(&self, proceeds_quote_raw: u64) -> Result<OpenPosition, String> {
+        let pos = self.position.lock().unwrap().take().ok_or_else(|| {
+            "no open position to close — duplicate/out-of-order close rejected (idempotency)"
+                .to_string()
+        })?;
+
+        // Realized P&L in i128 first, then clamped to i64.
+        let pnl_i128 = (proceeds_quote_raw as i128).saturating_sub(pos.spend_lamports as i128);
+        let pnl: i64 = if pnl_i128 > i64::MAX as i128 {
+            i64::MAX
+        } else if pnl_i128 < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            pnl_i128 as i64
+        };
+
+        // Roll the daily realized-P&L accumulator when the day changed.
+        {
+            let today = Self::today();
+            let mut pnl_mutex = self.realized_pnl.lock().unwrap();
+            let mut date_mutex = self.realized_pnl_date.lock().unwrap();
+            if *date_mutex != today {
+                *pnl_mutex = 0;
+                *date_mutex = today;
+            }
+            *pnl_mutex = pnl_mutex.saturating_add(pnl);
+        }
+
+        // Free the exposure/counter slots (saturating).
+        {
+            let mut positions = self.open_positions.lock().unwrap();
+            *positions = positions.saturating_sub(1);
+        }
+        {
+            let mut exposure = self.open_exposure_lamports.lock().unwrap();
+            *exposure = exposure.saturating_sub(pos.spend_lamports);
+        }
+
+        // Persist ONCE, after every mutation: the on-disk state is then
+        // always internally consistent (position=None matches the
+        // decremented counters), never a mid-transition snapshot.
+        self.persist_state();
+
+        // A realized loss counts toward the daily-loss hard kill switch
+        // (may trip it — fail-closed) and is audited.
+        if pnl < 0 {
+            let loss = pnl.unsigned_abs();
+            let _ = self.record_loss(loss);
+            self.write_audit("position_closed_loss", &format!("loss={loss}"));
+        } else {
+            self.write_audit("position_closed_profit", &format!("profit={pnl}"));
+        }
+        Ok(pos)
+    }
+
+    /// Net realized P&L for the current day (lamports; negative = net loss).
+    /// Rolls to zero when the date changed since the last booking.
+    pub fn realized_pnl(&self) -> i64 {
+        let pnl = self.realized_pnl.lock().unwrap();
+        if *self.realized_pnl_date.lock().unwrap() != Self::today() {
+            return 0;
+        }
+        *pnl
     }
 
     pub fn open_position_count(&self) -> u64 {
@@ -496,6 +688,39 @@ impl RiskManager {
         if projected_exposure > self.config.max_total_exposure_lamports {
             return Err(RejectReason::ExposureCapExceeded);
         }
+        Ok(())
+    }
+
+    /// Pre-EXIT check: the gates a position close must pass before an exit
+    /// transaction is built. Distinct from `pre_trade_check` because an exit
+    /// legitimately happens while the open-position cap is already reached
+    /// (closing the single open position), so size/cap checks do not apply —
+    /// but kill switch, circuit breaker, daily loss, and daily trade cap are
+    /// still enforced fail-closed (no new on-chain activity while any of them
+    /// is active), as is the slippage bound.
+    pub fn pre_exit_check(&self, slippage_bps: u64) -> Result<(), RejectReason> {
+        if !self.is_state_verified() {
+            return Err(RejectReason::UnverifiableRestartState);
+        }
+        if *self.kill_switch_active.lock().unwrap() {
+            return Err(RejectReason::KillSwitchActive);
+        }
+        if self.is_circuit_breaker_active() {
+            return Err(RejectReason::CircuitBreakerOpen);
+        }
+        if slippage_bps > self.config.max_slippage_bps {
+            return Err(RejectReason::SlippageExceeded);
+        }
+        let daily = self.daily_loss.lock().unwrap();
+        if daily.loss_lamports > self.config.daily_loss_limit_lamports {
+            return Err(RejectReason::DailyLossLimit);
+        }
+        drop(daily);
+        let trades = self.daily_trades.lock().unwrap();
+        if trades.count >= self.config.max_daily_trades {
+            return Err(RejectReason::DailyTradeCap);
+        }
+        drop(trades);
         Ok(())
     }
 
@@ -748,6 +973,8 @@ mod tests {
             daily_loss_lamports: 1_000_000,
             open_positions: 1,
             open_exposure_lamports: 40_000_000,
+            position: Some(sample_position(40_000_000)),
+            ..Default::default()
         };
         std::fs::write(
             cfg.data_dir.join("risk_state.json"),
@@ -760,6 +987,33 @@ mod tests {
         assert_eq!(rm.current_daily_loss(), 1_000_000);
         assert_eq!(rm.open_position_count(), 1);
         assert_eq!(rm.open_exposure_lamports(), 40_000_000);
+        assert!(rm.current_position().is_some());
+    }
+
+    #[test]
+    fn counter_only_open_position_without_detail_is_unverifiable() {
+        // A state file from a build predating position tracking has
+        // open_positions > 0 but no position detail — the position can never
+        // be reconstructed, so live trading must be refused (fail-closed).
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        let state = PersistedRiskState {
+            date: RiskManager::today(),
+            open_positions: 1,
+            open_exposure_lamports: 10_000_000,
+            ..Default::default()
+        };
+        std::fs::write(
+            cfg.data_dir.join("risk_state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_state_verified());
+        assert_eq!(
+            rm.pre_trade_check(500_000_000, 50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
     }
 
     #[test]
@@ -840,5 +1094,169 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("kill_switch_triggered"));
         assert!(content.contains("unit test"));
+    }
+
+    fn sample_position(spend_lamports: u64) -> OpenPosition {
+        OpenPosition {
+            pool_id: "pool_test".to_string(),
+            token_mint: "meme_token_mint".to_string(),
+            quote_mint: "So11111111111111111111111111111111111111112".to_string(),
+            token_amount_raw: 1_000_000_000,
+            quote_balance_after_entry: 0,
+            spend_lamports,
+            entry_sqrt_price: 1u128 << 64,
+            opened_at_ms: 1_700_000_000_000,
+            entry_sig: "entry_sig_test".to_string(),
+        }
+    }
+
+    #[test]
+    fn avg_entry_price_requires_nonzero_tokens() {
+        let p = sample_position(50_000_000);
+        assert!((p.avg_entry_price().unwrap() - 0.05).abs() < 1e-12);
+        let mut zero = p;
+        zero.token_amount_raw = 0;
+        assert!(zero.avg_entry_price().is_none());
+    }
+
+    #[test]
+    fn record_entry_then_close_books_realized_profit() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        assert_eq!(rm.open_position_count(), 1);
+        assert_eq!(rm.open_exposure_lamports(), 40_000_000);
+        assert!(rm.current_position().is_some());
+        // Exit realized 50M quote for a 40M spend => +10M profit.
+        let closed = rm.close_position(50_000_000).unwrap();
+        assert_eq!(closed.spend_lamports, 40_000_000);
+        assert_eq!(rm.realized_pnl(), 10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+        assert_eq!(rm.open_exposure_lamports(), 0);
+        assert!(rm.current_position().is_none());
+        assert_eq!(rm.current_daily_loss(), 0);
+    }
+
+    #[test]
+    fn close_position_is_idempotent() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        assert!(rm.close_position(30_000_000).is_ok());
+        // A second close of the same event must fail and change nothing.
+        let err = rm.close_position(30_000_000).unwrap_err();
+        assert!(err.contains("idempotency"), "got: {err}");
+        assert_eq!(rm.realized_pnl(), -10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+    }
+
+    #[test]
+    fn close_with_realized_loss_feeds_daily_loss_and_kill_switch() {
+        let cfg = test_config(); // daily_loss_limit = 5 SOL = 5_000_000_000
+        let rm = RiskManager::new(cfg);
+        rm.record_entry(sample_position(5_100_000_000)).unwrap();
+        // Realized loss of 5.1 SOL > 5.0 SOL daily limit => kill switch.
+        rm.close_position(0).unwrap();
+        assert!(rm.is_kill_switch_active());
+        assert_eq!(rm.current_daily_loss(), 5_100_000_000);
+        assert_eq!(rm.realized_pnl(), -(5_100_000_000i64));
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::KillSwitchActive));
+        assert_eq!(
+            rm.pre_trade_check(100_000_000, 50),
+            Err(RejectReason::KillSwitchActive)
+        );
+    }
+
+    #[test]
+    fn realized_pnl_accumulates_net_across_trades() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.close_position(50_000_000).unwrap(); // +10M
+        rm.record_entry(sample_position(30_000_000)).unwrap();
+        rm.close_position(27_000_000).unwrap(); // -3M
+        assert_eq!(rm.realized_pnl(), 7_000_000);
+        assert_eq!(rm.current_daily_loss(), 3_000_000); // loss side only
+    }
+
+    #[test]
+    fn record_entry_rejects_when_position_already_open() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(10_000_000)).unwrap();
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::OpenPositionCapExceeded)
+        );
+        assert_eq!(rm.open_position_count(), 1);
+    }
+
+    #[test]
+    fn record_entry_rejects_when_state_unverifiable() {
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        std::fs::write(cfg.data_dir.join("risk_state.json"), "{ nope").unwrap();
+        let rm = RiskManager::new(cfg);
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+    }
+
+    #[test]
+    fn restart_restores_full_position_detail_and_pnl() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.close_position(50_000_000).unwrap();
+        rm.record_entry(sample_position(30_000_000)).unwrap();
+        drop(rm);
+
+        // Simulated restart: same data dir, fresh manager.
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        let pos = rm2.current_position().unwrap();
+        assert_eq!(pos.spend_lamports, 30_000_000);
+        assert_eq!(pos.token_mint, "meme_token_mint");
+        assert_eq!(rm2.open_position_count(), 1);
+        assert_eq!(rm2.open_exposure_lamports(), 30_000_000);
+        assert_eq!(rm2.realized_pnl(), 10_000_000);
+    }
+
+    #[test]
+    fn pre_exit_check_enforces_gates() {
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        // Baseline passes with no position open (gates are gate-only).
+        assert!(rm.pre_exit_check(50).is_ok());
+
+        // Slippage bound.
+        assert_eq!(rm.pre_exit_check(9999), Err(RejectReason::SlippageExceeded));
+        // Circuit breaker.
+        rm.trip_circuit_breaker("unit test");
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::CircuitBreakerOpen));
+        // Kill switch (fresh manager — the breaker above stays tripped for
+        // its whole duration and must not shadow later assertions).
+        let rm = RiskManager::new(test_config());
+        rm.trigger_kill_switch("unit test");
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::KillSwitchActive));
+        rm.release_kill_switch();
+        // Daily trade cap: 3 recorded trades => cap reached (3 >= 3).
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::DailyTradeCap));
+        // And a plain pre_trade_check still passes the cap gate only when
+        // under it — verify the exit gate is independent of position caps.
+        let rm = RiskManager::new(test_config());
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn close_after_restart_still_idempotent() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        drop(rm);
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.close_position(45_000_000).is_ok());
+        assert!(rm2.close_position(45_000_000).is_err());
+        assert_eq!(rm2.realized_pnl(), 5_000_000);
     }
 }
