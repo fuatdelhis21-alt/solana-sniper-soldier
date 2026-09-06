@@ -41,7 +41,7 @@ use std::str::FromStr;
 use crate::amm::raydium_v4::SwapAccounts;
 
 /// Raydium CLMM mainnet program ID.
-pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3";
+pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 /// Raydium CLMM devnet program ID.
 pub const RAYDIUM_CLMM_PROGRAM_ID_DEVNET: &str = "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH";
 /// SPL Token program ID.
