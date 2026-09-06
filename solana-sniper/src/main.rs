@@ -1419,6 +1419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+                    .with_program_id(program_id.to_string())
                     .with_swap_accounts(accounts)
                     .with_resolved_pool(resolved);
                 swap_adapter = Some(adapter);
