@@ -47,6 +47,310 @@ use amm::AmmAdapter;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
 
+// ============================================================================
+// AŞAMA 2/3/4 — Paper trading on REAL on-chain market data (no tx ever built)
+// ============================================================================
+
+/// Simulated paper position: the real entry sqrt price and the position size
+/// that would have been traded. Max ONE open simulated position — mirrors the
+/// RiskManager single-position rule WITHOUT writing to the risk state file
+/// (a paper position must never leak into live restart state).
+#[derive(Clone, Copy)]
+struct PaperPosition {
+    entry_sqrt_price: u128,
+    position_size_lamports: u64,
+}
+
+/// Outcome of one paper iteration against real market data.
+#[derive(Debug)]
+enum PaperTick {
+    /// Simulated position closed at the simulated stop-loss (realized pnl).
+    ClosedStopLoss(i64),
+    /// Simulated position closed at the simulated take-profit (realized pnl).
+    ClosedTakeProfit(i64),
+    /// An open simulated position is held (no exit signal).
+    Hold,
+    /// No open position and the strategy produced no entry signal.
+    NoEntrySignal,
+    /// No open position and the strategy produced an entry signal; the caller
+    /// must run the risk gates (max-spend + pre_trade_check) before calling
+    /// `confirm_entry`.
+    EntryPending(strategy::EntrySignal),
+}
+
+/// Pure paper-trading state machine (no I/O, no randomness): real signals
+/// only. `entries` increments ONLY on a confirmed entry (AŞAMA 3) — never
+/// unconditionally per iteration.
+struct PaperSimulator {
+    strategy: strategy::SimpleSnipeStrategy,
+    position: Option<PaperPosition>,
+    entries: u64,
+    exits_stop_loss: u64,
+    exits_take_profit: u64,
+    holds: u64,
+    no_entry_signals: u64,
+    simulated_pnl_lamports: i64,
+}
+
+impl PaperSimulator {
+    fn new() -> Self {
+        Self {
+            strategy: strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default()),
+            position: None,
+            entries: 0,
+            exits_stop_loss: 0,
+            exits_take_profit: 0,
+            holds: 0,
+            no_entry_signals: 0,
+            simulated_pnl_lamports: 0,
+        }
+    }
+
+    fn has_open_position(&self) -> bool {
+        self.position.is_some()
+    }
+
+    /// One iteration tick against a REAL current sqrt price. Exit decisions
+    /// (SimpleSnipeStrategy::should_exit — unchanged) run first while a
+    /// simulated position is open; otherwise the unchanged entry strategy
+    /// (`evaluate`) runs with the real candidate.
+    fn tick(
+        &mut self,
+        candidate: &strategy::TokenCandidate,
+        current_sqrt_price: u128,
+    ) -> PaperTick {
+        if let Some(pos) = self.position {
+            let exit = self
+                .strategy
+                .should_exit(pos.entry_sqrt_price, current_sqrt_price);
+            return match exit {
+                strategy::ExitDecision::Hold => {
+                    self.holds += 1;
+                    PaperTick::Hold
+                }
+                strategy::ExitDecision::StopLoss => {
+                    let pnl = simulated_pnl_lamports(
+                        pos.entry_sqrt_price,
+                        current_sqrt_price,
+                        pos.position_size_lamports,
+                    );
+                    self.simulated_pnl_lamports += pnl;
+                    self.exits_stop_loss += 1;
+                    self.position = None;
+                    PaperTick::ClosedStopLoss(pnl)
+                }
+                strategy::ExitDecision::TakeProfit => {
+                    let pnl = simulated_pnl_lamports(
+                        pos.entry_sqrt_price,
+                        current_sqrt_price,
+                        pos.position_size_lamports,
+                    );
+                    self.simulated_pnl_lamports += pnl;
+                    self.exits_take_profit += 1;
+                    self.position = None;
+                    PaperTick::ClosedTakeProfit(pnl)
+                }
+            };
+        }
+        match self.strategy.evaluate(candidate, current_sqrt_price) {
+            Some(sig) => PaperTick::EntryPending(sig),
+            None => {
+                self.no_entry_signals += 1;
+                PaperTick::NoEntrySignal
+            }
+        }
+    }
+
+    /// Confirm a pending entry AFTER the caller's risk gates passed. The only
+    /// place `entries` increments (AŞAMA 3: total_trades semantics).
+    fn confirm_entry(&mut self, entry_sqrt_price: u128, sig: strategy::EntrySignal) {
+        self.position = Some(PaperPosition {
+            entry_sqrt_price,
+            position_size_lamports: sig.position_size_lamports,
+        });
+        self.entries += 1;
+    }
+}
+
+/// Quote-based simulated P&L for a closed paper position (no real swap): the
+/// price ratio `(current/entry)^2` — the SAME formula
+/// `SimpleSnipeStrategy::should_exit` uses — applied to the position size.
+/// Negative on stop-loss, positive on take-profit. Always reported/labeled as
+/// simulated, never mixed with realized on-chain P&L.
+fn simulated_pnl_lamports(
+    entry_sqrt_price: u128,
+    current_sqrt_price: u128,
+    position_size_lamports: u64,
+) -> i64 {
+    if entry_sqrt_price == 0 {
+        return 0;
+    }
+    let entry = entry_sqrt_price as f64;
+    let current = current_sqrt_price as f64;
+    let price_ratio = (current / entry) * (current / entry);
+    ((price_ratio - 1.0) * position_size_lamports as f64) as i64
+}
+
+/// Real market snapshot for one paper iteration — the SAME sources and
+/// functions the live path uses: WS feed or `PoolPriceFeed` (pool-state sqrt
+/// price + snapshot age), the staleness gate, swap-account resolution (real
+/// vault addresses), mint/freeze authority checks and, with `--live-risk-data`,
+/// real vault liquidity + holder concentration.
+struct PaperMarketSnapshot {
+    current_sqrt_price: u128,
+    price_timestamp_ms: u128,
+    liquidity_lamports: u64,
+    market_cap_lamports: u64,
+    holders: u64,
+    is_blocklisted: bool,
+    source: &'static str,
+}
+
+/// Paper market-data failure. Data that could not be fetched at all is
+/// `Unavailable` (paper mode has no circuit breaker and never mutates risk
+/// state — it is counted separately, never as "simulated success"). Data that
+/// WAS fetched but violates a real risk rule is a genuine `RejectReason`
+/// (stale_price, token_authority_risk).
+enum PaperDataError {
+    Unavailable(String),
+    Rejected(risk::RejectReason),
+}
+
+/// AŞAMA 2 — fetch real market data for a paper iteration. Fail-closed: a
+/// fetch error or a stale price never produces a "simulated success"; the
+/// iteration is rejected with the real reason. Paper mode never builds,
+/// signs or sends a transaction.
+fn resolve_paper_market_data(
+    args: &Args,
+    risk_cfg: &risk::RiskConfig,
+    rpc_client: &Arc<RpcClient>,
+    ws_provider: Option<&hft_marketdata::solana_ws::SolanaWsProvider>,
+    blocklist: &std::collections::HashSet<Pubkey>,
+) -> Result<PaperMarketSnapshot, PaperDataError> {
+    let pool_id_str = args
+        .pool_id
+        .as_deref()
+        .expect("--paper requires --pool-id (validated at startup)");
+    let pool_id = Pubkey::from_str(pool_id_str)
+        .map_err(|e| PaperDataError::Unavailable(format!("invalid --pool-id: {e}")))?;
+    let input_mint_str = args
+        .input_mint
+        .as_deref()
+        .expect("--paper requires --input-mint (validated at startup)");
+    let output_mint_str = args
+        .output_mint
+        .as_deref()
+        .expect("--paper requires --output-mint (validated at startup)");
+    let input_mint = Pubkey::from_str(input_mint_str)
+        .map_err(|e| PaperDataError::Unavailable(format!("invalid --input-mint: {e}")))?;
+    let output_mint = Pubkey::from_str(output_mint_str)
+        .map_err(|e| PaperDataError::Unavailable(format!("invalid --output-mint: {e}")))?;
+
+    // Same cluster switch as the live path: devnet CLMM program id when the
+    // RPC is devnet, the mainnet program id otherwise.
+    let program_id = if args.rpc.contains("devnet") {
+        Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET)
+            .expect("valid devnet program id")
+    } else {
+        Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
+            .expect("valid mainnet program id")
+    };
+
+    // 1) Real price: prefer a fresh WS update, else the fail-closed
+    //    RPC-polled pool state feed (identical to the live path).
+    let ws_state = ws_provider
+        .filter(|p| p.is_connected())
+        .and_then(|p| p.get_pool_state(pool_id_str));
+    let (current_sqrt_price, price_timestamp_ms, source) = if let Some(state) = ws_state {
+        (state.sqrt_price, state.timestamp_ms, "websocket")
+    } else {
+        let feed = marketdata::PoolPriceFeed::new(rpc_client.clone(), pool_id, program_id);
+        let pool = feed.refresh().map_err(|e| {
+            PaperDataError::Unavailable(format!(
+                "pool state fetch failed (no synthetic price is ever used): {e}"
+            ))
+        })?;
+        let ts = feed
+            .age_ms()
+            .map(|age| marketdata::now_ms().saturating_sub(age))
+            .unwrap_or(0);
+        (pool.sqrt_price_x64, ts, "rpc_poll")
+    };
+
+    // 2) Staleness gate — the SAME function the live path calls.
+    if let Err(reason) =
+        risk::check_price_staleness(price_timestamp_ms, risk_cfg.price_staleness_ms)
+    {
+        return Err(PaperDataError::Rejected(reason));
+    }
+
+    // 3) Swap-account resolution (real vault addresses). Paper never builds a
+    //    transaction, so the user ATA's are unused — the dummy owner only
+    //    derives them deterministically (the dry-run path uses the same
+    //    all-zero-owner pattern).
+    let dummy_user = Pubkey::new_from_array([0u8; 32]);
+    let (accounts, _pool) = amm::account_resolver::resolve_swap_accounts(
+        rpc_client,
+        &pool_id,
+        &dummy_user,
+        &input_mint,
+        &output_mint,
+        &program_id,
+    )
+    .map_err(|e| PaperDataError::Unavailable(format!("swap account resolution failed: {e}")))?;
+
+    // 4) Mint/freeze authority rug-check — same as live: a present mint or
+    //    freeze authority rejects the trade (fail-closed).
+    for mint in [input_mint, output_mint] {
+        match onchain_risk::fetch_mint_authority_risk(rpc_client, &mint) {
+            Ok(risk_info) if risk_info.is_risky() => {
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::TokenAuthorityRisk,
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(PaperDataError::Unavailable(format!(
+                    "mint authority check failed for {mint}: {e}"
+                )));
+            }
+        }
+    }
+
+    // 5) Real vault liquidity + holder concentration with --live-risk-data
+    //    (same functions as live); otherwise the explicit CLI values.
+    let mut liquidity_lamports = args.pool_liquidity;
+    let mut holders = args.pool_holders;
+    let mut top_holder_pct: f64 = 0.0;
+    if args.live_risk_data {
+        liquidity_lamports = onchain_risk::fetch_vault_liquidity(rpc_client, &accounts.input_vault)
+            .map_err(|e| {
+                PaperDataError::Unavailable(format!("vault liquidity fetch failed: {e}"))
+            })?;
+        let stats =
+            onchain_risk::fetch_holder_stats(rpc_client, &input_mint, &accounts.input_vault)
+                .map_err(|e| {
+                    PaperDataError::Unavailable(format!("holder stats fetch failed: {e}"))
+                })?;
+        holders = stats.sampled_holders;
+        top_holder_pct = stats.top_holder_pct;
+    }
+    let live_blocklisted = blocklist.contains(&input_mint) || blocklist.contains(&output_mint);
+    let is_blocklisted = args.pool_blocklisted
+        || live_blocklisted
+        || (args.live_risk_data && top_holder_pct > args.max_top_holder_pct);
+
+    Ok(PaperMarketSnapshot {
+        current_sqrt_price,
+        price_timestamp_ms,
+        liquidity_lamports,
+        market_cap_lamports: args.pool_market_cap,
+        holders,
+        is_blocklisted,
+        source,
+    })
+}
+
 /// HFT Platform CLI arguments.
 #[derive(Parser, Debug)]
 #[command(
@@ -330,6 +634,27 @@ fn resolve_blockhash(
     }
 }
 
+/// AŞAMA 2/5 — paper mode runs on REAL on-chain market data, so it requires
+/// the same pool/mint arguments as live. Fail-closed: without them paper
+/// refuses to start (no synthetic paper pools anymore).
+fn validate_paper_args(
+    pool_id: Option<&str>,
+    input_mint: Option<&str>,
+    output_mint: Option<&str>,
+) -> Result<(), String> {
+    match (pool_id, input_mint, output_mint) {
+        (None, _, _) => Err(
+            "--paper requires --pool-id (real on-chain pool data — no synthetic pools). \
+             Example: --paper --pool-id <devnet CLMM pool> --input-mint ... --output-mint ..."
+                .to_string(),
+        ),
+        (_, None, _) | (_, _, None) => Err(
+            "--paper requires --input-mint and --output-mint together with --pool-id".to_string(),
+        ),
+        (Some(_), Some(_), Some(_)) => Ok(()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -382,6 +707,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics_registry = metrics::Metrics::new();
 
+    // AŞAMA 2 — paper mode now trades on REAL on-chain market data, which
+    // requires the same pool/mint arguments as live. Fail-closed: without
+    // them paper refuses to start (no synthetic paper pools anymore).
+    if args.paper {
+        validate_paper_args(
+            args.pool_id.as_deref(),
+            args.input_mint.as_deref(),
+            args.output_mint.as_deref(),
+        )?;
+    }
+
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         args.rpc.clone(),
         CommitmentConfig::confirmed(),
@@ -419,6 +755,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut successful_trades: u64 = 0;
     let mut total_latency_ms: u128 = 0;
 
+    // Operating-mode label for mode-labeled metrics (AŞAMA 3/4): paper,
+    // dry_run, live, simulation. Summary/decision records stay separate per
+    // mode so simulated results are never mixed with real on-chain ones.
+    let mode_label: &str = if args.live {
+        "live"
+    } else if args.paper {
+        "paper"
+    } else if args.dry_run {
+        "dry_run"
+    } else {
+        "simulation"
+    };
+
+    // Per-RejectReason rejection tally for the paper summary (AŞAMA 3).
+    let mut rejected_by_reason: std::collections::HashMap<&'static str, u64> =
+        std::collections::HashMap::new();
+    // Paper-only accumulators (AŞAMA 3/4): real RPC-fetch and strategy timings
+    // plus data-error counts. A paper iteration with a data error is neither a
+    // trade nor a success — it is rejected with its real reason.
+    let mut paper_sim = PaperSimulator::new();
+    let mut paper_iterations: u64 = 0;
+    let mut paper_data_errors: u64 = 0;
+    let mut paper_data_fetch_ms: u128 = 0;
+    let mut paper_strategy_ms: u128 = 0;
+    let mut paper_rejects: u64 = 0;
+
     // Optional local blocklist, loaded once. Missing file => empty set (not
     // a fail-closed condition — it just means this extra gate is inactive).
     let blocklist: std::collections::HashSet<Pubkey> = match &args.blocklist_file {
@@ -449,7 +811,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     'main_loop: for i in 0..args.iterations {
         let iteration_start = std::time::Instant::now();
 
-        metrics::record_trade_attempt(&metrics_registry);
+        metrics::record_trade_attempt(&metrics_registry, mode_label);
         metrics::set_risk_gauges(
             &metrics_registry,
             risk_manager.is_circuit_breaker_active(),
@@ -459,7 +821,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) =
             risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
         {
-            metrics::record_trade_rejected(&metrics_registry, e.code());
+            metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
+            *rejected_by_reason.entry(e.code()).or_insert(0) += 1;
             tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
             if args.live {
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
@@ -470,51 +833,273 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if args.paper {
-            // Paper-trading: run the strategy on simulated market data. No
-            // on-chain transaction is ever built or submitted.
-            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
-            // Simulated market state for this iteration (deterministic seed).
-            let seed = i as u64;
-            let liquidity = 2_000_000_000_000u64 + (seed % 1_000_000_000_000);
-            let market_cap = 100_000_000_000_000u64 + (seed % 50_000_000_000_000);
-            let holders = 100 + (seed % 400);
-            let candidate = strategy::TokenCandidate {
-                liquidity_lamports: liquidity,
-                market_cap_lamports: market_cap,
-                holders,
-                is_blocklisted: false,
-            };
-            // Simulated sqrt price drifts around the entry to exercise exits.
-            let entry_sqrt = 1u128 << 64;
-            let drift = ((seed % 21) as f64 - 10.0) / 100.0; // -10% .. +10%
-            let current_sqrt = ((entry_sqrt as f64) * (1.0 + drift).sqrt()) as u128;
+            // ================================================================
+            // PAPER MODE (AŞAMA 2/3/4): runs SimpleSnipeStrategy on REAL
+            // on-chain market data (same sources as live), simulates the
+            // would-be trade, and NEVER builds, signs or sends a transaction.
+            // ================================================================
+            paper_iterations += 1;
 
-            let entry = strategy.evaluate(&candidate, entry_sqrt);
-            let exit = strategy.should_exit(entry_sqrt, current_sqrt);
+            // Real market data (pool price, vaults, holders, mint authority).
+            let data_start = std::time::Instant::now();
+            let data_outcome = resolve_paper_market_data(
+                &args,
+                &risk_cfg,
+                &rpc_client,
+                ws_provider.as_deref(),
+                &blocklist,
+            );
+            paper_data_fetch_ms =
+                paper_data_fetch_ms.saturating_add(data_start.elapsed().as_millis());
 
+            // A real decision record is written every iteration so audit and
+            // replay reflect exactly what happened (including rejections).
+            let pool_id_str = args.pool_id.as_deref().unwrap_or("");
             let mut rec = decision::DecisionRecord::new("simple_snipe", "paper");
             rec.mode = "paper".to_string();
-            rec.pool_id = format!("paper_pool_{i}");
-            rec.token_in = "SIM".to_string();
-            rec.token_out = "SOL".to_string();
-            rec.sqrt_price = current_sqrt.to_string();
-            rec.liquidity = liquidity.to_string();
-            rec.context = serde_json::json!({
-                "entry": entry.is_some(),
-                "exit": format!("{exit:?}"),
-                "drift_pct": drift * 100.0,
-            });
-            rec.save(&args.data_dir)?;
+            rec.pool_id = pool_id_str.to_string();
+            rec.token_in = args.input_mint.as_deref().unwrap_or("").to_string();
+            rec.token_out = args.output_mint.as_deref().unwrap_or("").to_string();
 
-            tracing::info!(
-                target: "paper",
-                iteration = i + 1,
-                entry = entry.is_some(),
-                exit = ?exit,
-                "paper-trading decision recorded (no on-chain tx)"
-            );
-            successful_trades += 1;
-            total_trades += 1;
+            let snapshot = match data_outcome {
+                Ok(s) => s,
+                Err(PaperDataError::Rejected(reason)) => {
+                    // Real reject reason (stale price / token authority risk).
+                    let code = reason.code();
+                    *rejected_by_reason.entry(code).or_insert(0) += 1;
+                    paper_rejects += 1;
+                    metrics::record_trade_rejected(&metrics_registry, "paper", code);
+                    rec.sqrt_price = String::new();
+                    rec.context = serde_json::json!({
+                        "action": "rejected",
+                        "reject_reason": code,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    tracing::warn!(
+                        target: "paper",
+                        iteration = i + 1,
+                        reject_reason = code,
+                        "paper iteration rejected by real risk rule (fail-closed, not simulated-success)"
+                    );
+                    // Rejection is not a trade: counters stay untouched.
+                    total_latency_ms =
+                        total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                Err(PaperDataError::Unavailable(err)) => {
+                    // RPC/parse failure: paper has no breaker and never writes
+                    // risk state — counted separately, never simulated-success.
+                    paper_data_errors += 1;
+                    rec.context = serde_json::json!({
+                        "action": "data_error",
+                        "error": err,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    tracing::error!(
+                        target: "paper",
+                        iteration = i + 1,
+                        error = %err,
+                        "paper market data unavailable — rejected, not simulated-success (fail-closed)"
+                    );
+                    total_latency_ms =
+                        total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+
+            rec.sqrt_price = snapshot.current_sqrt_price.to_string();
+            rec.liquidity = snapshot.liquidity_lamports.to_string();
+
+            // Real candidate built from on-chain data (same fields the live
+            // path feeds into the unchanged SimpleSnipeStrategy::evaluate).
+            let candidate = strategy::TokenCandidate {
+                liquidity_lamports: snapshot.liquidity_lamports,
+                market_cap_lamports: snapshot.market_cap_lamports,
+                holders: snapshot.holders,
+                is_blocklisted: snapshot.is_blocklisted,
+            };
+
+            // Strategy evaluation on the REAL price (unchanged strategy code).
+            let strat_start = std::time::Instant::now();
+            let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
+            paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
+
+            match tick {
+                PaperTick::Hold => {
+                    rec.amount_in = 0;
+                    rec.context = serde_json::json!({
+                        "action": "hold",
+                        "entry_sqrt": null,
+                        "current_sqrt": snapshot.current_sqrt_price.to_string(),
+                        "source": snapshot.source,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    tracing::info!(
+                        target: "paper",
+                        iteration = i + 1,
+                        "paper position HELD (no exit signal, real price)"
+                    );
+                }
+                PaperTick::ClosedStopLoss(pnl) | PaperTick::ClosedTakeProfit(pnl) => {
+                    let action = if matches!(tick, PaperTick::ClosedStopLoss(_)) {
+                        "exit_stop_loss"
+                    } else {
+                        "exit_take_profit"
+                    };
+                    rec.context = serde_json::json!({
+                        "action": action,
+                        "realized_simulated_pnl_lamports": pnl,
+                        "entry_sqrt": null,
+                        "current_sqrt": snapshot.current_sqrt_price.to_string(),
+                        "source": snapshot.source,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    metrics::set_paper_simulated_pnl(
+                        &metrics_registry,
+                        paper_sim.simulated_pnl_lamports,
+                    );
+                    tracing::info!(
+                        target: "paper",
+                        iteration = i + 1,
+                        action = action,
+                        pnl_lamports = pnl,
+                        "paper simulated EXIT on real price (no on-chain tx)"
+                    );
+                }
+                PaperTick::NoEntrySignal => {
+                    rec.context = serde_json::json!({
+                        "action": "no_entry_signal",
+                        "liquidity_lamports": snapshot.liquidity_lamports,
+                        "holders": snapshot.holders,
+                        "blocklisted": snapshot.is_blocklisted,
+                        "source": snapshot.source,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    tracing::info!(
+                        target: "paper",
+                        iteration = i + 1,
+                        "strategy produced NO entry signal on real data — no simulated trade"
+                    );
+                }
+                PaperTick::EntryPending(signal) => {
+                    // Real risk gates BEFORE the entry is simulated (same
+                    // order as live): max-spend cap, then pre_trade_check.
+                    let max_spend_lamports =
+                        solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+                    let mut accepted = true;
+                    if signal.position_size_lamports > max_spend_lamports {
+                        accepted = false;
+                        *rejected_by_reason.entry("max_spend_exceeded").or_insert(0) += 1;
+                        paper_rejects += 1;
+                        metrics::record_trade_rejected(
+                            &metrics_registry,
+                            "paper",
+                            "max_spend_exceeded",
+                        );
+                        tracing::warn!(
+                            target: "paper",
+                            iteration = i + 1,
+                            position_size_lamports = signal.position_size_lamports,
+                            max_spend_lamports = max_spend_lamports,
+                            "max spend cap exceeded — no simulated trade (fail-closed)"
+                        );
+                    } else if let Err(e) = risk_manager
+                        .pre_trade_check(signal.position_size_lamports, signal.slippage_bps)
+                    {
+                        accepted = false;
+                        *rejected_by_reason.entry(e.code()).or_insert(0) += 1;
+                        paper_rejects += 1;
+                        metrics::record_trade_rejected(&metrics_registry, "paper", e.code());
+                        tracing::warn!(
+                            target: "paper",
+                            iteration = i + 1,
+                            error = %e,
+                            "risk gate rejected paper entry — no simulated trade (fail-closed)"
+                        );
+                    }
+                    if !accepted {
+                        let code = rejected_by_reason
+                            .iter()
+                            .max_by_key(|(_, v)| *v)
+                            .map(|(k, _)| *k)
+                            .unwrap_or("unknown");
+                        rec.amount_in = signal.position_size_lamports;
+                        rec.context = serde_json::json!({
+                            "action": "rejected",
+                            "reject_reason": code,
+                            "source": snapshot.source,
+                            "simulated": true,
+                        });
+                        rec.save(&args.data_dir)?;
+                        total_latency_ms =
+                            total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    // Entry accepted: the ONLY place total_trades and
+                    // successful_trades increment (AŞAMA 3 — real signal +
+                    // real gates; no unconditional counting).
+                    let entry_sqrt = snapshot.current_sqrt_price;
+                    paper_sim.confirm_entry(entry_sqrt, signal.clone());
+                    total_trades += 1;
+                    successful_trades += 1;
+                    metrics::record_trade_executed(&metrics_registry, "paper");
+                    rec.amount_in = signal.position_size_lamports;
+                    rec.context = serde_json::json!({
+                        "action": "enter",
+                        "would_execute": true,
+                        "entry_sqrt": entry_sqrt.to_string(),
+                        "position_size_lamports": signal.position_size_lamports,
+                        "slippage_bps": signal.slippage_bps,
+                        "source": snapshot.source,
+                        "simulated": true,
+                    });
+                    rec.save(&args.data_dir)?;
+                    tracing::info!(
+                        target: "paper",
+                        iteration = i + 1,
+                        entry_sqrt = entry_sqrt,
+                        size_lamports = signal.position_size_lamports,
+                        source = snapshot.source,
+                        "paper ENTRY simulated on real on-chain data (no on-chain tx — would execute)"
+                    );
+                }
+            }
+
+            total_latency_ms =
+                total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+
+            // Periodic metrics snapshot (paper included; mode-labeled).
+            if total_trades > 0 && total_trades % 10 == 0 {
+                let avg_latency = total_latency_ms / paper_iterations.max(1) as u128;
+                use std::io::Write;
+                let metrics_path = args.data_dir.join("metrics.jsonl");
+                let metrics = serde_json::json!({
+                    "ts_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    "mode": "paper",
+                    "total_trades": total_trades,
+                    "successful": successful_trades,
+                    "avg_latency_ms": avg_latency
+                });
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&metrics_path)
+                {
+                    let _ = writeln!(f, "{}", metrics);
+                }
+            }
+
             sleep(Duration::from_millis(200)).await;
             continue;
         }
@@ -888,7 +1473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_spend_lamports = max_spend_lamports,
                     "max spend (SOL) cap exceeded — no trade this iteration (fail-closed)"
                 );
-                metrics::record_trade_rejected(&metrics_registry, "max_spend_exceeded");
+                metrics::record_trade_rejected(&metrics_registry, mode_label, "max_spend_exceeded");
                 rec.context = serde_json::json!({
                     "entry": true,
                     "risk_rejected": "max_spend_sol_exceeded",
@@ -906,7 +1491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 entry_signal.position_size_lamports,
                 entry_signal.slippage_bps,
             ) {
-                metrics::record_trade_rejected(&metrics_registry, e.code());
+                metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
                 tracing::warn!(
                     target: "live",
                     iteration = i + 1,
@@ -966,7 +1551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     entry_signal.position_size_lamports,
                     entry_signal.slippage_bps,
                 ) {
-                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
                     tracing::warn!(target: "live", iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
                     sleep(Duration::from_millis(200)).await;
                     continue;
@@ -1038,7 +1623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // report for details — not fabricated here.
                         risk_manager.record_trade();
                         risk_manager.record_position_open(entry_signal.position_size_lamports);
-                        metrics::record_trade_executed(&metrics_registry);
+                        metrics::record_trade_executed(&metrics_registry, mode_label);
                         tracing::info!(target: "live", signature = %sig, "transaction confirmed");
                         let cluster = if args.rpc.contains("devnet") {
                             "devnet"
@@ -1061,6 +1646,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             tracing::debug!(target: "sim", iteration = i + 1, "simulation iteration");
+            // Simulation (no flags): synthetic iteration counts as an
+            // executed trade in the mode-labeled metrics — matching the
+            // legacy unconditional `total_trades += 1` semantics below.
+            metrics::record_trade_executed(&metrics_registry, mode_label);
         }
 
         let elapsed_ms = iteration_start.elapsed().as_millis();
@@ -1104,8 +1693,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sleep(Duration::from_millis(200)).await;
     }
 
-    let avg_latency = if total_trades > 0 {
-        total_latency_ms / total_trades as u128
+    // Paper iterations all accumulate latency (rejections included), while
+    // `total_trades` counts only accepted simulated entries — so for paper
+    // the per-iteration average is the honest denominator.
+    let avg_latency_denom = if args.paper {
+        paper_iterations
+    } else {
+        total_trades
+    };
+    let avg_latency = if avg_latency_denom > 0 {
+        total_latency_ms / avg_latency_denom as u128
     } else {
         0
     };
@@ -1127,7 +1724,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Avg latency:      {} ms", avg_latency);
     println!(
         "  Mode:             {}",
-        if args.dry_run {
+        if args.paper {
+            "PAPER (real on-chain data, simulated exec)"
+        } else if args.dry_run {
             "DRY-RUN"
         } else if args.live {
             "LIVE"
@@ -1136,6 +1735,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     println!("  Data directory:   {}", args.data_dir.display());
+    if args.paper {
+        println!("  ── Paper (simulated, never on-chain) ──");
+        println!("  Simulated entries:     {}", paper_sim.entries);
+        println!("  Exits stop-loss:       {}", paper_sim.exits_stop_loss);
+        println!("  Exits take-profit:     {}", paper_sim.exits_take_profit);
+        println!("  Holds:                 {}", paper_sim.holds);
+        println!("  No entry signal:       {}", paper_sim.no_entry_signals);
+        println!("  Market-data errors:    {}", paper_data_errors);
+        println!("  Rejections:            {}", paper_rejects);
+        if !rejected_by_reason.is_empty() {
+            let mut reasons: Vec<_> = rejected_by_reason.iter().collect();
+            reasons.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+            for (reason, count) in reasons {
+                println!("    - {reason}: {count}");
+            }
+        }
+        println!(
+            "  Simulated P&L:         {} lamports ({:.6} SOL)",
+            paper_sim.simulated_pnl_lamports,
+            paper_sim.simulated_pnl_lamports as f64 / 1e9
+        );
+    }
     if risk_manager.is_circuit_breaker_active() {
         println!("  ⚠️  CIRCUIT BREAKER ACTIVE");
     }
@@ -1271,5 +1892,125 @@ mod tests {
     #[test]
     fn paper_alone_ok() {
         assert!(validate_signing_config(false, false, true, false, &None, &None, &None).is_ok());
+    }
+
+    // ── AŞAMA 2/5: paper startup validation (no synthetic pools anymore) ──
+    #[test]
+    fn paper_requires_pool_id() {
+        let err = validate_paper_args(None, Some("mint"), Some("mint")).unwrap_err();
+        assert!(err.contains("--pool-id"), "got: {err}");
+    }
+
+    #[test]
+    fn paper_requires_mints_together_with_pool() {
+        let err = validate_paper_args(Some("pool"), None, Some("mint")).unwrap_err();
+        assert!(err.contains("--input-mint"), "got: {err}");
+        let err = validate_paper_args(Some("pool"), Some("mint"), None).unwrap_err();
+        assert!(err.contains("--output-mint"), "got: {err}");
+    }
+
+    #[test]
+    fn paper_with_pool_and_mints_ok() {
+        assert!(validate_paper_args(Some("pool"), Some("mint"), Some("mint")).is_ok());
+    }
+
+    // ── AŞAMA 4/5: quote-based simulated P&L (same (current/entry)^2 ratio
+    //    formula SimpleSnipeStrategy::should_exit uses — pure, no I/O) ──
+    #[test]
+    fn simulated_pnl_lamports_zero_at_entry_price_or_zero_entry() {
+        assert_eq!(
+            simulated_pnl_lamports(1_000_000_000, 1_000_000_000, 1_000_000_000),
+            0
+        );
+        assert_eq!(simulated_pnl_lamports(0, 1_000_000_000, 1_000_000_000), 0);
+    }
+
+    #[test]
+    fn simulated_pnl_lamports_scales_with_squared_price_ratio() {
+        // 2x sqrt price => 4x price => +3x position size (positive).
+        assert_eq!(
+            simulated_pnl_lamports(1_000_000_000, 2_000_000_000, 1_000_000_000),
+            3_000_000_000
+        );
+        // Half sqrt price => 0.25x price => -0.75x position size (negative).
+        assert_eq!(
+            simulated_pnl_lamports(2_000_000_000, 1_000_000_000, 1_000_000_000),
+            -750_000_000
+        );
+    }
+
+    // ── AŞAMA 3/5: entries increment ONLY on confirm_entry; a rejected /
+    //    no-signal iteration is never a simulated success; exits accumulate
+    //    into the simulated P&L exactly once ──
+    fn rejected_candidate() -> strategy::TokenCandidate {
+        // Blocklisted candidates are always rejected by the unchanged
+        // strategy (see strategy.rs tests) — deterministic NoEntrySignal.
+        strategy::TokenCandidate {
+            liquidity_lamports: 0,
+            market_cap_lamports: 0,
+            holders: 0,
+            is_blocklisted: true,
+        }
+    }
+
+    fn entry_signal(size: u64) -> strategy::EntrySignal {
+        strategy::EntrySignal {
+            position_size_lamports: size,
+            slippage_bps: 100,
+            entry_sqrt_price: 0,
+        }
+    }
+
+    #[test]
+    fn paper_simulator_never_counts_unconfirmed_iterations() {
+        let mut sim = PaperSimulator::new();
+        assert!(!sim.has_open_position());
+        let cand = rejected_candidate();
+        // No open position + rejected candidate => no entry signal.
+        for _ in 0..3 {
+            match sim.tick(&cand, 1_000_000_000) {
+                PaperTick::NoEntrySignal => {}
+                other => panic!("expected NoEntrySignal, got: {other:?}"),
+            }
+        }
+        assert_eq!(sim.entries, 0, "no entry without confirm_entry");
+        assert_eq!(sim.simulated_pnl_lamports, 0);
+        assert_eq!(sim.no_entry_signals, 3);
+        // Hold/open-position iterations never count either.
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        assert_eq!(sim.entries, 1);
+        assert!(matches!(sim.tick(&cand, 1_000_000_000), PaperTick::Hold));
+        assert_eq!(sim.entries, 1, "hold must not re-count the entry");
+        assert_eq!(sim.holds, 1);
+    }
+
+    #[test]
+    fn paper_simulator_exits_update_pnl_once_and_clear_position() {
+        let mut sim = PaperSimulator::new();
+        let cand = rejected_candidate();
+
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        // sqrt price 0.97x => price ratio 0.9409 => ~5.9% loss >= 5% SL.
+        let PaperTick::ClosedStopLoss(sl_pnl) = sim.tick(&cand, 970_000_000) else {
+            panic!("expected stop-loss close");
+        };
+        assert!(sl_pnl < 0, "stop-loss P&L must be negative, got {sl_pnl}");
+        assert!(!sim.has_open_position(), "position must clear after close");
+
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        // sqrt price 1.1x => price ratio 1.21 => +21% >= 10% TP.
+        let PaperTick::ClosedTakeProfit(tp_pnl) = sim.tick(&cand, 1_100_000_000) else {
+            panic!("expected take-profit close");
+        };
+        assert!(tp_pnl > 0, "take-profit P&L must be positive, got {tp_pnl}");
+
+        assert_eq!(sim.entries, 2);
+        assert_eq!(sim.exits_stop_loss, 1);
+        assert_eq!(sim.exits_take_profit, 1);
+        assert_eq!(
+            sim.simulated_pnl_lamports,
+            sl_pnl + tp_pnl,
+            "accumulator must equal the sum of realized simulated closes"
+        );
     }
 }

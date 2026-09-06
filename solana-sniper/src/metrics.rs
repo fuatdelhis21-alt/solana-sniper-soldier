@@ -34,15 +34,19 @@ pub struct Metrics {
     pub last_trade_ts: Gauge,
     /// Every time the risk gate is evaluated for a candidate trade,
     /// regardless of outcome.
-    pub trade_attempt_total: IntCounter,
-    /// Rejections, labeled by machine-readable `RejectReason::code()`
-    /// (stale_price, slippage_exceeded, max_spend_exceeded,
-    /// daily_trade_cap, daily_loss_limit, circuit_breaker_open,
-    /// token_authority_risk, holder_concentration_exceeded,
-    /// insufficient_liquidity, hsm_unavailable, ...).
+    /// Risk-gate evaluations per operating mode
+    /// (`mode`: "paper" | "dry_run" | "live" | "simulation").
+    pub trade_attempt_total: IntCounterVec,
+    /// Rejections, labeled by operating mode and machine-readable
+    /// `RejectReason::code()` (stale_price, slippage_exceeded,
+    /// max_spend_exceeded, daily_trade_cap, daily_loss_limit,
+    /// circuit_breaker_open, token_authority_risk,
+    /// holder_concentration_exceeded, insufficient_liquidity,
+    /// hsm_unavailable, ...).
     pub trade_rejected_total: IntCounterVec,
-    /// Trades that were actually built, signed, and submitted successfully.
-    pub trade_executed_total: IntCounter,
+    /// Trades actually executed per mode (live: submitted on-chain; paper:
+    /// simulated "would-execute" entries that passed every real gate).
+    pub trade_executed_total: IntCounterVec,
     /// Circuit breaker state gauge (1=open/tripped, 0=closed/normal).
     pub circuit_breaker_state: Gauge,
     /// Realized P&L for the current UTC day, in lamports (loss-only today —
@@ -51,6 +55,10 @@ pub struct Metrics {
     pub daily_realized_pnl: Gauge,
     /// Number of currently tracked open positions.
     pub open_position_count: Gauge,
+    /// Cumulative simulated P&L of closed paper positions, in lamports
+    /// (negative = simulated loss). NEVER mixed with `daily_realized_pnl`
+    /// which tracks real on-chain P&L only.
+    pub paper_simulated_pnl: Gauge,
 }
 
 impl Metrics {
@@ -76,15 +84,24 @@ impl Metrics {
             Gauge::new("hft_kill_switch_active", "Kill switch state (1=active)").unwrap();
         let last_trade_ts = Gauge::new("hft_last_trade_ts", "Unix ms of last trade").unwrap();
 
-        let trade_attempt_total =
-            IntCounter::new("trade_attempt_total", "Total risk-gate evaluations").unwrap();
-        let trade_rejected_total = IntCounterVec::new(
-            Opts::new("trade_rejected_total", "Rejected trades by reason code"),
-            &["reason"],
+        let trade_attempt_total = IntCounterVec::new(
+            Opts::new("trade_attempt_total", "Total risk-gate evaluations"),
+            &["mode"],
         )
         .unwrap();
-        let trade_executed_total =
-            IntCounter::new("trade_executed_total", "Trades successfully submitted").unwrap();
+        let trade_rejected_total = IntCounterVec::new(
+            Opts::new("trade_rejected_total", "Rejected trades by reason code"),
+            &["mode", "reason"],
+        )
+        .unwrap();
+        let trade_executed_total = IntCounterVec::new(
+            Opts::new(
+                "trade_executed_total",
+                "Trades successfully submitted (live) or simulated as executed (paper)",
+            ),
+            &["mode"],
+        )
+        .unwrap();
         let circuit_breaker_state = Gauge::new(
             "circuit_breaker_state",
             "Circuit breaker state (1=open/tripped, 0=closed)",
@@ -97,6 +114,11 @@ impl Metrics {
         .unwrap();
         let open_position_count =
             Gauge::new("open_position_count", "Currently tracked open positions").unwrap();
+        let paper_simulated_pnl = Gauge::new(
+            "paper_simulated_pnl",
+            "Cumulative simulated P&L of closed paper positions, in lamports",
+        )
+        .unwrap();
 
         registry.register(Box::new(trades_total.clone())).ok();
         registry.register(Box::new(trades_success.clone())).ok();
@@ -123,6 +145,9 @@ impl Metrics {
         registry
             .register(Box::new(open_position_count.clone()))
             .ok();
+        registry
+            .register(Box::new(paper_simulated_pnl.clone()))
+            .ok();
         Arc::new(Self {
             registry,
             trades_total,
@@ -140,6 +165,7 @@ impl Metrics {
             circuit_breaker_state,
             daily_realized_pnl,
             open_position_count,
+            paper_simulated_pnl,
         })
     }
 
@@ -226,23 +252,29 @@ pub fn set_kill_switch(metrics: &Metrics, active: bool) {
         .set(if active { 1.0 } else { 0.0 });
 }
 
-/// Convenience: record a risk-gate evaluation attempt.
-pub fn record_trade_attempt(metrics: &Metrics) {
-    metrics.trade_attempt_total.inc();
+/// Convenience: record a risk-gate evaluation attempt for an operating
+/// mode (`mode`: "paper" | "dry_run" | "live" | "simulation").
+pub fn record_trade_attempt(metrics: &Metrics, mode: &str) {
+    metrics.trade_attempt_total.with_label_values(&[mode]).inc();
 }
 
-/// Convenience: record a rejection with its machine-readable reason code
-/// (e.g. `RejectReason::code()` from `risk.rs`).
-pub fn record_trade_rejected(metrics: &Metrics, reason_code: &str) {
+/// Convenience: record a rejection with its operating mode and
+/// machine-readable reason code (e.g. `RejectReason::code()` from `risk.rs`).
+pub fn record_trade_rejected(metrics: &Metrics, mode: &str, reason_code: &str) {
     metrics
         .trade_rejected_total
-        .with_label_values(&[reason_code])
+        .with_label_values(&[mode, reason_code])
         .inc();
 }
 
-/// Convenience: record a successfully submitted trade.
-pub fn record_trade_executed(metrics: &Metrics) {
-    metrics.trade_executed_total.inc();
+/// Convenience: record an executed trade for an operating mode. In live mode
+/// this means submitted+confirmed on-chain; in paper mode it means a
+/// simulated "would-execute" entry that passed every real gate.
+pub fn record_trade_executed(metrics: &Metrics, mode: &str) {
+    metrics
+        .trade_executed_total
+        .with_label_values(&[mode])
+        .inc();
 }
 
 /// Convenience: refresh the circuit-breaker/open-position/PNL gauges from
@@ -260,6 +292,13 @@ pub fn set_risk_gauges(
         .daily_realized_pnl
         .set(daily_realized_pnl_lamports as f64);
     metrics.open_position_count.set(open_position_count as f64);
+}
+
+/// Convenience: publish the cumulative simulated P&L of closed paper
+/// positions (AŞAMA 4). Always labeled simulated — never mixed with real
+/// on-chain realized P&L.
+pub fn set_paper_simulated_pnl(metrics: &Metrics, pnl_lamports: i64) {
+    metrics.paper_simulated_pnl.set(pnl_lamports as f64);
 }
 
 #[cfg(test)]
@@ -291,18 +330,20 @@ mod tests {
     #[test]
     fn risk_metrics_render_with_reason_label() {
         let m = Metrics::new();
-        record_trade_attempt(&m);
-        record_trade_attempt(&m);
-        record_trade_rejected(&m, "stale_price");
-        record_trade_rejected(&m, "stale_price");
-        record_trade_rejected(&m, "daily_loss_limit");
-        record_trade_executed(&m);
+        record_trade_attempt(&m, "paper");
+        record_trade_attempt(&m, "live");
+        record_trade_rejected(&m, "paper", "stale_price");
+        record_trade_rejected(&m, "paper", "stale_price");
+        record_trade_rejected(&m, "live", "daily_loss_limit");
+        record_trade_executed(&m, "paper");
         set_risk_gauges(&m, true, -150_000_000, 1);
         let out = m.render();
-        assert!(out.contains("trade_attempt_total 2"));
-        assert!(out.contains("trade_rejected_total{reason=\"stale_price\"} 2"));
-        assert!(out.contains("trade_rejected_total{reason=\"daily_loss_limit\"} 1"));
-        assert!(out.contains("trade_executed_total 1"));
+        // Mode-labeled counters: paper and live attempts are separated.
+        assert!(out.contains("trade_attempt_total{mode=\"paper\"} 1"));
+        assert!(out.contains("trade_attempt_total{mode=\"live\"} 1"));
+        assert!(out.contains("trade_rejected_total{mode=\"paper\",reason=\"stale_price\"} 2"));
+        assert!(out.contains("trade_rejected_total{mode=\"live\",reason=\"daily_loss_limit\"} 1"));
+        assert!(out.contains("trade_executed_total{mode=\"paper\"} 1"));
         assert!(out.contains("circuit_breaker_state 1"));
         assert!(out.contains("daily_realized_pnl -150000000"));
         assert!(out.contains("open_position_count 1"));
