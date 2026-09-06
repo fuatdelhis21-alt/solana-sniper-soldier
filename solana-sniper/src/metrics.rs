@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
+    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
     TextEncoder,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,6 +51,24 @@ pub struct Metrics {
     pub daily_realized_pnl: Gauge,
     /// Number of currently tracked open positions.
     pub open_position_count: Gauge,
+    /// EXIT-MANAGEMENT observability (AŞAMA 4/5/6): exit submissions,
+    /// rejections by reason, executions, and the EXIT_BLOCKED / retry state.
+    pub trade_exit_attempt_total: IntCounter,
+    pub trade_exit_rejected_total: IntCounterVec,
+    pub trade_exit_executed_total: IntCounter,
+    /// Closed positions (exits) today — never gates anything.
+    pub daily_exits: Gauge,
+    /// Kill switch tri-state per category: {reason="integrity"|"risk_limit"|"unknown"}
+    /// is 1 when the kill switch is active with that category, else 0.
+    pub kill_switch_state: GaugeVec,
+    /// Circuit breaker state machine: 0=closed, 1=half_open, 2=open.
+    pub breaker_state: Gauge,
+    /// EXIT_BLOCKED flag (exit retry budget exhausted; position stays open).
+    pub exit_blocked: Gauge,
+    /// Age in seconds of the currently open position (0 when none).
+    pub open_position_age_seconds: Gauge,
+    /// RECONCILE_REQUIRED flag (startup orphan/mismatch; operator action).
+    pub reconcile_required: Gauge,
 }
 
 impl Metrics {
@@ -97,6 +115,53 @@ impl Metrics {
         .unwrap();
         let open_position_count =
             Gauge::new("open_position_count", "Currently tracked open positions").unwrap();
+        let trade_exit_attempt_total = IntCounter::new(
+            "trade_exit_attempt_total",
+            "Exit transaction submission attempts (bounded retry budget)",
+        )
+        .unwrap();
+        let trade_exit_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "trade_exit_rejected_total",
+                "Rejected exits by machine-readable reason code",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        let trade_exit_executed_total = IntCounter::new(
+            "trade_exit_executed_total",
+            "Exits successfully submitted and confirmed",
+        )
+        .unwrap();
+        let daily_exits = Gauge::new("daily_exits", "Closed positions (exits) today").unwrap();
+        let kill_switch_state = GaugeVec::new(
+            Opts::new(
+                "kill_switch_state",
+                "Kill switch active state by category (1=active)",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        let breaker_state = Gauge::new(
+            "breaker_state",
+            "Circuit breaker state (0=closed, 1=half_open, 2=open)",
+        )
+        .unwrap();
+        let exit_blocked = Gauge::new(
+            "exit_blocked",
+            "EXIT_BLOCKED flag (exit retry budget exhausted; position stays open)",
+        )
+        .unwrap();
+        let open_position_age_seconds = Gauge::new(
+            "open_position_age_seconds",
+            "Age in seconds of the currently open position (0 when none)",
+        )
+        .unwrap();
+        let reconcile_required = Gauge::new(
+            "reconcile_required",
+            "RECONCILE_REQUIRED flag (startup orphan/mismatch; operator action)",
+        )
+        .unwrap();
 
         registry.register(Box::new(trades_total.clone())).ok();
         registry.register(Box::new(trades_success.clone())).ok();
@@ -123,6 +188,23 @@ impl Metrics {
         registry
             .register(Box::new(open_position_count.clone()))
             .ok();
+        registry
+            .register(Box::new(trade_exit_attempt_total.clone()))
+            .ok();
+        registry
+            .register(Box::new(trade_exit_rejected_total.clone()))
+            .ok();
+        registry
+            .register(Box::new(trade_exit_executed_total.clone()))
+            .ok();
+        registry.register(Box::new(daily_exits.clone())).ok();
+        registry.register(Box::new(kill_switch_state.clone())).ok();
+        registry.register(Box::new(breaker_state.clone())).ok();
+        registry.register(Box::new(exit_blocked.clone())).ok();
+        registry
+            .register(Box::new(open_position_age_seconds.clone()))
+            .ok();
+        registry.register(Box::new(reconcile_required.clone())).ok();
         Arc::new(Self {
             registry,
             trades_total,
@@ -140,6 +222,15 @@ impl Metrics {
             circuit_breaker_state,
             daily_realized_pnl,
             open_position_count,
+            trade_exit_attempt_total,
+            trade_exit_rejected_total,
+            trade_exit_executed_total,
+            daily_exits,
+            kill_switch_state,
+            breaker_state,
+            exit_blocked,
+            open_position_age_seconds,
+            reconcile_required,
         })
     }
 
@@ -262,6 +353,67 @@ pub fn set_risk_gauges(
     metrics.open_position_count.set(open_position_count as f64);
 }
 
+/// Convenience: record an exit submission attempt (bounded retry budget).
+pub fn record_exit_attempt(metrics: &Metrics) {
+    metrics.trade_exit_attempt_total.inc();
+}
+
+/// Convenience: record an exit rejection with its machine-readable reason
+/// code (e.g. `RejectReason::code()` from `risk.rs`).
+pub fn record_exit_rejected(metrics: &Metrics, reason_code: &str) {
+    metrics
+        .trade_exit_rejected_total
+        .with_label_values(&[reason_code])
+        .inc();
+}
+
+/// Convenience: record a successfully confirmed exit.
+pub fn record_exit_executed(metrics: &Metrics) {
+    metrics.trade_exit_executed_total.inc();
+}
+
+/// Refresh the EXIT-MANAGEMENT / integrity state gauges (AŞAMA 4/5/6):
+/// breaker state machine (0=closed, 1=half_open, 2=open), kill switch
+/// category state, EXIT_BLOCKED, RECONCILE_REQUIRED, daily exits and the
+/// open position age. `kill_switch_reason` is the active category code
+/// ("integrity"/"risk_limit") or `None` when released.
+pub fn set_state_gauges(
+    metrics: &Metrics,
+    breaker_state: u8,
+    kill_switch_active: bool,
+    kill_switch_reason: Option<&str>,
+    exit_blocked: bool,
+    reconcile_required: bool,
+    daily_exits: u64,
+    open_position_age_seconds: f64,
+) {
+    metrics.breaker_state.set(breaker_state as f64);
+    // Kill-switch tri-state: clear every category, then set the active one.
+    for reason in ["integrity", "risk_limit", "unknown"] {
+        metrics
+            .kill_switch_state
+            .with_label_values(&[reason])
+            .set(0.0);
+    }
+    if kill_switch_active {
+        let reason = kill_switch_reason.unwrap_or("unknown");
+        metrics
+            .kill_switch_state
+            .with_label_values(&[reason])
+            .set(1.0);
+    }
+    metrics
+        .exit_blocked
+        .set(if exit_blocked { 1.0 } else { 0.0 });
+    metrics
+        .reconcile_required
+        .set(if reconcile_required { 1.0 } else { 0.0 });
+    metrics.daily_exits.set(daily_exits as f64);
+    metrics
+        .open_position_age_seconds
+        .set(open_position_age_seconds);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +458,45 @@ mod tests {
         assert!(out.contains("circuit_breaker_state 1"));
         assert!(out.contains("daily_realized_pnl -150000000"));
         assert!(out.contains("open_position_count 1"));
+    }
+
+    #[test]
+    fn exit_management_metrics_render() {
+        let m = Metrics::new();
+        record_exit_attempt(&m);
+        record_exit_rejected(&m, "exit_retry_backoff");
+        record_exit_rejected(&m, "exit_blocked_integrity");
+        record_exit_executed(&m);
+        set_state_gauges(&m, 2, true, Some("integrity"), true, false, 3, 42.5);
+        let out = m.render();
+        assert!(out.contains("trade_exit_attempt_total 1"));
+        assert!(out.contains("trade_exit_rejected_total{reason=\"exit_retry_backoff\"} 1"));
+        assert!(out.contains("trade_exit_rejected_total{reason=\"exit_blocked_integrity\"} 1"));
+        assert!(out.contains("trade_exit_executed_total 1"));
+        assert!(out.contains("breaker_state 2"));
+        assert!(out.contains("kill_switch_state{reason=\"integrity\"} 1"));
+        assert!(out.contains("kill_switch_state{reason=\"risk_limit\"} 0"));
+        assert!(out.contains("exit_blocked 1"));
+        assert!(out.contains("reconcile_required 0"));
+        assert!(out.contains("daily_exits 3"));
+        assert!(out.contains("open_position_age_seconds 42.5"));
+    }
+
+    #[test]
+    fn state_gauges_reflect_half_open_and_risk_limit() {
+        let m = Metrics::new();
+        set_state_gauges(&m, 1, true, Some("risk_limit"), false, true, 1, 0.0);
+        let out = m.render();
+        assert!(out.contains("breaker_state 1"));
+        assert!(out.contains("kill_switch_state{reason=\"integrity\"} 0"));
+        assert!(out.contains("kill_switch_state{reason=\"risk_limit\"} 1"));
+        assert!(out.contains("exit_blocked 0"));
+        assert!(out.contains("reconcile_required 1"));
+        // Releasing the kill switch clears the active category.
+        set_state_gauges(&m, 0, false, None, false, false, 0, 0.0);
+        let out = m.render();
+        assert!(out.contains("breaker_state 0"));
+        assert!(out.contains("kill_switch_state{reason=\"risk_limit\"} 0"));
     }
 
     #[tokio::test]

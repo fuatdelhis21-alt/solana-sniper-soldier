@@ -193,6 +193,12 @@ struct Args {
     /// mode. Has no effect in --paper or --dry-run.
     #[arg(long, default_value_t = false)]
     confirm_live: bool,
+
+    /// Bind address for the Prometheus metrics + health HTTP server.
+    /// Defaults to localhost only (never 0.0.0.0); a bind failure is fatal
+    /// — the process refuses to run without observability.
+    #[arg(long, default_value = "127.0.0.1:9898")]
+    metrics_addr: String,
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -363,6 +369,113 @@ fn token_account_balance_raw(
     Ok(Some(u64::from_le_bytes(buf)))
 }
 
+/// AŞAMA 5 — restart orphan-position reconciliation (LIVE + --pool-id only).
+/// Compares the recorded position against on-chain reality BEFORE the
+/// trading loop starts:
+/// - on-chain tokens exist but no position is recorded → orphan: mark
+///   RECONCILE_REQUIRED. NO automatic recovery sell is ever performed —
+///   the bot cannot know the cost basis / entry pool of orphan tokens;
+/// - a position is recorded but the on-chain token balance is zero (moved
+///   or sold manually) → state/on-chain mismatch: mark RECONCILE_REQUIRED.
+/// Either condition refuses to start live trading (fail-closed): the
+/// position stays exactly as recorded, the operator resolves the mismatch
+/// and restarts. RPC/HSM failures here are also fail-closed: they trip the
+/// circuit breaker and refuse to start.
+async fn startup_orphan_reconcile(
+    args: &Args,
+    rpc_client: &Arc<RpcClient>,
+    risk_manager: &risk::RiskManager,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !args.live {
+        return Ok(());
+    }
+    // A RECONCILE_REQUIRED flag persisted from a previous run blocks live
+    // trading unconditionally (with or without --pool-id) until an operator
+    // resolves the mismatch. Fail-closed, no automatic sell — ever.
+    if risk_manager.is_reconcile_required() {
+        tracing::error!(
+            target: "main",
+            "RECONCILE_REQUIRED flag is set (persisted) — refusing to start live trading (fail-closed; no automatic recovery sell)"
+        );
+        eprintln!(
+            "[CRITICAL] RECONCILE REQUIRED: persisted from a previous run. Live trading will NOT \
+             start and NO automatic recovery sell is performed. Inspect/resolve the mismatch \
+             (risk_state.json vs on-chain token account), then restart."
+        );
+        return Err(
+            "startup reconciliation required (persisted flag) — refusing to start live trading (fail-closed; no automatic recovery sell)"
+                .to_string()
+                .into(),
+        );
+    }
+    if args.pool_id.is_none() {
+        return Ok(());
+    }
+    let endpoint = args.hsm_endpoint.as_ref().expect("validated in live");
+    let ca = args.hsm_ca.as_ref().expect("validated in live");
+    let identity = args
+        .hsm_client_identity
+        .as_ref()
+        .expect("validated in live");
+    let from = hsm_pubkey(endpoint, ca, identity).await?;
+    let token_mint_str = args
+        .output_mint
+        .as_ref()
+        .ok_or("startup reconciliation: --output-mint is required with --pool-id")?;
+    let token_mint = Pubkey::from_str(token_mint_str)
+        .map_err(|e| format!("startup reconciliation: invalid --output-mint: {e}"))?;
+
+    let onchain_balance = match token_account_balance_raw(rpc_client, &from, &token_mint) {
+        Ok(b) => b.unwrap_or(0),
+        Err(e) => {
+            risk_manager.trip_circuit_breaker(&format!(
+                "startup reconciliation: token balance read failed (fail-closed): {e}"
+            ));
+            return Err(format!(
+                "startup reconciliation: token balance read failed (fail-closed): {e}"
+            )
+            .into());
+        }
+    };
+
+    let recorded = risk_manager.current_position();
+    match (&recorded, onchain_balance) {
+        (None, b) if b > 0 => {
+            // Orphan tokens on-chain with no recorded position detail: no
+            // automatic sell — the operator must reconcile manually.
+            risk_manager.set_reconcile_required(&format!(
+                "orphan token balance of {b} raw units on-chain but no recorded position — no automatic recovery sell (fail-closed)"
+            ));
+        }
+        (Some(_), 0) => {
+            risk_manager.set_reconcile_required(
+                "recorded open position but zero on-chain token balance — position may have been moved or sold manually",
+            );
+        }
+        _ => {}
+    }
+
+    if risk_manager.is_reconcile_required() {
+        tracing::error!(
+            target: "main",
+            onchain_token_balance = onchain_balance,
+            recorded_open = recorded.is_some(),
+            "RECONCILE_REQUIRED — refusing to start live trading; position left open, no automatic sell (fail-closed)"
+        );
+        eprintln!(
+            "[CRITICAL] RECONCILE REQUIRED: on-chain token state does not match the recorded \
+             position. Live trading will NOT start and NO automatic recovery sell is performed. \
+             Inspect/resolve the mismatch (risk_state.json vs on-chain token account), then restart."
+        );
+        return Err(
+            "startup reconciliation required — refusing to start live trading (fail-closed; no automatic recovery sell)"
+                .to_string()
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -389,6 +502,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daily_loss = risk_manager.current_daily_loss(),
         circuit_breaker = risk_manager.is_circuit_breaker_active(),
         state_verified = risk_manager.is_state_verified(),
+        reconcile_required = risk_manager.is_reconcile_required(),
+        exit_blocked = risk_manager.is_exit_blocked(),
+        kill_switch = risk_manager.is_kill_switch_active(),
         "risk manager initialized"
     );
 
@@ -414,6 +530,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let metrics_registry = metrics::Metrics::new();
+
+    // Metrics/health HTTP server (localhost by default — never 0.0.0.0).
+    // Fail-loud: a bind failure exits the process instead of running
+    // silently without observability.
+    {
+        let addr = args.metrics_addr.clone();
+        let reg = metrics_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::spawn_metrics_server(&addr, reg).await {
+                eprintln!("[CRITICAL] {e}");
+                tracing::error!(target: "metrics", error = %e, "metrics server failed — exiting");
+                std::process::exit(1);
+            }
+        });
+    }
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         args.rpc.clone(),
@@ -479,6 +610,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // AŞAMA 5 — restart orphan-position reconciliation. Live mode compares
+    // the recorded position against the real on-chain token balance BEFORE
+    // the loop starts; any mismatch marks RECONCILE_REQUIRED and refuses to
+    // start (no automatic recovery sell).
+    if args.live {
+        startup_orphan_reconcile(&args, &rpc_client, &risk_manager).await?;
+    }
+
     'main_loop: for i in 0..args.iterations {
         let iteration_start = std::time::Instant::now();
 
@@ -488,6 +627,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_manager.is_circuit_breaker_active(),
             risk_manager.realized_pnl(),
             risk_manager.open_position_count(),
+        );
+        // EXIT-management / integrity gauges (breaker state machine, kill
+        // switch category, EXIT_BLOCKED, RECONCILE_REQUIRED, daily exits,
+        // open position age) — refreshed every iteration.
+        let breaker_gauge = match risk_manager.breaker_state() {
+            risk::BreakerState::Closed => 0u8,
+            risk::BreakerState::HalfOpen => 1u8,
+            risk::BreakerState::Open => 2u8,
+        };
+        let kill_reason = risk_manager.kill_switch_category().map(|c| c.code());
+        let open_age_secs = risk_manager
+            .current_position()
+            .map(|p| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as f64;
+                (now_ms - p.opened_at_ms as f64).max(0.0) / 1000.0
+            })
+            .unwrap_or(0.0);
+        metrics::set_state_gauges(
+            &metrics_registry,
+            breaker_gauge,
+            risk_manager.is_kill_switch_active(),
+            kill_reason,
+            risk_manager.is_exit_blocked(),
+            risk_manager.is_reconcile_required(),
+            risk_manager.current_daily_exits(),
+            open_age_secs,
         );
         // Entry gates apply only when no position is open. With an open
         // position this is an EXIT-management iteration: the exit path below
@@ -626,10 +794,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "LIVE mode iteration"
             );
 
-            if risk_manager.is_circuit_breaker_active() {
-                tracing::error!(target: "main", "CIRCUIT BREAKER ACTIVE — stopping live trading");
-                eprintln!("[CRITICAL] Circuit breaker active. Trading halted.");
-                break;
+            // Circuit-breaker recovery management (AŞAMA 3). While `Open`
+            // nothing trades: the bot waits out the cooldown, then runs a
+            // READ-ONLY probe (getSlot — never a write/sign). A successful
+            // probe moves the breaker to `HalfOpen`, where trial trades may
+            // run (a confirmed entry/exit heals it to `Closed`, any failure
+            // re-trips it); a failed probe re-opens the breaker and
+            // restarts the cooldown. The breaker NEVER auto-closes by time.
+            match risk_manager.breaker_state() {
+                risk::BreakerState::Open => {
+                    if !risk_manager.breaker_cooldown_elapsed() {
+                        tracing::warn!(
+                            target: "live",
+                            iteration = i + 1,
+                            "CIRCUIT BREAKER OPEN — cooldown in progress; no trades this iteration (fail-closed)"
+                        );
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    // Cooldown elapsed: read-only health probe.
+                    match rpc_client.get_slot() {
+                        Ok(slot) => {
+                            risk_manager.enter_half_open(&format!(
+                                "read-only getSlot probe succeeded (slot {slot})"
+                            ));
+                            tracing::info!(
+                                target: "live",
+                                iteration = i + 1,
+                                slot,
+                                "breaker HALF-OPEN — read-only probe succeeded; trial trades may run"
+                            );
+                        }
+                        Err(e) => {
+                            risk_manager.report_probe_failure(&format!(
+                                "read-only getSlot probe failed (fail-closed): {e}"
+                            ));
+                            tracing::error!(
+                                target: "live",
+                                iteration = i + 1,
+                                error = %e,
+                                "breaker probe FAILED — breaker stays open, cooldown restarted"
+                            );
+                            eprintln!(
+                                "[CRITICAL] Breaker probe failed — breaker stays OPEN. Retrying after the cooldown."
+                            );
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    }
+                }
+                risk::BreakerState::HalfOpen => {
+                    tracing::warn!(
+                        target: "live",
+                        iteration = i + 1,
+                        "breaker HALF-OPEN — trial trades only (a confirmed trade heals it; any failure re-opens it)"
+                    );
+                }
+                risk::BreakerState::Closed => {}
             }
 
             // Live mode is fail-closed: the remote HSM is mandatory (validated
@@ -977,10 +1198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 };
 
-                // 2) Exit risk gate (kill switch, circuit breaker, daily loss,
-                //    daily trade cap, slippage) — fail-closed.
+                // 2) Exit risk gate (kill switch, circuit breaker, exit
+                //    retry budget, reconciliation, slippage) — fail-closed.
                 if let Err(e) = risk_manager.pre_exit_check(args.max_slippage_bps) {
-                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    metrics::record_exit_rejected(&metrics_registry, e.code());
                     tracing::warn!(target: "live", iteration = i + 1, error = %e, "pre-exit check failed — exit rejected this iteration (fail-closed)");
                     rec.context = serde_json::json!({
                         "exit": format!("{exit_decision:?}"),
@@ -988,6 +1209,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     rec.save(&args.data_dir)?;
                     total_trades += 1;
+                    if e.code() == "exit_retry_exhausted" {
+                        // EXIT_BLOCKED (AŞAMA 4): the bounded retry budget
+                        // is exhausted — the position stays open and NO
+                        // further automatic exit attempt may run. Audited
+                        // by RiskManager; surfaced loudly here.
+                        eprintln!(
+                            "[CRITICAL] EXIT BLOCKED: exit retry budget exhausted — position stays open; no automatic retry. Operator intervention required."
+                        );
+                        break;
+                    }
                     sleep(Duration::from_millis(200)).await;
                     continue;
                 }
@@ -1108,8 +1339,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 8) FINAL pre-send recheck — state may have changed (e.g.
                 //    the kill switch tripped) since the earlier check.
                 if let Err(e) = risk_manager.pre_exit_check(args.max_slippage_bps) {
-                    metrics::record_trade_rejected(&metrics_registry, e.code());
+                    metrics::record_exit_rejected(&metrics_registry, e.code());
                     tracing::warn!(target: "live", iteration = i + 1, error = %e, "final pre-send exit recheck failed — aborting send (fail-closed)");
+                    if e.code() == "exit_retry_exhausted" {
+                        eprintln!(
+                            "[CRITICAL] EXIT BLOCKED: exit retry budget exhausted — position stays open; no automatic retry."
+                        );
+                        break;
+                    }
                     sleep(Duration::from_millis(200)).await;
                     continue;
                 }
@@ -1133,6 +1370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 10) Submission via plain RPC retry. Jito bundles are an
                 //     entry-side latency optimization; exits prioritize
                 //     reliability and simplicity (fail-closed is unchanged).
+                metrics::record_exit_attempt(&metrics_registry);
                 match retry::send_with_retry(&*rpc_client, &tx) {
                     Ok(sig) => {
                         // 11) On-chain confirmation: measure the REAL quote
@@ -1177,6 +1415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 risk_manager.record_exit();
                                 successful_trades += 1;
                                 metrics::record_trade_executed(&metrics_registry);
+                                metrics::record_exit_executed(&metrics_registry);
                                 metrics::set_risk_gauges(
                                     &metrics_registry,
                                     risk_manager.is_circuit_breaker_active(),
@@ -1225,12 +1464,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(e) => {
                         // Failed exit: the position stays OPEN — never mark
                         // it closed on a failed transaction (fail-closed).
+                        // The attempt consumes one unit of the bounded exit
+                        // retry budget (AŞAMA 4): after `max_exit_attempts`
+                        // the exit becomes EXIT_BLOCKED — the position stays
+                        // open and no further automatic attempt may run.
                         tracing::error!(target: "live", error = %e, "exit transaction failed after retries — position remains open");
                         eprintln!(
                             "[LIVE] iter {}: EXIT TX failed: {} — position stays open",
                             i + 1,
                             e
                         );
+                        risk_manager.record_exit_attempt();
+                        if risk_manager.is_exit_blocked() {
+                            metrics_registry.exit_blocked.set(1.0);
+                            eprintln!(
+                                "[CRITICAL] EXIT BLOCKED after repeated failed exit attempts — position stays open; no automatic retry. Operator intervention required."
+                            );
+                            break;
+                        }
                     }
                 }
                 total_trades += 1;
