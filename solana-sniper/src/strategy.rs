@@ -37,8 +37,13 @@ impl Default for StrategyConfig {
         Self {
             // 1000 SOL liquidity floor (conservative for devnet testing).
             min_liquidity_lamports: 1_000_000_000_000,
-            // 0.1 SOL max position per trade.
-            max_trade_size_lamports: 100_000_000,
+            // 0.01 SOL max position per trade — deliberately BELOW the
+            // production risk cap (0.05 SOL, risk::RiskConfig::
+            // production_defaults). Invariant:
+            //   strategy_position_size <= risk.max_trade_size_lamports
+            // is enforced at startup (main.rs) and by the unit tests here,
+            // so the two constants can never silently diverge again.
+            max_trade_size_lamports: 10_000_000,
             // 1% max slippage.
             max_slippage_bps: 100,
             // 5% stop-loss.
@@ -162,6 +167,25 @@ impl SimpleSnipeStrategy {
     }
 }
 
+/// Fail-closed cross-module invariant, checked at startup (main.rs) and in
+/// tests: the strategy must never size a position above the risk manager's
+/// hard per-trade cap, otherwise every entry would be rejected at the
+/// `pre_trade_check` gate (MaxSpendExceeded) — or worse, silently bypass it.
+/// Breaking this invariant is a configuration error: refuse to start.
+pub fn validate_position_size_invariant(
+    strategy_position_size_lamports: u64,
+    risk_max_trade_size_lamports: u64,
+) -> Result<(), String> {
+    if strategy_position_size_lamports > risk_max_trade_size_lamports {
+        return Err(format!(
+            "config error: strategy position size ({strategy_position_size_lamports} lamports) \
+             exceeds risk max_trade_size_lamports ({risk_max_trade_size_lamports} lamports); \
+             refusing to start (fail-closed)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,7 +203,7 @@ mod tests {
     fn evaluate_accepts_valid_candidate() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let sig = s.evaluate(&valid_candidate(), 1u128 << 64).unwrap();
-        assert_eq!(sig.position_size_lamports, 100_000_000);
+        assert_eq!(sig.position_size_lamports, 10_000_000);
         assert_eq!(sig.slippage_bps, 100);
     }
 
@@ -255,5 +279,33 @@ mod tests {
     fn should_exit_holds_on_zero_entry() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         assert_eq!(s.should_exit(0, 1u128 << 64), ExitDecision::Hold);
+    }
+
+    // ── Trade-size vs risk-cap invariant (fail-closed) ──
+
+    #[test]
+    fn strategy_default_position_size_stays_below_production_risk_limit() {
+        use crate::risk::RiskConfig;
+        let risk_cfg =
+            RiskConfig::production_defaults(std::env::temp_dir().join("size_inv_test")).unwrap();
+        let strat_cfg = StrategyConfig::default();
+        assert!(
+            strat_cfg.max_trade_size_lamports <= risk_cfg.max_trade_size_lamports,
+            "strategy {strat_cfg:?} must never exceed risk cap {}",
+            risk_cfg.max_trade_size_lamports
+        );
+        // Document the exact safe values so a future bump is deliberate.
+        assert_eq!(strat_cfg.max_trade_size_lamports, 10_000_000, "0.01 SOL");
+        assert_eq!(risk_cfg.max_trade_size_lamports, 50_000_000, "0.05 SOL");
+    }
+
+    #[test]
+    fn oversized_strategy_configuration_is_fail_closed_rejected() {
+        let err = validate_position_size_invariant(100_000_000, 50_000_000).unwrap_err();
+        assert!(err.contains("config error"), "got: {err}");
+        assert!(err.contains("refusing to start"), "got: {err}");
+        // Equal sizes are allowed; only exceeding the risk cap is an error.
+        assert!(validate_position_size_invariant(50_000_000, 50_000_000).is_ok());
+        assert!(validate_position_size_invariant(10_000_000, 50_000_000).is_ok());
     }
 }
