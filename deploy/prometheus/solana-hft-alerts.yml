@@ -1,0 +1,121 @@
+# Solana HFT — Prometheus alert rules (VPS)
+#
+# Secret'sız alert/label'lar. Bu dosya VPS üzerindeki Prometheus'a
+# rules dosyası olarak yüklenir (örn. /etc/prometheus/rules/solana-hft.yml).
+# Tüm metrikler bot'un localhost metrics server'ından (127.0.0.1:9898) scrape
+# edilir. Metrics portu internete açılmaz.
+#
+# Referans: docs/VPS_ARCHITECTURE.md (BÖLÜM 8 — Alert/Operatör Sinyalleri)
+
+groups:
+  - name: solana-hft-critical
+    rules:
+      # HSM unavailable / RPC unavailable → breaker Open
+      - alert: SolanaHftBreakerOpen
+        expr: breaker_state == 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN — no trades (fail-closed)"
+          description: "breaker_state=2. RPC/HSM/infra hatası. Cooldown + probe akışı bekleniyor."
+
+      # Circuit breaker HalfOpen (probe succeeded, trial trades)
+      - alert: SolanaHftBreakerHalfOpen
+        expr: breaker_state == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker HALF-OPEN"
+          description: "breaker_state=1. Salt-okunur probe başarılı; trial trades. Başarısız işlem Open'a döndürür."
+
+      # EXIT_BLOCKED — pozisyon açık, otomatik retry yok
+      - alert: SolanaHftExitBlocked
+        expr: exit_blocked == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EXIT_BLOCKED — position stays open"
+          description: "Exit retry budget exhausted. Operator intervention required."
+
+      # RECONCILE_REQUIRED — operator must act
+      - alert: SolanaHftReconcileRequired
+        expr: reconcile_required == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RECONCILE_REQUIRED — no automatic sell"
+          description: "On-chain state mismatch. Operator must reconcile; no automatic recovery sell."
+
+      # Kill switch active (integrity or risk_limit)
+      - alert: SolanaHftKillSwitchActive
+        expr: kill_switch_state{reason="integrity"} == 1 or kill_switch_state{reason="risk_limit"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch active"
+          description: "Kill switch triggered. reason label indicates category."
+
+      # Risk state invalid → live startup refused
+      - alert: SolanaHftStateInvalid
+        expr: state_verified == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Risk state invalid — live startup refused"
+          description: "risk_state.json could not be verified."
+
+      # HSM errors rising
+      - alert: SolanaHftHsmErrors
+        expr: increase(hft_hsm_errors[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HSM signing errors detected"
+          description: "hft_hsm_errors increased in the last 5 minutes."
+
+      # Daily loss limit reached (kill switch risk_limit)
+      - alert: SolanaHftDailyLossLimit
+        expr: kill_switch_state{reason="risk_limit"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Daily loss limit reached"
+          description: "Risk-limit kill switch active. New entries stopped; exits still allowed."
+
+      # State persistence failure
+      - alert: SolanaHftStatePersistFailed
+        expr: increase(state_persist_failed_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Risk state persistence failure"
+          description: "risk_state.json could not be written atomically. Restart safety degraded."
+
+      # Failed exits rising
+      - alert: SolanaHftFailedExits
+        expr: increase(trade_exit_rejected_total[5m]) > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple failed exit attempts"
+          description: "Exit rejections rising. Check reason labels."
+
+      # Process down (metrics scrape failing)
+      - alert: SolanaHftProcessDown
+        expr: up{job="solana-sniper"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "solana-sniper process down"
+          description: "Metrics scrape failing. Check systemctl status solana-sniper."

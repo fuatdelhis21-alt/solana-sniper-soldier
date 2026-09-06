@@ -618,6 +618,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         startup_orphan_reconcile(&args, &rpc_client, &risk_manager).await?;
     }
 
+    // Operating mode label for the readiness snapshot. Live mode requires
+    // the full fail-closed gate set; paper/dry-run only need state + no
+    // reconcile flag.
+    let mode_label = if args.live {
+        "live"
+    } else if args.paper {
+        "paper"
+    } else if args.dry_run {
+        "dry_run"
+    } else {
+        "simulation"
+    };
+
     'main_loop: for i in 0..args.iterations {
         let iteration_start = std::time::Instant::now();
 
@@ -656,6 +669,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_manager.is_reconcile_required(),
             risk_manager.current_daily_exits(),
             open_age_secs,
+        );
+        // Readiness snapshot for `/ready` (BÖLÜM 5). Process alive is set
+        // once the metrics server is serving (below). Live readiness derives
+        // from the risk manager's fail-closed state: an RPC/HSM failure trips
+        // the breaker (Open) which makes ready_live() false; HSM is verified
+        // at startup in live mode. Paper/dry-run readiness only requires
+        // verified state + no reconcile flag.
+        metrics::set_readiness(
+            &metrics_registry,
+            metrics::ReadinessSnapshot {
+                process_alive: true,
+                state_verified: risk_manager.is_state_verified(),
+                reconcile_required: risk_manager.is_reconcile_required(),
+                exit_blocked: risk_manager.is_exit_blocked(),
+                breaker_state: breaker_gauge,
+                kill_switch_active: risk_manager.is_kill_switch_active(),
+                live_armed: risk_manager.is_live_armed(),
+                hsm_ready: if args.live {
+                    // HSM was verified reachable at startup (hsm_pubkey) and
+                    // any later failure trips the breaker. Report Some(true)
+                    // only while the breaker is not Open.
+                    Some(breaker_gauge != 2)
+                } else {
+                    None
+                },
+                rpc_ready: Some(breaker_gauge != 2),
+                market_data_ready: Some(ws_provider.is_some() || !args.live),
+                mode: mode_label.to_string(),
+            },
         );
         // Entry gates apply only when no position is open. With an open
         // position this is an EXIT-management iteration: the exit path below

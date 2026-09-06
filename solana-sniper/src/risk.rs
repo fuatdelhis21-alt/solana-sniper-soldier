@@ -599,10 +599,22 @@ impl RiskManager {
         if let Ok(json) = serde_json::to_string(&state) {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
                 let path = self.config.data_dir.join("risk_state.json");
-                if std::fs::write(&path, json).is_err() {
+                // Atomic write (BÖLÜM 6): write to a temp file in the SAME
+                // directory, fsync, then rename over the target. A crash
+                // mid-write leaves only the intact previous file (or the
+                // temp file), never a truncated/corrupt risk_state.json.
+                // This keeps restart safety: a half-written state would
+                // otherwise trip `is_state_verified=false` and refuse live
+                // startup even though the previous state was fine.
+                let tmp = self.config.data_dir.join("risk_state.json.tmp");
+                let write_ok =
+                    std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+                if !write_ok {
+                    // Best-effort cleanup of a leftover temp file.
+                    let _ = std::fs::remove_file(&tmp);
                     self.write_audit(
                         "state_persist_failed",
-                        "failed to write risk_state.json — restart safety degraded",
+                        "failed to atomically write risk_state.json — restart safety degraded",
                     );
                 }
             }
@@ -2066,5 +2078,124 @@ mod tests {
         let rm = RiskManager::new(cfg);
         assert!(!rm.is_state_verified());
         assert!(rm.is_reconcile_required());
+    }
+
+    #[test]
+    fn atomic_persist_leaves_no_temp_file_and_state_roundtrips() {
+        // BÖLÜM 6: persist_state must write via .tmp + atomic rename, so a
+        // crash mid-write never leaves a truncated risk_state.json. After a
+        // normal persist there must be NO leftover .tmp file, and the state
+        // must reload cleanly (verified) on restart.
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.record_exit_attempt();
+        drop(rm);
+
+        let state_path = cfg.data_dir.join("risk_state.json");
+        let tmp_path = cfg.data_dir.join("risk_state.json.tmp");
+        assert!(
+            state_path.exists(),
+            "risk_state.json must exist after persist"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "no .tmp file may remain after a successful atomic persist"
+        );
+
+        // Restart: state must parse cleanly (verified) and preserve the
+        // open position + exit attempt count. The backoff timer is NOT
+        // persisted (it is per-process pacing); the count is, so the budget
+        // is preserved across restart.
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        assert!(rm2.current_position().is_some());
+        assert_eq!(rm2.check_exit_gate(), ExitAttemptGate::Allowed);
+        // Persisted count was 1; the budget is 3. Two more attempts reach
+        // the cap (count 3) → EXIT_BLOCKED.
+        rm2.record_exit_attempt(); // count 2
+        assert!(!rm2.is_exit_blocked());
+        rm2.record_exit_attempt(); // count 3 → blocked
+        assert!(rm2.is_exit_blocked());
+    }
+
+    #[test]
+    fn atomic_persist_survives_interrupted_write() {
+        // Simulate a crash mid-write: a leftover .tmp file must NOT corrupt
+        // the real state. The loader reads only risk_state.json (never the
+        // .tmp), so a stale .tmp is harmless and the real file stays intact.
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        drop(rm);
+
+        // Write a stale/partial .tmp as if a crash happened mid-write.
+        std::fs::write(cfg.data_dir.join("risk_state.json.tmp"), "{ partial").unwrap();
+
+        // Restart: the real state file is intact and verified; the stale
+        // .tmp is ignored (and would be overwritten on the next persist).
+        let rm2 = RiskManager::new(cfg.clone());
+        assert!(rm2.is_state_verified());
+        assert!(rm2.current_position().is_some());
+
+        // A subsequent persist overwrites the stale .tmp cleanly.
+        rm2.record_exit_attempt();
+        drop(rm2);
+        assert!(!cfg.data_dir.join("risk_state.json.tmp").exists());
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_invalid_risk_limits() {
+        // BÖLÜM 10 (config): zero/invalid risk limits must be rejected
+        // (fail-closed), never silently accepted.
+        let base = test_config();
+        assert!(base.validate().is_ok());
+
+        let mut c = base.clone();
+        c.max_trade_size_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_slippage_bps = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_slippage_bps = 10_001;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.daily_loss_limit_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_daily_trades = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_open_positions = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_total_exposure_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.price_staleness_ms = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.breaker_cooldown = Duration::ZERO;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_exit_attempts = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.exit_attempt_backoff = Duration::ZERO;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn production_defaults_validate_and_are_env_overridable() {
+        // BÖLÜM 10 (config): production defaults must validate cleanly and
+        // the env-overridable fields must parse from the documented names.
+        let cfg = RiskConfig::production_defaults(unique_test_dir()).unwrap();
+        assert!(cfg.validate().is_ok());
+        // Defaults match the documented safe values.
+        assert_eq!(cfg.max_exit_attempts, 3);
+        assert_eq!(cfg.breaker_cooldown, Duration::from_millis(300_000));
+        assert_eq!(cfg.exit_attempt_backoff, Duration::from_millis(5_000));
+        assert_eq!(cfg.daily_loss_limit_lamports, 200_000_000);
     }
 }

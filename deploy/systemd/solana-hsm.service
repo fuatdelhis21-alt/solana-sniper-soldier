@@ -1,0 +1,80 @@
+# Solana HFT — HSM signer service (systemd unit)
+#
+# VPS deployment unit for the `hsm_server` process (tools/hsm_server).
+#
+# SECURITY MODEL (BÖLÜM 2/3/7):
+# - Runs as a dedicated NON-ROOT user `solana-hsm` (never root), SEPARATE
+#   from the bot user. The bot user has NO access to the HSM private key.
+# - The signing key is injected via `HSM_KEY_B64` from an EnvironmentFile
+#   with 0600 perms owned by `solana-hsm`. It is NEVER written to the source
+#   tree, logs, or this unit file.
+# - mTLS cert/key files (server.pem/server.key/ca.pem) are readable ONLY by
+#   `solana-hsm`. The bot presents its own client identity over mTLS.
+# - Fail-closed: if server.pem/server.key/ca.pem are missing the server
+#   refuses to start (no plain-HTTP fallback).
+# - Binds to 127.0.0.1:8443 by default (never 0.0.0.0). The bot reaches it
+#   over the loopback interface.
+#
+# PLACEHOLDERS — replace before use (never commit real values):
+#   /opt/solana-hft-hsm       → install dir
+#   /etc/solana-hft-hsm       → config dir (0600, hsm-owned)
+#   /var/log/solana-hft-hsm   → audit log dir (hsm-owned)
+#   /etc/solana-hft-hsm/hsm.env → contains HSM_KEY_B64 (0600, hsm-owned)
+#
+# Copy to /etc/systemd/system/solana-hsm.service, then:
+#   systemctl daemon-reload
+#   systemctl enable --now solana-hsm
+
+[Unit]
+Description=Solana HFT Remote HSM signer (mTLS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solana-hsm
+Group=solana-hsm
+WorkingDirectory=/opt/solana-hft-hsm
+
+# HSM_KEY_B64 is read from this file (0600, owned by solana-hsm). It must
+# NOT be set inline here. If unset, the server starts with an EPHEMERAL key
+# (dev/test only) — production must always set a real key via this file.
+EnvironmentFile=/etc/solana-hft-hsm/hsm.env
+
+ExecStart=/opt/solana-hft-hsm/bin/hsm_server \
+    --certs /etc/solana-hft-hsm/certs \
+    --log-file /var/log/solana-hft-hsm/hsm_audit.log
+
+# --- Hardening (BÖLÜM 3/7) ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Only the audit log dir is writable. The certs dir is read-only (0600).
+ReadWritePaths=/var/log/solana-hft-hsm
+# Network is required (loopback mTLS from the bot).
+
+# --- Restart policy (bounded) ---
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-hsm
+
+[Install]
+WantedBy=multi-user.target

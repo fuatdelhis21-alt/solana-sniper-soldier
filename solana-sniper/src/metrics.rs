@@ -10,7 +10,7 @@
 //! liveness but `/metrics` returns 503.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
@@ -19,10 +19,66 @@ use prometheus::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Readiness snapshot for the `/ready` endpoint. Distinct from process
+/// liveness (`/health`): a process can be alive yet NOT trade-ready (e.g.
+/// circuit breaker Open, RECONCILE_REQUIRED, EXIT_BLOCKED, HSM down).
+/// `main.rs` refreshes this every loop iteration via `set_readiness`.
+#[derive(Debug, Clone, Default)]
+pub struct ReadinessSnapshot {
+    /// Process is alive and the metrics server is serving.
+    pub process_alive: bool,
+    /// Risk state file parsed successfully at startup.
+    pub state_verified: bool,
+    /// RECONCILE_REQUIRED flag (operator must act; entries blocked).
+    pub reconcile_required: bool,
+    /// EXIT_BLOCKED flag (exit retry budget exhausted; position stays open).
+    pub exit_blocked: bool,
+    /// Circuit breaker state: 0=closed, 1=half_open, 2=open.
+    pub breaker_state: u8,
+    /// Kill switch active (any category).
+    pub kill_switch_active: bool,
+    /// Live mode is armed (--confirm-live + arm_live). False in paper/dry-run.
+    pub live_armed: bool,
+    /// HSM reachable + pubkey verified (live mode). Unknown in paper/dry-run.
+    pub hsm_ready: Option<bool>,
+    /// RPC reachable (last known). Unknown before first check.
+    pub rpc_ready: Option<bool>,
+    /// Market data feed available (WS or RPC poll). Unknown before first check.
+    pub market_data_ready: Option<bool>,
+    /// Current operating mode: "paper" | "dry_run" | "live" | "simulation".
+    pub mode: String,
+}
+
+impl ReadinessSnapshot {
+    /// Whether the bot is ready to run a PAPER/DRY-RUN iteration (no live
+    /// arm, no HSM, no on-chain requirement).
+    pub fn ready_paper_dry_run(&self) -> bool {
+        self.process_alive && self.state_verified && !self.reconcile_required
+    }
+
+    /// Whether the bot is ready to run a LIVE iteration. Every fail-closed
+    /// gate must be satisfied; a single false means NOT trade-ready.
+    pub fn ready_live(&self) -> bool {
+        self.process_alive
+            && self.state_verified
+            && !self.reconcile_required
+            && !self.exit_blocked
+            && self.breaker_state != 2 // not Open
+            && !self.kill_switch_active
+            && self.live_armed
+            && self.hsm_ready == Some(true)
+            && self.rpc_ready == Some(true)
+            && self.market_data_ready == Some(true)
+    }
+}
+
 /// Shared metrics registry + counters, cheaply cloneable across tasks.
 #[derive(Clone)]
 pub struct Metrics {
     registry: Registry,
+    /// Latest readiness snapshot, refreshed by `main.rs` each iteration and
+    /// served by the `/ready` endpoint.
+    readiness: Arc<Mutex<ReadinessSnapshot>>,
     pub trades_total: IntCounter,
     pub trades_success: IntCounter,
     pub trades_failed: IntCounter,
@@ -74,6 +130,7 @@ pub struct Metrics {
 impl Metrics {
     pub fn new() -> Arc<Self> {
         let registry = Registry::new();
+        let readiness = Arc::new(Mutex::new(ReadinessSnapshot::default()));
 
         let trades_total = IntCounter::new("hft_trades_total", "Total trade attempts").unwrap();
         let trades_success = IntCounter::new("hft_trades_success", "Successful trades").unwrap();
@@ -207,6 +264,7 @@ impl Metrics {
         registry.register(Box::new(reconcile_required.clone())).ok();
         Arc::new(Self {
             registry,
+            readiness,
             trades_total,
             trades_success,
             trades_failed,
@@ -270,6 +328,34 @@ pub async fn spawn_metrics_server(addr: &str, metrics: Arc<Metrics>) -> Result<(
 
             let (status, body) = match path.as_str() {
                 "/health" => ("200 OK", "ok".to_string()),
+                "/ready" => {
+                    let snap = metrics.readiness.lock().unwrap().clone();
+                    let ready = if snap.mode == "live" {
+                        snap.ready_live()
+                    } else {
+                        snap.ready_paper_dry_run()
+                    };
+                    let body = serde_json::json!({
+                        "ready": ready,
+                        "mode": snap.mode,
+                        "process_alive": snap.process_alive,
+                        "state_verified": snap.state_verified,
+                        "reconcile_required": snap.reconcile_required,
+                        "exit_blocked": snap.exit_blocked,
+                        "breaker_state": snap.breaker_state,
+                        "kill_switch_active": snap.kill_switch_active,
+                        "live_armed": snap.live_armed,
+                        "hsm_ready": snap.hsm_ready,
+                        "rpc_ready": snap.rpc_ready,
+                        "market_data_ready": snap.market_data_ready,
+                    })
+                    .to_string();
+                    if ready {
+                        ("200 OK", body)
+                    } else {
+                        ("503 Service Unavailable", body)
+                    }
+                }
                 "/metrics" => ("200 OK", metrics.render()),
                 _ => ("404 Not Found", "not found".to_string()),
             };
@@ -414,6 +500,20 @@ pub fn set_state_gauges(
         .set(open_position_age_seconds);
 }
 
+/// Refresh the readiness snapshot served by `/ready`. `main.rs` calls this
+/// every loop iteration with the current risk/HSM/RPC/market-data state so
+/// the endpoint reflects live conditions (not a stale startup value).
+/// `process_alive` is set true once the metrics server is serving.
+pub fn set_readiness(metrics: &Metrics, snap: ReadinessSnapshot) {
+    *metrics.readiness.lock().unwrap() = snap;
+}
+
+/// Read the current readiness snapshot (used by tests and the `/ready`
+/// handler).
+pub fn readiness_snapshot(metrics: &Metrics) -> ReadinessSnapshot {
+    metrics.readiness.lock().unwrap().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +624,134 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert_eq!(body, "ok");
+
+        handle.abort();
+    }
+
+    #[test]
+    fn readiness_paper_dry_run_requires_state_and_no_reconcile() {
+        // Default snapshot: process alive, nothing else set.
+        let snap = ReadinessSnapshot {
+            process_alive: true,
+            mode: "paper".to_string(),
+            ..Default::default()
+        };
+        // state_verified defaults false → not ready.
+        assert!(!snap.ready_paper_dry_run());
+        let mut snap = snap;
+        snap.state_verified = true;
+        assert!(snap.ready_paper_dry_run());
+        // RECONCILE_REQUIRED blocks paper/dry-run readiness.
+        snap.reconcile_required = true;
+        assert!(!snap.ready_paper_dry_run());
+    }
+
+    #[test]
+    fn readiness_live_requires_all_fail_closed_gates() {
+        let base = ReadinessSnapshot {
+            process_alive: true,
+            state_verified: true,
+            reconcile_required: false,
+            exit_blocked: false,
+            breaker_state: 0,
+            kill_switch_active: false,
+            live_armed: true,
+            hsm_ready: Some(true),
+            rpc_ready: Some(true),
+            market_data_ready: Some(true),
+            mode: "live".to_string(),
+        };
+        assert!(base.ready_live());
+
+        // Each single gate failure must make live NOT ready.
+        let mut s = base.clone();
+        s.state_verified = false;
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.reconcile_required = true;
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.exit_blocked = true;
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.breaker_state = 2; // Open
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.kill_switch_active = true;
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.live_armed = false;
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.hsm_ready = Some(false);
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.rpc_ready = Some(false);
+        assert!(!s.ready_live());
+        let mut s = base.clone();
+        s.market_data_ready = Some(false);
+        assert!(!s.ready_live());
+        // HalfOpen (1) is live-ready (probe succeeded; trial trades allowed).
+        let mut s = base.clone();
+        s.breaker_state = 1;
+        assert!(s.ready_live());
+    }
+
+    #[test]
+    fn readiness_snapshot_set_and_read_roundtrip() {
+        let m = Metrics::new();
+        let snap = ReadinessSnapshot {
+            process_alive: true,
+            state_verified: true,
+            mode: "dry_run".to_string(),
+            ..Default::default()
+        };
+        set_readiness(&m, snap.clone());
+        let got = readiness_snapshot(&m);
+        assert_eq!(got.mode, "dry_run");
+        assert!(got.state_verified);
+        assert!(got.ready_paper_dry_run());
+    }
+
+    #[tokio::test]
+    async fn ready_endpoint_reflects_snapshot() {
+        let m = Metrics::new();
+        // Not ready by default (state not verified).
+        let addr = "127.0.0.1:0";
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        drop(listener);
+        let server_addr = format!("127.0.0.1:{}", bound.port());
+        let m2 = m.clone();
+        let sa = server_addr.clone();
+        let handle = tokio::spawn(async move {
+            let _ = spawn_metrics_server(&sa, m2).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Default snapshot → not ready → 503.
+        let resp = reqwest::get(&format!("http://{server_addr}/ready"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+
+        // Mark ready (paper mode) → 200.
+        set_readiness(
+            &m,
+            ReadinessSnapshot {
+                process_alive: true,
+                state_verified: true,
+                mode: "paper".to_string(),
+                ..Default::default()
+            },
+        );
+        let resp = reqwest::get(&format!("http://{server_addr}/ready"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("\"ready\":true"));
+        assert!(body.contains("\"mode\":\"paper\""));
 
         handle.abort();
     }

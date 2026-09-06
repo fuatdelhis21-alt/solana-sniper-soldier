@@ -1,0 +1,107 @@
+# Solana HFT — Bot service (systemd unit)
+#
+# VPS deployment unit for the `solana-sniper` bot process.
+#
+# SECURITY MODEL (BÖLÜM 2/3):
+# - Runs as a dedicated NON-ROOT user `solana-bot` (never root).
+# - Default operating mode is PAPER/DRY-RUN. LIVE mode is NEVER the default
+#   and requires an explicit operator action (see the ExecStart override
+#   below and the runbook). Mainnet is never hardcoded.
+# - Filesystem access is locked down: ProtectSystem=strict, ProtectHome=true,
+#   PrivateTmp=true, NoNewPrivileges=true, empty CapabilityBoundingSet.
+#   Only the data/log dirs are writable (ReadWritePaths).
+# - The bot NEVER holds the HSM private key. It talks to the HSM service over
+#   mTLS only. The mTLS client identity is read from a path OUTSIDE the
+#   source tree (see EnvironmentFile / ExecStart).
+# - Restart is bounded (StartLimitIntervalSec + StartLimitBurst) so a crash
+#   loop cannot spin forever.
+#
+# PLACEHOLDERS — replace before use (never commit real values):
+#   /opt/solana-hft            → install dir
+#   /etc/solana-hft            → config dir (0600, root-owned)
+#   /var/lib/solana-hft        → writable data dir (bot-owned)
+#   /var/log/solana-hft        → log dir (bot-owned)
+#   /etc/solana-hft/hsm/client_all.pem → mTLS client identity (bot-readable)
+#   /etc/solana-hft/hsm/ca.pem         → mTLS CA (bot-readable)
+#   <REPLACE_ME_RPC_URL>       → devnet/test RPC (never mainnet by default)
+#   <REPLACE_ME_WS_URL>        → devnet/test WS
+#
+# Copy to /etc/systemd/system/solana-sniper.service, then:
+#   systemctl daemon-reload
+#   systemctl enable --now solana-sniper
+
+[Unit]
+Description=Solana HFT Sniper bot (paper/dry-run default)
+# The bot must NOT start live before the HSM service is up. In paper/dry-run
+# the HSM is not required, so this is a soft ordering hint only; the bot's
+# own fail-closed checks enforce the real gate.
+After=network-online.target solana-hsm.service
+Wants=network-online.target
+# Do not auto-start in live mode. The bot binary itself refuses live without
+# --confirm-live + arm; this unit only guarantees the process runs in a safe
+# (paper/dry-run) configuration by default.
+
+[Service]
+Type=simple
+User=solana-bot
+Group=solana-bot
+WorkingDirectory=/opt/solana-hft
+
+# Environment: non-secret config. Secrets (HSM mTLS identity, RPC auth) are
+# injected via EnvironmentFile with 0600 perms, never inline here.
+EnvironmentFile=-/etc/solana-hft/bot.env
+Environment=RUST_LOG=info,solana_sniper=debug
+Environment=RUST_BACKTRACE=0
+
+# DEFAULT: paper mode (no on-chain transactions, no HSM signing).
+# To run dry-run instead, change --paper to --dry-run.
+# LIVE MODE IS NEVER THE DEFAULT. To go live an operator must:
+#   1. set the correct (non-mainnet-by-default) RPC/WS in bot.env,
+#   2. add --live --confirm-live and the HSM mTLS flags,
+#   3. explicitly `systemctl restart solana-sniper`.
+# The bot refuses to start live without --confirm-live (fail-closed).
+ExecStart=/opt/solana-hft/bin/solana-sniper \
+    --paper \
+    --iterations 0 \
+    --rpc <REPLACE_ME_RPC_URL> \
+    --ws <REPLACE_ME_WS_URL> \
+    --data-dir /var/lib/solana-hft \
+    --metrics-addr 127.0.0.1:9898
+
+# --- Hardening (BÖLÜM 3) ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Empty capability set: the bot needs no privileges.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Only the data + log dirs are writable.
+ReadWritePaths=/var/lib/solana-hft /var/log/solana-hft
+# Network is required (RPC/WS/HSM), so it is NOT disabled.
+
+# --- Restart policy (bounded, no infinite crash loop) ---
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# --- Resource limits ---
+LimitNOFILE=65536
+LimitNPROC=512
+
+# --- Logging (journald; rotation handled by journald) ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-sniper
+
+[Install]
+WantedBy=multi-user.target
