@@ -35,6 +35,21 @@ pub enum RejectReason {
     OpenPositionCapExceeded,
     ExposureCapExceeded,
     UnverifiableRestartState,
+    /// An exit was refused because a system-INTEGRITY condition is active
+    /// (unverifiable state, HSM/RPC failure, Open circuit breaker). Risk
+    /// limits alone never produce this code.
+    ExitBlockedIntegrity,
+    /// The bounded exit retry budget is exhausted and the position is in
+    /// EXIT_BLOCKED — it stays open, no further automatic attempts until an
+    /// operator/health signal clears the block.
+    ExitRetryExhausted,
+    /// An exit retry is inside its deterministic backoff window — not a
+    /// permanent block, just "try again later this same exit event".
+    ExitRetryBackoff,
+    /// Startup reconciliation is required: the persisted state could not be
+    /// trusted/verified. New entries stay closed and no automatic recovery
+    /// sell happens until an operator resolves it.
+    ReconcileRequired,
 }
 
 impl RejectReason {
@@ -57,6 +72,10 @@ impl RejectReason {
             RejectReason::OpenPositionCapExceeded => "open_position_cap_exceeded",
             RejectReason::ExposureCapExceeded => "exposure_cap_exceeded",
             RejectReason::UnverifiableRestartState => "unverifiable_restart_state",
+            RejectReason::ExitBlockedIntegrity => "exit_blocked_integrity",
+            RejectReason::ExitRetryExhausted => "exit_retry_exhausted",
+            RejectReason::ExitRetryBackoff => "exit_retry_backoff",
+            RejectReason::ReconcileRequired => "reconcile_required",
         }
     }
 }
@@ -65,6 +84,68 @@ impl std::fmt::Display for RejectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.code())
     }
+}
+
+/// Broad classification of a kill-switch / circuit-breaker condition.
+/// Decides whether a risk-REDUCING exit may still run:
+///
+/// - `RiskLimit`: a capital-preservation limit was breached (daily realized
+///   loss, daily entry cap, exposure cap). NEW entries stop — exits stay
+///   permitted because closing an open position reduces risk.
+/// - `Integrity`: the system cannot *verify* its own safety (unreadable
+///   state file, HSM/RPC failure, stale/unknown price, security-audit
+///   suspicion, manual operator kill). EVERYTHING stops, exits included,
+///   and the condition is surfaced loudly (audit + log + metric).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskCategory {
+    RiskLimit,
+    Integrity,
+}
+
+impl RiskCategory {
+    pub fn code(&self) -> &'static str {
+        match self {
+            RiskCategory::RiskLimit => "risk_limit",
+            RiskCategory::Integrity => "integrity",
+        }
+    }
+}
+
+/// Circuit-breaker state machine:
+/// - `Closed`: normal operation (entries and exits allowed).
+/// - `Open`: tripped by an infrastructure/integrity error (HSM, RPC, WS,
+///   account resolution, probe failure). Everything stops — entries AND
+///   exits. Auto-recovers only to `HalfOpen` after the cooldown window has
+///   elapsed AND a read-only health probe succeeds (see
+///   `enter_half_open` / `report_probe_failure`).
+/// - `HalfOpen`: a probe succeeded, so the failure is believed transient.
+///   Trial trades are permitted (the probe was read-only; a real,
+///   confirmed entry or exit proves the system works and heals the
+///   breaker to `Closed`). ANY failure — a failed exit attempt, a failed
+///   entry, a re-tripped infra error — returns it to `Open`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Bounded, deterministic exit retry tracker (see AŞAMA 4 requirements):
+/// one exit event (a TP/SL decision) may be attempted at most
+/// `max_exit_attempts` times with a deterministic fixed backoff between
+/// attempts. When the budget is exhausted the exit is EXIT_BLOCKED: the
+/// position stays open, no new attempts happen, and the state is surfaced
+/// until an operator/health signal clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAttemptGate {
+    /// Attempt allowed (budget remaining and outside the backoff window).
+    Allowed,
+    /// Inside the deterministic backoff window of the previous attempt.
+    Backoff,
+    /// Budget exhausted — EXIT_BLOCKED. Position stays open.
+    Blocked,
 }
 
 /// Check a price/quote timestamp against a configured staleness limit.
@@ -134,6 +215,15 @@ pub struct RiskConfig {
     /// Maximum age (ms) of a price/quote before it is considered stale and
     /// the trade is rejected fail-closed.
     pub price_staleness_ms: u64,
+    /// Circuit-breaker cooldown: while `Open`, no exit may run until this
+    /// window elapses AND a read-only probe succeeds (half-open). Re-used
+    /// as the interval between probe attempts after failures.
+    pub breaker_cooldown: Duration,
+    /// Maximum attempts for ONE exit event before EXIT_BLOCKED.
+    pub max_exit_attempts: u64,
+    /// Deterministic fixed backoff between exit attempts (no infinite
+    /// retry, no unbounded jitter).
+    pub exit_attempt_backoff: Duration,
     data_dir: PathBuf,
 }
 
@@ -148,6 +238,9 @@ impl RiskConfig {
             max_open_positions: 10,
             max_total_exposure_lamports: 10_000_000_000,
             price_staleness_ms: 5_000,
+            breaker_cooldown: Duration::from_secs(300),
+            max_exit_attempts: 3,
+            exit_attempt_backoff: Duration::from_secs(5),
             data_dir,
         }
     }
@@ -155,24 +248,37 @@ impl RiskConfig {
     /// Conservative production defaults per the risk-hardening spec:
     /// 0.05 SOL max trade, 5 trades/day, 0.20 SOL hard daily-loss kill,
     /// 1 open position, 0.05 SOL total exposure, 2% max slippage, 5s price
-    /// staleness limit. `price_staleness_ms` may be overridden via the
-    /// `PRICE_STALENESS_MS` env var (still validated, never silently unset).
+    /// staleness limit. All breaker/exit knobs are env-overridable and
+    /// validated (never silently unset):
+    /// - `PRICE_STALENESS_MS` (default 5000)
+    /// - `BREAKER_COOLDOWN_MS` (default 300000)
+    /// - `EXIT_MAX_ATTEMPTS` (default 3)
+    /// - `EXIT_BACKOFF_MS` (default 5000)
+    /// - `DAILY_LOSS_LIMIT_LAMPORTS` (default 200_000_000)
     pub fn production_defaults(data_dir: PathBuf) -> Result<Self, String> {
-        let price_staleness_ms = match std::env::var("PRICE_STALENESS_MS") {
-            Ok(v) => v
-                .parse::<u64>()
-                .map_err(|e| format!("invalid PRICE_STALENESS_MS: {e}"))?,
-            Err(_) => 5_000,
+        let env_u64 = |name: &str, default: u64| -> Result<u64, String> {
+            match std::env::var(name) {
+                Ok(v) => v.parse::<u64>().map_err(|e| format!("invalid {name}: {e}")),
+                Err(_) => Ok(default),
+            }
         };
+        let price_staleness_ms = env_u64("PRICE_STALENESS_MS", 5_000)?;
+        let breaker_cooldown = Duration::from_millis(env_u64("BREAKER_COOLDOWN_MS", 300_000)?);
+        let max_exit_attempts = env_u64("EXIT_MAX_ATTEMPTS", 3)?;
+        let exit_attempt_backoff = Duration::from_millis(env_u64("EXIT_BACKOFF_MS", 5_000)?);
+        let daily_loss_limit_lamports = env_u64("DAILY_LOSS_LIMIT_LAMPORTS", 200_000_000)?;
         let cfg = Self {
-            max_trade_size_lamports: 50_000_000,    // 0.05 SOL
-            max_slippage_bps: 200,                  // 2%
-            daily_loss_limit_lamports: 200_000_000, // 0.20 SOL hard kill
+            max_trade_size_lamports: 50_000_000, // 0.05 SOL
+            max_slippage_bps: 200,               // 2%
+            daily_loss_limit_lamports,
             max_daily_trades: 5,
             circuit_breaker_duration: Duration::from_secs(300),
             max_open_positions: 1,
             max_total_exposure_lamports: 50_000_000, // 0.05 SOL
             price_staleness_ms,
+            breaker_cooldown,
+            max_exit_attempts,
+            exit_attempt_backoff,
             data_dir,
         };
         cfg.validate()?;
@@ -203,6 +309,15 @@ impl RiskConfig {
         }
         if self.price_staleness_ms == 0 {
             return Err("price_staleness_ms must be > 0".into());
+        }
+        if self.breaker_cooldown.is_zero() {
+            return Err("breaker_cooldown must be > 0".into());
+        }
+        if self.max_exit_attempts == 0 {
+            return Err("max_exit_attempts must be > 0".into());
+        }
+        if self.exit_attempt_backoff.is_zero() {
+            return Err("exit_attempt_backoff must be > 0".into());
         }
         Ok(())
     }
@@ -237,10 +352,84 @@ struct KillSwitchAudit {
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct PersistedRiskState {
     date: String,
+    #[serde(default)]
     daily_trades: u64,
+    #[serde(default)]
     daily_loss_lamports: u64,
+    #[serde(default)]
     open_positions: u64,
+    #[serde(default)]
     open_exposure_lamports: u64,
+    /// Fully-detailed open position (mint, amount, entry price, spend),
+    /// if one is currently open. `None` = no open position.
+    #[serde(default)]
+    position: Option<OpenPosition>,
+    /// Net realized P&L (lamports; negative = loss) accumulated today.
+    #[serde(default)]
+    realized_pnl_lamports: i64,
+    /// Calendar date the realized-P&L accumulator belongs to (empty when no
+    /// P&L was ever booked — falls back to `date`).
+    #[serde(default)]
+    realized_date: String,
+    /// Number of closed positions (exits) today — informational/observability
+    /// only. NEVER gates entries: the daily entry cap (`daily_trades`) must
+    /// not be consumed by mandatory TP/SL exits, and exits must remain
+    /// possible after the entry cap is reached.
+    #[serde(default)]
+    daily_exits: u64,
+    /// Exit attempts consumed by the CURRENT exit event (bounded retry
+    /// budget, max `max_exit_attempts`). Reset on a successful close or a
+    /// new entry.
+    #[serde(default)]
+    exit_attempt_count: u64,
+    /// EXIT_BLOCKED flag: the exit retry budget is exhausted and no further
+    /// automatic exit attempt may run until a reset (operator/success).
+    #[serde(default)]
+    exit_blocked: bool,
+    /// Startup reconciliation required: the persisted state does not match
+    /// on-chain reality (orphan tokens without position detail, etc.). While
+    /// set, new entries are rejected and no automatic recovery sell happens —
+    /// an operator must resolve it. Persisted so it survives restarts.
+    #[serde(default)]
+    reconcile_required: bool,
+}
+
+/// A fully-detailed, currently-open position. Recorded on-chain after a
+/// confirmed entry and consumed (only once) by `close_position` on exit.
+#[derive(Default, Serialize, Deserialize, Clone, Debug)]
+pub struct OpenPosition {
+    /// Pool the position was opened on (CLMM pool id).
+    pub pool_id: String,
+    /// The mint the position holds (the token bought at entry).
+    pub token_mint: String,
+    /// The mint used as quote (SOL side) — what the position is valued in.
+    pub quote_mint: String,
+    /// Actual token amount received on-chain at entry (raw units, incl. all
+    /// decimals), read from the token account after confirmation.
+    pub token_amount_raw: u64,
+    /// Quote-account balance right after entry (raw quote units). Subtracted
+    /// from the post-exit balance to compute the REAL received quote amount.
+    pub quote_balance_after_entry: u64,
+    /// SOL (quote) lamports spent to open the position.
+    pub spend_lamports: u64,
+    /// Entry reference price (Q64.64 sqrt) for stop-loss / take-profit.
+    pub entry_sqrt_price: u128,
+    /// Unix ms when the entry transaction confirmed.
+    pub opened_at_ms: u128,
+    /// Entry transaction signature.
+    pub entry_sig: String,
+}
+
+impl OpenPosition {
+    /// Average realized entry price = spend / tokens received (quote per
+    /// token, raw-unit ratio). `None` when the amount is zero (fail-closed:
+    /// a zero-amount position cannot be valued).
+    pub fn avg_entry_price(&self) -> Option<f64> {
+        if self.token_amount_raw == 0 {
+            return None;
+        }
+        Some(self.spend_lamports as f64 / self.token_amount_raw as f64)
+    }
 }
 
 /// Risk manager with circuit breaker, daily trade cap, and kill switch.
@@ -248,15 +437,43 @@ pub struct RiskManager {
     config: RiskConfig,
     daily_loss: Mutex<DailyLoss>,
     daily_trades: Mutex<DailyTrades>,
-    circuit_breaker_active: Mutex<bool>,
+    /// Circuit-breaker state machine (Closed/Open/HalfOpen). Tripped by
+    /// infrastructure/integrity errors; exits `Open` only via a successful
+    /// read-only probe (`enter_half_open`) and a subsequent successful
+    /// close — NEVER by mere passage of time (fail-closed).
+    breaker_state: Mutex<BreakerState>,
+    /// Instant the breaker was last tripped (start of the cooldown window).
     last_breaker_reset: Mutex<Instant>,
     kill_switch_active: Mutex<bool>,
+    /// Category of the active kill switch, when triggered (`None` = not
+    /// triggered or released). Decides whether risk-reducing exits may run.
+    kill_switch_reason: Mutex<Option<RiskCategory>>,
     /// Manual "arm" switch. Distinct from `kill_switch_active`: this must be
     /// explicitly enabled (fail-closed default: false) before the live
     /// trading loop is permitted to start at all.
     live_armed: Mutex<bool>,
     open_positions: Mutex<u64>,
     open_exposure_lamports: Mutex<u64>,
+    /// The single fully-detailed open position, when one exists.
+    position: Mutex<Option<OpenPosition>>,
+    /// Net realized P&L for today (lamports; negative = loss).
+    realized_pnl: Mutex<i64>,
+    /// Calendar date the `realized_pnl` accumulator belongs to.
+    realized_pnl_date: Mutex<String>,
+    /// Closed-position (exit) counter for the current day. Distinct from
+    /// `daily_trades` (the ENTRY counter): exits must never consume or gate
+    /// on the daily entry cap.
+    daily_exits: Mutex<DailyTrades>,
+    /// Exit attempts consumed by the current exit event (bounded retry).
+    exit_attempt_count: Mutex<u64>,
+    /// Instant of the last exit attempt (deterministic backoff window).
+    last_exit_attempt: Mutex<Option<Instant>>,
+    /// EXIT_BLOCKED: retry budget exhausted — position stays open, no
+    /// further automatic exit attempts until reset.
+    exit_blocked: Mutex<bool>,
+    /// Startup reconciliation required (orphan/on-chain mismatch). While
+    /// set: entries rejected, no automatic recovery sell, operator must act.
+    reconcile_required: Mutex<bool>,
     /// Whether restart-safe state (daily counters, open positions) was
     /// verified at startup — either a fresh (no prior state file) start, or
     /// a successfully-parsed prior state file. `false` means the prior state
@@ -268,7 +485,7 @@ pub struct RiskManager {
 impl RiskManager {
     pub fn new(config: RiskConfig) -> Self {
         let (state, verified) = Self::load_state(&config.data_dir);
-        let rm = Self {
+        let mut rm = Self {
             daily_loss: Mutex::new(DailyLoss {
                 date: state.date.clone(),
                 loss_lamports: state.daily_loss_lamports,
@@ -277,12 +494,31 @@ impl RiskManager {
                 date: state.date.clone(),
                 count: state.daily_trades,
             }),
-            circuit_breaker_active: Mutex::new(false),
+            daily_exits: Mutex::new(DailyTrades {
+                date: state.date.clone(),
+                count: state.daily_exits,
+            }),
+            breaker_state: Mutex::new(BreakerState::Closed),
             last_breaker_reset: Mutex::new(Instant::now()),
             kill_switch_active: Mutex::new(false),
+            kill_switch_reason: Mutex::new(None),
             live_armed: Mutex::new(false),
             open_positions: Mutex::new(state.open_positions),
             open_exposure_lamports: Mutex::new(state.open_exposure_lamports),
+            position: Mutex::new(state.position.clone()),
+            realized_pnl: Mutex::new(state.realized_pnl_lamports),
+            realized_pnl_date: Mutex::new(if state.realized_date.is_empty() {
+                state.date.clone()
+            } else {
+                state.realized_date.clone()
+            }),
+            exit_attempt_count: Mutex::new(state.exit_attempt_count),
+            last_exit_attempt: Mutex::new(None),
+            exit_blocked: Mutex::new(state.exit_blocked),
+            // Fail-closed: an unverifiable state file ALSO means an operator
+            // must reconcile before trading resumes (separate, persisted
+            // signal from `state_verified` — see `is_reconcile_required`).
+            reconcile_required: Mutex::new(!verified || state.reconcile_required),
             state_verified: verified,
             config,
         };
@@ -291,6 +527,17 @@ impl RiskManager {
                 "restart_state_unverifiable",
                 "risk_state.json exists but could not be parsed",
             );
+        } else if state.open_positions > 0 && state.position.is_none() {
+            // A state written by an older build may have counter-only open
+            // positions with no detail — the position can never be
+            // reconstructed, so it must not be traded around blindly.
+            // Fail-closed: refuse live trading until the operator inspects
+            // and clears the state file.
+            rm.write_audit(
+                "restart_state_unverifiable",
+                "open_positions > 0 but position detail missing — state predates position tracking or is inconsistent",
+            );
+            rm.state_verified = false;
         }
         rm
     }
@@ -325,20 +572,49 @@ impl RiskManager {
         let daily_loss_lamports = self.daily_loss.lock().unwrap().loss_lamports;
         let open_positions = *self.open_positions.lock().unwrap();
         let open_exposure_lamports = *self.open_exposure_lamports.lock().unwrap();
+        let position = { self.position.lock().unwrap().clone() };
+        let realized_pnl_lamports = *self.realized_pnl.lock().unwrap();
+        let realized_date = { self.realized_pnl_date.lock().unwrap().clone() };
+        let daily_exits = {
+            let t = self.daily_exits.lock().unwrap();
+            t.count
+        };
+        let exit_attempt_count = *self.exit_attempt_count.lock().unwrap();
+        let exit_blocked = *self.exit_blocked.lock().unwrap();
+        let reconcile_required = *self.reconcile_required.lock().unwrap();
         let state = PersistedRiskState {
             date,
             daily_trades,
             daily_loss_lamports,
             open_positions,
             open_exposure_lamports,
+            position,
+            realized_pnl_lamports,
+            realized_date,
+            daily_exits,
+            exit_attempt_count,
+            exit_blocked,
+            reconcile_required,
         };
         if let Ok(json) = serde_json::to_string(&state) {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
                 let path = self.config.data_dir.join("risk_state.json");
-                if std::fs::write(&path, json).is_err() {
+                // Atomic write (BÖLÜM 6): write to a temp file in the SAME
+                // directory, fsync, then rename over the target. A crash
+                // mid-write leaves only the intact previous file (or the
+                // temp file), never a truncated/corrupt risk_state.json.
+                // This keeps restart safety: a half-written state would
+                // otherwise trip `is_state_verified=false` and refuse live
+                // startup even though the previous state was fine.
+                let tmp = self.config.data_dir.join("risk_state.json.tmp");
+                let write_ok =
+                    std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+                if !write_ok {
+                    // Best-effort cleanup of a leftover temp file.
+                    let _ = std::fs::remove_file(&tmp);
                     self.write_audit(
                         "state_persist_failed",
-                        "failed to write risk_state.json — restart safety degraded",
+                        "failed to atomically write risk_state.json — restart safety degraded",
                     );
                 }
             }
@@ -369,18 +645,74 @@ impl RiskManager {
     }
 
     /// Trip the circuit breaker due to an infrastructure error (HSM, RPC,
-    /// WebSocket, account resolution, etc). Fail-closed: no new trade may be
-    /// opened while the breaker is active; it auto-resets after
-    /// `circuit_breaker_duration`.
+    /// WebSocket, account resolution, etc). Fail-closed: every trade —
+    /// entries AND exits — is refused while the breaker is `Open`, and the
+    /// breaker NEVER auto-resets by time alone: it returns to service only
+    /// through the probe sequence (`breaker_cooldown_elapsed` → read-only
+    /// probe → `enter_half_open` → successful close).
     pub fn trip_circuit_breaker(&self, reason: &str) {
-        *self.circuit_breaker_active.lock().unwrap() = true;
+        {
+            let mut state = self.breaker_state.lock().unwrap();
+            let was_half_open = *state == BreakerState::HalfOpen;
+            *state = BreakerState::Open;
+            if was_half_open {
+                self.write_audit("circuit_breaker_retripped_from_half_open", reason);
+            }
+        }
         *self.last_breaker_reset.lock().unwrap() = Instant::now();
         self.write_audit("circuit_breaker_tripped", reason);
     }
 
+    /// Current circuit-breaker state. `Open` gates everything; `HalfOpen`
+    /// (probe succeeded) permits trial trades — a successful entry or exit
+    /// heals the breaker back to `Closed`, any failure re-trips it.
+    pub fn breaker_state(&self) -> BreakerState {
+        *self.breaker_state.lock().unwrap()
+    }
+
+    /// Whether the breaker is `Open` AND its cooldown window has elapsed —
+    /// i.e. a read-only probe may now be attempted. `false` while `Closed`
+    /// or `HalfOpen` (no probe needed there), and while the cooldown is
+    /// still running. Pure query — no state transition.
+    pub fn breaker_cooldown_elapsed(&self) -> bool {
+        if self.breaker_state() != BreakerState::Open {
+            return false;
+        }
+        self.last_breaker_reset.lock().unwrap().elapsed() >= self.config.breaker_cooldown
+    }
+
+    /// Enter `HalfOpen` after the cooldown elapsed AND a read-only health
+    /// probe succeeded. Only meaningful from `Open`; a no-op from any other
+    /// state (fail-closed: never widens permissions on its own).
+    pub fn enter_half_open(&self, reason: &str) {
+        let mut state = self.breaker_state.lock().unwrap();
+        if *state != BreakerState::Open {
+            return;
+        }
+        *state = BreakerState::HalfOpen;
+        drop(state);
+        self.write_audit("breaker_half_open", reason);
+    }
+
+    /// A read-only probe failed: the outage is not over. Re-trip to `Open`
+    /// and restart the cooldown window so the next probe only runs after
+    /// another full cooldown. Fail-closed in both directions: never leaves
+    /// a failing system in `HalfOpen`, never auto-closes the breaker.
+    pub fn report_probe_failure(&self, reason: &str) {
+        {
+            let mut state = self.breaker_state.lock().unwrap();
+            if *state != BreakerState::Open {
+                *state = BreakerState::Open;
+            }
+        }
+        *self.last_breaker_reset.lock().unwrap() = Instant::now();
+        self.write_audit("breaker_probe_failed", reason);
+    }
+
     /// Record a newly-opened position (increments both the open-position
-    /// count and the exposure total). Persisted immediately for restart
-    /// safety.
+    /// count and the exposure total). Counter-only bookkeeping — prefer
+    /// `record_entry` (which stores the full position detail) for real
+    /// entries. Persisted immediately for restart safety.
     pub fn record_position_open(&self, lamports: u64) {
         *self.open_positions.lock().unwrap() += 1;
         *self.open_exposure_lamports.lock().unwrap() += lamports;
@@ -388,7 +720,9 @@ impl RiskManager {
     }
 
     /// Record a closed position, freeing its exposure. Saturating: never
-    /// underflows below zero even if called out of order.
+    /// underflows below zero even if called out of order. Counter-only
+    /// bookkeeping — prefer `close_position` (which also computes and
+    /// books the realized P&L).
     pub fn record_position_close(&self, lamports: u64) {
         let mut positions = self.open_positions.lock().unwrap();
         *positions = positions.saturating_sub(1);
@@ -397,6 +731,146 @@ impl RiskManager {
         *exposure = exposure.saturating_sub(lamports);
         drop(exposure);
         self.persist_state();
+    }
+
+    /// Record a fully-detailed position entry. Fail-closed:
+    /// - rejected when restart state is unverifiable,
+    /// - rejected when a position is already open (idempotency guard —
+    ///   a single duplicate record must never double-count exposure),
+    /// - rejected when the open-position cap is already reached.
+    /// On success the counters are bumped and the detail is persisted.
+    pub fn record_entry(&self, pos: OpenPosition) -> Result<(), RejectReason> {
+        if !self.is_state_verified() {
+            return Err(RejectReason::UnverifiableRestartState);
+        }
+        if self.is_reconcile_required() {
+            return Err(RejectReason::ReconcileRequired);
+        }
+        let spend = pos.spend_lamports;
+        {
+            let mut slot = self.position.lock().unwrap();
+            if slot.is_some() {
+                return Err(RejectReason::OpenPositionCapExceeded);
+            }
+            *slot = Some(pos);
+        }
+        // A fresh position gets a fresh exit-retry budget (EXIT_BLOCKED from
+        // a previous, unrelated exit event must not leak into the new one).
+        self.reset_exit_gate();
+        // A CONFIRMED entry while the breaker was half-open proves the
+        // system can complete real transactions: heal the breaker to Closed.
+        {
+            let mut bs = self.breaker_state.lock().unwrap();
+            if *bs == BreakerState::HalfOpen {
+                *bs = BreakerState::Closed;
+                self.write_audit(
+                    "breaker_closed",
+                    "successful entry from half-open — breaker healed",
+                );
+            }
+        }
+        self.record_position_open(spend);
+        Ok(())
+    }
+
+    /// The currently-open position detail, if any.
+    pub fn current_position(&self) -> Option<OpenPosition> {
+        self.position.lock().unwrap().clone()
+    }
+
+    /// Close the open position with the *actual* realized proceeds
+    /// (quote raw units measured on-chain after confirmation) and book the
+    /// realized P&L:
+    /// - P&L = proceeds − spend, computed in i128 and clamped to i64
+    ///   (overflow-safe; a saturating result is audited).
+    /// - A realized loss is fed into the daily-loss accumulator
+    ///   (`record_loss`), which triggers the hard kill switch when the
+    ///   daily limit is exceeded (fail-closed).
+    /// - Idempotent: the position slot is consumed via `Option::take`;
+    ///   a second call returns an error and changes nothing.
+    ///
+    /// `proceeds_quote_raw` must be in the same unit as `spend_lamports`
+    /// (native-SOL/WSOL quote with 9 decimals). The caller measures it
+    /// on-chain; unmeasurable proceeds must NOT be passed as zero.
+    pub fn close_position(&self, proceeds_quote_raw: u64) -> Result<OpenPosition, String> {
+        let pos = self.position.lock().unwrap().take().ok_or_else(|| {
+            "no open position to close — duplicate/out-of-order close rejected (idempotency)"
+                .to_string()
+        })?;
+
+        // Realized P&L in i128 first, then clamped to i64.
+        let pnl_i128 = (proceeds_quote_raw as i128).saturating_sub(pos.spend_lamports as i128);
+        let pnl: i64 = if pnl_i128 > i64::MAX as i128 {
+            i64::MAX
+        } else if pnl_i128 < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            pnl_i128 as i64
+        };
+
+        // Roll the daily realized-P&L accumulator when the day changed.
+        {
+            let today = Self::today();
+            let mut pnl_mutex = self.realized_pnl.lock().unwrap();
+            let mut date_mutex = self.realized_pnl_date.lock().unwrap();
+            if *date_mutex != today {
+                *pnl_mutex = 0;
+                *date_mutex = today;
+            }
+            *pnl_mutex = pnl_mutex.saturating_add(pnl);
+        }
+
+        // Free the exposure/counter slots (saturating).
+        {
+            let mut positions = self.open_positions.lock().unwrap();
+            *positions = positions.saturating_sub(1);
+        }
+        {
+            let mut exposure = self.open_exposure_lamports.lock().unwrap();
+            *exposure = exposure.saturating_sub(pos.spend_lamports);
+        }
+
+        // The exit event SUCCEEDED: reset the bounded retry budget and, if
+        // the breaker was half-open (probe succeeded), return it to Closed —
+        // a real, confirmed exit proves the system can complete transactions
+        // again. Persisted with the single snapshot below.
+        self.reset_exit_gate();
+        {
+            let mut bs = self.breaker_state.lock().unwrap();
+            if *bs == BreakerState::HalfOpen {
+                *bs = BreakerState::Closed;
+                self.write_audit(
+                    "breaker_closed",
+                    "successful exit from half-open — breaker healed",
+                );
+            }
+        }
+
+        // Persist ONCE, after every mutation: the on-disk state is then
+        // always internally consistent (position=None matches the
+        // decremented counters), never a mid-transition snapshot.
+        self.persist_state();
+
+        // A realized loss counts toward the daily-loss hard kill switch
+        // (may trip it — fail-closed) and is audited.
+        if pnl < 0 {
+            let loss = pnl.unsigned_abs();
+            let _ = self.record_loss(loss);
+            self.write_audit("position_closed_loss", &format!("loss={loss}"));
+        } else {
+            self.write_audit("position_closed_profit", &format!("profit={pnl}"));
+        }
+        Ok(pos)
+    }
+
+    /// Net realized P&L for the current day (lamports; negative = net loss).
+    /// Rolls to zero when the date changed since the last booking.
+    pub fn realized_pnl(&self) -> i64 {
+        let pnl = self.realized_pnl.lock().unwrap();
+        if *self.realized_pnl_date.lock().unwrap() != Self::today() {
+            return 0;
+        }
+        *pnl
     }
 
     pub fn open_position_count(&self) -> u64 {
@@ -438,16 +912,24 @@ impl RiskManager {
         }
     }
 
-    /// Manually trigger the kill switch. All new trades are rejected until
-    /// `release_kill_switch` is called. The event is written to the audit log.
-    pub fn trigger_kill_switch(&self, reason: &str) {
+    /// Trigger the kill switch with a category. `RiskLimit` breaches
+    /// (daily loss / entry-cap) stop NEW entries but still allow exits;
+    /// `Integrity` conditions (HSM/RPC/state/manual) stop everything until
+    /// `release_kill_switch` is called. Every trigger is audited with its
+    /// category.
+    pub fn trigger_kill_switch(&self, category: RiskCategory, reason: &str) {
         *self.kill_switch_active.lock().unwrap() = true;
-        self.write_audit("kill_switch_triggered", reason);
+        *self.kill_switch_reason.lock().unwrap() = Some(category);
+        self.write_audit(
+            "kill_switch_triggered",
+            &format!("[{}] {}", category.code(), reason),
+        );
     }
 
     /// Manually release the kill switch.
     pub fn release_kill_switch(&self) {
         *self.kill_switch_active.lock().unwrap() = false;
+        *self.kill_switch_reason.lock().unwrap() = None;
         self.write_audit("kill_switch_released", "manual release");
     }
 
@@ -455,8 +937,108 @@ impl RiskManager {
         *self.kill_switch_active.lock().unwrap()
     }
 
-    /// Pre-trade check: kill switch, circuit breaker, size, slippage, daily
-    /// loss, and daily trade cap.
+    /// Category of the active kill switch, if any. `None` when released.
+    /// Used by `pre_exit_check` to decide whether a risk-reducing exit may
+    /// run while the kill switch is active.
+    pub fn kill_switch_category(&self) -> Option<RiskCategory> {
+        *self.kill_switch_reason.lock().unwrap()
+    }
+
+    /// Check the bounded exit-retry gate for the CURRENT exit event:
+    /// - `Blocked`: EXIT_BLOCKED (budget exhausted) — position stays open.
+    /// - `Backoff`: inside the deterministic backoff window — retry later.
+    /// - `Allowed`: an attempt may run now.
+    pub fn check_exit_gate(&self) -> ExitAttemptGate {
+        if *self.exit_blocked.lock().unwrap() {
+            return ExitAttemptGate::Blocked;
+        }
+        let count = *self.exit_attempt_count.lock().unwrap();
+        if count >= self.config.max_exit_attempts {
+            return ExitAttemptGate::Blocked;
+        }
+        if let Some(last) = *self.last_exit_attempt.lock().unwrap() {
+            if last.elapsed() < self.config.exit_attempt_backoff {
+                return ExitAttemptGate::Backoff;
+            }
+        }
+        ExitAttemptGate::Allowed
+    }
+
+    /// Consume one exit attempt (call AFTER an exit attempt ran, whether it
+    /// succeeded or failed — a failed attempt must count against the
+    /// budget). When the budget is exhausted the exit becomes EXIT_BLOCKED
+    /// (position stays open, audited loudly); the block is cleared only by
+    /// `reset_exit_gate` (successful close, new entry, operator reset).
+    pub fn record_exit_attempt(&self) {
+        let mut count = self.exit_attempt_count.lock().unwrap();
+        *count = count.saturating_add(1);
+        let exhausted = *count >= self.config.max_exit_attempts;
+        drop(count);
+        *self.last_exit_attempt.lock().unwrap() = Some(Instant::now());
+        if exhausted {
+            *self.exit_blocked.lock().unwrap() = true;
+            self.write_audit(
+                "exit_blocked",
+                &format!(
+                    "exit retry budget exhausted (max {}) — position stays open",
+                    self.config.max_exit_attempts
+                ),
+            );
+        }
+        self.persist_state();
+    }
+
+    /// Clear the exit-retry state: fresh budget for a NEW exit event.
+    /// Called on a successful close and when a new position is opened.
+    pub fn reset_exit_gate(&self) {
+        *self.exit_attempt_count.lock().unwrap() = 0;
+        *self.last_exit_attempt.lock().unwrap() = None;
+        if *self.exit_blocked.lock().unwrap() {
+            *self.exit_blocked.lock().unwrap() = false;
+            self.write_audit("exit_block_cleared", "reset_exit_gate");
+        }
+    }
+
+    /// Whether EXIT_BLOCKED is set (retry budget exhausted; position open).
+    pub fn is_exit_blocked(&self) -> bool {
+        *self.exit_blocked.lock().unwrap()
+    }
+
+    /// Mark that operator reconciliation is required (state/on-chain
+    /// mismatch discovered at startup, orphan tokens, etc). Persisted and
+    /// audited; while set, entries are rejected and NO automatic recovery
+    /// sell happens — fail-closed until an operator resolves it.
+    pub fn set_reconcile_required(&self, reason: &str) {
+        let was = *self.reconcile_required.lock().unwrap();
+        *self.reconcile_required.lock().unwrap() = true;
+        if !was {
+            self.write_audit("reconcile_required", reason);
+        }
+        self.persist_state();
+    }
+
+    /// Clear the reconciliation flag (operator resolved the mismatch).
+    pub fn clear_reconcile_required(&self, reason: &str) {
+        let was = *self.reconcile_required.lock().unwrap();
+        *self.reconcile_required.lock().unwrap() = false;
+        if was {
+            self.write_audit("reconcile_cleared", reason);
+            self.persist_state();
+        }
+    }
+
+    /// Whether startup reconciliation is required. Checked independently of
+    /// `is_state_verified`: it can be set even when the state file parsed
+    /// fine (e.g. on-chain token balance found without matching position
+    /// detail).
+    pub fn is_reconcile_required(&self) -> bool {
+        *self.reconcile_required.lock().unwrap()
+    }
+
+    /// Pre-ENTRY trade check: kill switch, circuit breaker, size, slippage,
+    /// daily loss, and the daily ENTRY trade cap (`max_daily_trades` counts
+    /// entries only — exits are gated by `pre_exit_check` and counted by
+    /// `record_exit`, independent of this cap).
     pub fn pre_trade_check(
         &self,
         trade_size_lamports: u64,
@@ -464,6 +1046,12 @@ impl RiskManager {
     ) -> Result<(), RejectReason> {
         if !self.is_state_verified() {
             return Err(RejectReason::UnverifiableRestartState);
+        }
+        // RECONCILE_REQUIRED (orphan/state mismatch) is an independent,
+        // persisted signal: entries stay closed until an operator resolves
+        // it — even when the state file itself parsed fine.
+        if self.is_reconcile_required() {
+            return Err(RejectReason::ReconcileRequired);
         }
         if *self.kill_switch_active.lock().unwrap() {
             return Err(RejectReason::KillSwitchActive);
@@ -499,8 +1087,71 @@ impl RiskManager {
         Ok(())
     }
 
-    /// Record a completed trade. If the daily trade cap is exceeded, the kill
-    /// switch is triggered automatically and the event is audited.
+    /// Pre-EXIT check: the gates a mandatory position close (TP/SL) must
+    /// pass before an exit transaction is built. Distinct from
+    /// `pre_trade_check` in deliberate ways:
+    /// - Position/exposure caps do NOT apply (an exit legitimately runs
+    ///   while the open-position cap is reached — it closes that position).
+    /// - The daily ENTRY trade cap does NOT apply: closing an open position
+    ///   to protect capital (stop-loss/take-profit) must remain possible
+    ///   even after the entry limit for the day is exhausted. Exits are
+    ///   counted separately (`record_exit`/`current_daily_exits`) and never
+    ///   consume or double-count the entry counter.
+    /// - The daily-LOSS limit does NOT block an exit: a loss-limit breach
+    ///   trips a RISK_LIMIT kill switch that must still permit the
+    ///   risk-reducing close of an open position (the breach happened
+    ///   exactly because a position was closed at a loss; blocking further
+    ///   exits would lock remaining capital in).
+    /// What DOES block an exit (fail-closed, INTEGRITY semantics):
+    /// - unverifiable restart state / reconciliation required,
+    /// - EXIT_BLOCKED (retry budget exhausted — position stays open),
+    /// - an in-flight exit backoff window (deterministic retry pacing),
+    /// - an Open circuit breaker (HalfOpen permits exits — the probe
+    ///   succeeded, so a safe close may be retried),
+    /// - an INTEGRITY-category kill switch (RiskLimit kill switches pass),
+    /// - slippage bound violations.
+    pub fn pre_exit_check(&self, slippage_bps: u64) -> Result<(), RejectReason> {
+        if !self.is_state_verified() {
+            return Err(RejectReason::UnverifiableRestartState);
+        }
+        if self.is_reconcile_required() {
+            return Err(RejectReason::ReconcileRequired);
+        }
+        if *self.exit_blocked.lock().unwrap() {
+            return Err(RejectReason::ExitRetryExhausted);
+        }
+        if let Some(last) = *self.last_exit_attempt.lock().unwrap() {
+            if last.elapsed() < self.config.exit_attempt_backoff {
+                return Err(RejectReason::ExitRetryBackoff);
+            }
+        }
+        // Open breaker: exits stop (integrity). HalfOpen: the probe
+        // succeeded, so a risk-reducing exit may run again.
+        if self.breaker_state() == BreakerState::Open {
+            return Err(RejectReason::ExitBlockedIntegrity);
+        }
+        if *self.kill_switch_active.lock().unwrap() {
+            match self.kill_switch_category() {
+                // Risk-limit breaches stop entries but let exits through:
+                // closing a position REDUCES risk. Integrity conditions and
+                // the defensive no-category case block exits fail-closed.
+                Some(RiskCategory::Integrity) | None => {
+                    return Err(RejectReason::ExitBlockedIntegrity);
+                }
+                Some(RiskCategory::RiskLimit) => {}
+            }
+        }
+        if slippage_bps > self.config.max_slippage_bps {
+            return Err(RejectReason::SlippageExceeded);
+        }
+        Ok(())
+    }
+
+    /// Record a completed ENTRY trade. This is the ONLY counter that gates
+    /// new entries (`pre_trade_check`'s `DailyTradeCap`). Exits MUST use
+    /// `record_exit` instead — an exit recorded here would consume the daily
+    /// entry cap and could even trip the defensive kill switch below,
+    /// freezing the bot (including mandatory stops) for the rest of the day.
     pub fn record_trade(&self) {
         let mut trades = self.daily_trades.lock().unwrap();
         let today = Self::today();
@@ -509,14 +1160,20 @@ impl RiskManager {
             trades.count = 0;
         }
         trades.count += 1;
+        // Defensive: only reachable if the entry gate was bypassed — normal
+        // flow caps entries in pre_trade_check before record_trade is ever
+        // called, so a healthy bot never trips here.
         let exceeded = trades.count > self.config.max_daily_trades;
         drop(trades);
         self.persist_state();
         if exceeded {
-            self.trigger_kill_switch(&format!(
-                "daily trade cap exceeded (> {})",
-                self.config.max_daily_trades
-            ));
+            self.trigger_kill_switch(
+                RiskCategory::Integrity,
+                &format!(
+                    "daily entry cap exceeded (> {})",
+                    self.config.max_daily_trades
+                ),
+            );
         }
     }
 
@@ -526,6 +1183,34 @@ impl RiskManager {
             return 0;
         }
         trades.count
+    }
+
+    /// Record a completed EXIT (position close). Kept in a counter SEPARATE
+    /// from the entry counter (`record_trade`): exits never consume the
+    /// daily entry cap, never gate on it, and never trip the kill switch —
+    /// a stop-loss/take-profit close must stay possible after the daily
+    /// entry limit is exhausted (mandatory capital protection). The exit
+    /// counter is informational (observability/metrics) and is persisted for
+    /// restart safety.
+    pub fn record_exit(&self) {
+        let mut exits = self.daily_exits.lock().unwrap();
+        let today = Self::today();
+        if exits.date != today {
+            exits.date = today;
+            exits.count = 0;
+        }
+        exits.count += 1;
+        drop(exits);
+        self.persist_state();
+    }
+
+    /// Number of exits (closed positions) today.
+    pub fn current_daily_exits(&self) -> u64 {
+        let exits = self.daily_exits.lock().unwrap();
+        if exits.date != Self::today() {
+            return 0;
+        }
+        exits.count
     }
 
     /// Record a loss and potentially trigger circuit breaker.
@@ -541,10 +1226,16 @@ impl RiskManager {
         drop(daily);
         self.persist_state();
         if exceeded {
-            self.trigger_kill_switch(&format!(
-                "daily loss limit exceeded (> {})",
-                self.config.daily_loss_limit_lamports
-            ));
+            // RISK_LIMIT: a loss-limit breach must stop NEW entries but
+            // never block the risk-reducing close of an open position —
+            // `pre_exit_check` lets RiskLimit kill switches through.
+            self.trigger_kill_switch(
+                RiskCategory::RiskLimit,
+                &format!(
+                    "daily loss limit exceeded (> {})",
+                    self.config.daily_loss_limit_lamports
+                ),
+            );
             return Err("daily loss limit exceeded — kill switch triggered".into());
         }
         Ok(())
@@ -558,16 +1249,13 @@ impl RiskManager {
         daily.loss_lamports
     }
 
+    /// Whether the ENTRY gate is closed by the circuit breaker — true only
+    /// while the breaker is `Open`. In `HalfOpen` the read-only probe has
+    /// already succeeded, so the system is allowed to run trial trades: a
+    /// successful entry or exit returns the breaker to `Closed`; any failure
+    /// trips it back to `Open` (fail-closed in both directions).
     pub fn is_circuit_breaker_active(&self) -> bool {
-        let active = *self.circuit_breaker_active.lock().unwrap();
-        if active {
-            let elapsed = self.last_breaker_reset.lock().unwrap().elapsed();
-            if elapsed > self.config.circuit_breaker_duration {
-                *self.circuit_breaker_active.lock().unwrap() = false;
-                return false;
-            }
-        }
-        active
+        self.breaker_state() == BreakerState::Open
     }
 }
 
@@ -605,6 +1293,9 @@ mod tests {
             max_open_positions: 10,
             max_total_exposure_lamports: 10_000_000_000,
             price_staleness_ms: 5_000,
+            breaker_cooldown: Duration::from_millis(50),
+            max_exit_attempts: 3,
+            exit_attempt_backoff: Duration::from_millis(50),
             data_dir: unique_test_dir(),
         }
     }
@@ -630,17 +1321,19 @@ mod tests {
     #[test]
     fn kill_switch_blocks_trades() {
         let rm = RiskManager::new(test_config());
-        rm.trigger_kill_switch("test");
+        rm.trigger_kill_switch(RiskCategory::Integrity, "test");
         assert!(rm.is_kill_switch_active());
+        assert_eq!(rm.kill_switch_category(), Some(RiskCategory::Integrity));
         assert!(rm.pre_trade_check(500_000_000, 50).is_err());
     }
 
     #[test]
     fn kill_switch_release_allows_trades() {
         let rm = RiskManager::new(test_config());
-        rm.trigger_kill_switch("test");
+        rm.trigger_kill_switch(RiskCategory::Integrity, "test");
         rm.release_kill_switch();
         assert!(!rm.is_kill_switch_active());
+        assert_eq!(rm.kill_switch_category(), None);
         assert!(rm.pre_trade_check(500_000_000, 50).is_ok());
     }
 
@@ -748,6 +1441,8 @@ mod tests {
             daily_loss_lamports: 1_000_000,
             open_positions: 1,
             open_exposure_lamports: 40_000_000,
+            position: Some(sample_position(40_000_000)),
+            ..Default::default()
         };
         std::fs::write(
             cfg.data_dir.join("risk_state.json"),
@@ -760,6 +1455,33 @@ mod tests {
         assert_eq!(rm.current_daily_loss(), 1_000_000);
         assert_eq!(rm.open_position_count(), 1);
         assert_eq!(rm.open_exposure_lamports(), 40_000_000);
+        assert!(rm.current_position().is_some());
+    }
+
+    #[test]
+    fn counter_only_open_position_without_detail_is_unverifiable() {
+        // A state file from a build predating position tracking has
+        // open_positions > 0 but no position detail — the position can never
+        // be reconstructed, so live trading must be refused (fail-closed).
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        let state = PersistedRiskState {
+            date: RiskManager::today(),
+            open_positions: 1,
+            open_exposure_lamports: 10_000_000,
+            ..Default::default()
+        };
+        std::fs::write(
+            cfg.data_dir.join("risk_state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_state_verified());
+        assert_eq!(
+            rm.pre_trade_check(500_000_000, 50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
     }
 
     #[test]
@@ -834,11 +1556,646 @@ mod tests {
 
     #[test]
     fn audit_log_written_on_kill_switch() {
-        let rm = RiskManager::new(test_config());
-        rm.trigger_kill_switch("unit test");
-        let path = std::env::temp_dir().join("audit").join("risk_audit.jsonl");
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.trigger_kill_switch(RiskCategory::Integrity, "unit test");
+        let path = cfg.data_dir.join("audit").join("risk_audit.jsonl");
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("kill_switch_triggered"));
         assert!(content.contains("unit test"));
+        assert!(content.contains("[integrity]"));
+    }
+
+    fn sample_position(spend_lamports: u64) -> OpenPosition {
+        OpenPosition {
+            pool_id: "pool_test".to_string(),
+            token_mint: "meme_token_mint".to_string(),
+            quote_mint: "So11111111111111111111111111111111111111112".to_string(),
+            token_amount_raw: 1_000_000_000,
+            quote_balance_after_entry: 0,
+            spend_lamports,
+            entry_sqrt_price: 1u128 << 64,
+            opened_at_ms: 1_700_000_000_000,
+            entry_sig: "entry_sig_test".to_string(),
+        }
+    }
+
+    #[test]
+    fn avg_entry_price_requires_nonzero_tokens() {
+        let p = sample_position(50_000_000);
+        assert!((p.avg_entry_price().unwrap() - 0.05).abs() < 1e-12);
+        let mut zero = p;
+        zero.token_amount_raw = 0;
+        assert!(zero.avg_entry_price().is_none());
+    }
+
+    #[test]
+    fn record_entry_then_close_books_realized_profit() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        assert_eq!(rm.open_position_count(), 1);
+        assert_eq!(rm.open_exposure_lamports(), 40_000_000);
+        assert!(rm.current_position().is_some());
+        // Exit realized 50M quote for a 40M spend => +10M profit.
+        let closed = rm.close_position(50_000_000).unwrap();
+        assert_eq!(closed.spend_lamports, 40_000_000);
+        assert_eq!(rm.realized_pnl(), 10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+        assert_eq!(rm.open_exposure_lamports(), 0);
+        assert!(rm.current_position().is_none());
+        assert_eq!(rm.current_daily_loss(), 0);
+    }
+
+    #[test]
+    fn close_position_is_idempotent() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        assert!(rm.close_position(30_000_000).is_ok());
+        // A second close of the same event must fail and change nothing.
+        let err = rm.close_position(30_000_000).unwrap_err();
+        assert!(err.contains("idempotency"), "got: {err}");
+        assert_eq!(rm.realized_pnl(), -10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+    }
+
+    #[test]
+    fn close_with_realized_loss_feeds_daily_loss_and_kill_switch() {
+        let cfg = test_config(); // daily_loss_limit = 5 SOL = 5_000_000_000
+        let rm = RiskManager::new(cfg);
+        rm.record_entry(sample_position(5_100_000_000)).unwrap();
+        // Realized loss of 5.1 SOL > 5.0 SOL daily limit => kill switch.
+        rm.close_position(0).unwrap();
+        assert!(rm.is_kill_switch_active());
+        // The kill switch from a realized loss is RISK_LIMIT category: new
+        // entries stop, but a risk-reducing exit must still pass.
+        assert_eq!(rm.kill_switch_category(), Some(RiskCategory::RiskLimit));
+        assert_eq!(rm.current_daily_loss(), 5_100_000_000);
+        assert_eq!(rm.realized_pnl(), -(5_100_000_000i64));
+        assert!(rm.pre_exit_check(50).is_ok());
+        assert_eq!(
+            rm.pre_trade_check(100_000_000, 50),
+            Err(RejectReason::KillSwitchActive)
+        );
+    }
+
+    #[test]
+    fn realized_pnl_accumulates_net_across_trades() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.close_position(50_000_000).unwrap(); // +10M
+        rm.record_entry(sample_position(30_000_000)).unwrap();
+        rm.close_position(27_000_000).unwrap(); // -3M
+        assert_eq!(rm.realized_pnl(), 7_000_000);
+        assert_eq!(rm.current_daily_loss(), 3_000_000); // loss side only
+    }
+
+    #[test]
+    fn record_entry_rejects_when_position_already_open() {
+        let rm = RiskManager::new(test_config());
+        rm.record_entry(sample_position(10_000_000)).unwrap();
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::OpenPositionCapExceeded)
+        );
+        assert_eq!(rm.open_position_count(), 1);
+    }
+
+    #[test]
+    fn record_entry_rejects_when_state_unverifiable() {
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        std::fs::write(cfg.data_dir.join("risk_state.json"), "{ nope").unwrap();
+        let rm = RiskManager::new(cfg);
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+    }
+
+    #[test]
+    fn restart_restores_full_position_detail_and_pnl() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.close_position(50_000_000).unwrap();
+        rm.record_entry(sample_position(30_000_000)).unwrap();
+        drop(rm);
+
+        // Simulated restart: same data dir, fresh manager.
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        let pos = rm2.current_position().unwrap();
+        assert_eq!(pos.spend_lamports, 30_000_000);
+        assert_eq!(pos.token_mint, "meme_token_mint");
+        assert_eq!(rm2.open_position_count(), 1);
+        assert_eq!(rm2.open_exposure_lamports(), 30_000_000);
+        assert_eq!(rm2.realized_pnl(), 10_000_000);
+    }
+
+    #[test]
+    fn pre_exit_check_enforces_gates() {
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        // Baseline passes with no position open (gates are gate-only).
+        assert!(rm.pre_exit_check(50).is_ok());
+
+        // Slippage bound.
+        assert_eq!(rm.pre_exit_check(9999), Err(RejectReason::SlippageExceeded));
+        // Open circuit breaker blocks exits with the INTEGRITY code.
+        rm.trip_circuit_breaker("unit test");
+        assert_eq!(
+            rm.pre_exit_check(50),
+            Err(RejectReason::ExitBlockedIntegrity)
+        );
+        // INTEGRITY kill switch (fresh manager — the breaker above stays
+        // open and must not shadow later assertions).
+        let rm = RiskManager::new(test_config());
+        rm.trigger_kill_switch(RiskCategory::Integrity, "unit test");
+        assert_eq!(
+            rm.pre_exit_check(50),
+            Err(RejectReason::ExitBlockedIntegrity)
+        );
+        rm.release_kill_switch();
+        // RISK_LIMIT kill switch: exits pass (closing reduces risk), even
+        // though entries stay blocked.
+        let rm = RiskManager::new(test_config());
+        rm.trigger_kill_switch(RiskCategory::RiskLimit, "daily loss");
+        assert!(rm.pre_exit_check(50).is_ok());
+        assert!(rm.pre_trade_check(10_000_000, 50).is_err());
+        rm.release_kill_switch();
+        // The daily ENTRY cap does NOT gate exits (see
+        // entry_cap_full_does_not_block_exit below) — even with the cap
+        // exhausted, pre_exit_check must still pass all remaining gates.
+        let rm = RiskManager::new(test_config());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn daily_entry_cap_full_blocks_new_entries_only() {
+        // max_daily_trades = 3 in test_config. 3 completed entries => the
+        // 4th entry is rejected with DailyTradeCap.
+        let rm = RiskManager::new(test_config());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::DailyTradeCap)
+        );
+        // The SAME exhausted cap must not block an exit.
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn entry_cap_full_tp_sl_exit_still_closes_position() {
+        // A position is open and the daily entry cap is exhausted (e.g. the
+        // position was opened as the 5th entry). A TP/SL exit must still be
+        // executable and book its P&L exactly once.
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
+        assert!(rm.pre_exit_check(50).is_ok());
+        let closed = rm.close_position(50_000_000).unwrap();
+        assert_eq!(closed.spend_lamports, 40_000_000);
+        assert_eq!(rm.realized_pnl(), 10_000_000);
+        assert_eq!(rm.open_position_count(), 0);
+        assert!(rm.close_position(50_000_000).is_err()); // idempotent
+    }
+
+    #[test]
+    fn record_exit_never_consumes_entry_cap_or_trips_kill_switch() {
+        let cfg = test_config(); // max_daily_trades = 3
+        let rm = RiskManager::new(cfg);
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_trade();
+        assert_eq!(rm.current_daily_trades(), 3);
+        assert!(!rm.is_kill_switch_active());
+
+        // Exits after the cap is full: counted separately, no kill switch,
+        // entry counter untouched.
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit(); // arbitrarily many exits
+        assert_eq!(rm.current_daily_trades(), 3, "entry cap must not move");
+        assert_eq!(rm.current_daily_exits(), 4);
+        assert!(!rm.is_kill_switch_active());
+        // Entries stay blocked, exits stay open.
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::DailyTradeCap)
+        );
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn exit_records_do_not_double_count_after_restart() {
+        // record_exit persists; a restart restores the exit counter without
+        // touching the entry counter (no double counting of either).
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_trade();
+        rm.record_trade();
+        rm.record_exit();
+        rm.record_exit();
+        rm.record_exit();
+        drop(rm);
+
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        assert_eq!(rm2.current_daily_trades(), 2);
+        assert_eq!(rm2.current_daily_exits(), 3);
+        // New exit after restart still does not consume the entry cap.
+        rm2.record_exit();
+        assert_eq!(rm2.current_daily_trades(), 2);
+        assert_eq!(rm2.current_daily_exits(), 4);
+    }
+
+    #[test]
+    fn unverified_state_blocks_entry_and_exit_gates() {
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        std::fs::write(cfg.data_dir.join("risk_state.json"), "{ corrupt").unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_state_verified());
+        // Neither a new entry nor an exit may proceed on unverified state.
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+        assert_eq!(
+            rm.pre_exit_check(50),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::UnverifiableRestartState)
+        );
+    }
+
+    #[test]
+    fn close_after_restart_still_idempotent() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        drop(rm);
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.close_position(45_000_000).is_ok());
+        assert!(rm2.close_position(45_000_000).is_err());
+        assert_eq!(rm2.realized_pnl(), 5_000_000);
+    }
+
+    #[test]
+    fn new_reject_and_category_codes_are_stable() {
+        assert_eq!(
+            RejectReason::ExitBlockedIntegrity.code(),
+            "exit_blocked_integrity"
+        );
+        assert_eq!(
+            RejectReason::ExitRetryExhausted.code(),
+            "exit_retry_exhausted"
+        );
+        assert_eq!(RejectReason::ExitRetryBackoff.code(), "exit_retry_backoff");
+        assert_eq!(RejectReason::ReconcileRequired.code(), "reconcile_required");
+        assert_eq!(RiskCategory::RiskLimit.code(), "risk_limit");
+        assert_eq!(RiskCategory::Integrity.code(), "integrity");
+        assert!(RiskCategory::Integrity != RiskCategory::RiskLimit);
+        assert_eq!(
+            RejectReason::ExitBlockedIntegrity.to_string(),
+            "exit_blocked_integrity"
+        );
+    }
+
+    #[test]
+    fn breaker_cooldown_elapsed_gates_probe_and_half_open_sequence() {
+        // test_config: breaker_cooldown = 50ms.
+        let rm = RiskManager::new(test_config());
+        assert_eq!(rm.breaker_state(), BreakerState::Closed);
+        assert!(!rm.breaker_cooldown_elapsed()); // no probe needed while Closed
+
+        rm.trip_circuit_breaker("rpc down");
+        assert_eq!(rm.breaker_state(), BreakerState::Open);
+        // Cooldown NOT yet elapsed: no probe attempt yet (fail-closed).
+        assert!(!rm.breaker_cooldown_elapsed());
+        assert!(rm.is_circuit_breaker_active());
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        // Probe window open — but the state must NOT auto-move: only an
+        // explicit successful probe (enter_half_open) may.
+        assert!(rm.breaker_cooldown_elapsed());
+        assert_eq!(rm.breaker_state(), BreakerState::Open);
+
+        rm.enter_half_open("get_slot probe ok");
+        assert_eq!(rm.breaker_state(), BreakerState::HalfOpen);
+        // HalfOpen needs no further probe.
+        assert!(!rm.breaker_cooldown_elapsed());
+    }
+
+    #[test]
+    fn probe_failure_retrips_to_open_and_restarts_cooldown() {
+        let rm = RiskManager::new(test_config());
+        rm.trip_circuit_breaker("rpc down");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(rm.breaker_cooldown_elapsed());
+        rm.report_probe_failure("get_slot probe failed");
+        assert_eq!(rm.breaker_state(), BreakerState::Open);
+        // Cooldown restarted by the failure: no immediate re-probe.
+        assert!(!rm.breaker_cooldown_elapsed());
+        assert!(rm.pre_exit_check(50).is_err());
+    }
+
+    #[test]
+    fn half_open_is_trial_state_entry_and_exit_allowed() {
+        let rm = RiskManager::new(test_config());
+        rm.trip_circuit_breaker("rpc down");
+        rm.enter_half_open("probe ok");
+        assert_eq!(rm.breaker_state(), BreakerState::HalfOpen);
+        // The probe succeeded, so the entry gate re-opens for trial trades.
+        assert!(!rm.is_circuit_breaker_active());
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+        // The risk-reducing exit is permitted in HalfOpen too.
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn successful_entry_from_half_open_heals_breaker() {
+        let rm = RiskManager::new(test_config());
+        rm.trip_circuit_breaker("rpc down");
+        rm.enter_half_open("probe ok");
+        assert_eq!(rm.breaker_state(), BreakerState::HalfOpen);
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        // A confirmed real entry proves the system works again: Closed.
+        assert_eq!(rm.breaker_state(), BreakerState::Closed);
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+    }
+
+    #[test]
+    fn enter_half_open_is_noop_unless_open() {
+        // From Closed: no-op (never widens permissions on its own).
+        let rm = RiskManager::new(test_config());
+        rm.enter_half_open("probe ok");
+        assert_eq!(rm.breaker_state(), BreakerState::Closed);
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+    }
+
+    #[test]
+    fn successful_close_heals_half_open_breaker() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg);
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.trip_circuit_breaker("rpc down");
+        rm.enter_half_open("probe ok");
+        assert_eq!(rm.breaker_state(), BreakerState::HalfOpen);
+        // A real, confirmed exit proves the system works again: Closed.
+        rm.close_position(45_000_000).unwrap();
+        assert_eq!(rm.breaker_state(), BreakerState::Closed);
+        assert!(!rm.is_circuit_breaker_active());
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+    }
+
+    #[test]
+    fn exit_retry_budget_exhausts_into_exit_blocked() {
+        // test_config: max_exit_attempts = 3, backoff = 50ms.
+        let rm = RiskManager::new(test_config());
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Allowed);
+        // Attempt 1.
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Allowed);
+        rm.record_exit_attempt();
+        // Immediately after an attempt: deterministic backoff.
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Backoff);
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::ExitRetryBackoff));
+        // Attempts 2 and 3 (backoff is only a pacing gate; the caller waits).
+        rm.record_exit_attempt();
+        assert!(!rm.is_exit_blocked());
+        rm.record_exit_attempt();
+        // Budget exhausted -> EXIT_BLOCKED, position stays open.
+        assert!(rm.is_exit_blocked());
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Blocked);
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::ExitRetryExhausted));
+        // The block is sticky: further attempts stay refused.
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::ExitRetryExhausted));
+        assert!(rm.current_position().is_none()); // no position involved here
+    }
+
+    #[test]
+    fn new_entry_and_successful_close_reset_exit_block() {
+        let rm = RiskManager::new(test_config());
+        // Exhaust the budget (no position needed for the gate itself).
+        rm.record_exit_attempt();
+        rm.record_exit_attempt();
+        rm.record_exit_attempt();
+        assert!(rm.is_exit_blocked());
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::ExitRetryExhausted));
+        // A new entry grants a fresh exit-retry budget.
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        assert!(!rm.is_exit_blocked());
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Allowed);
+        // Consume one attempt, then a SUCCESSFUL close resets again.
+        rm.record_exit_attempt();
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Backoff);
+        rm.close_position(45_000_000).unwrap();
+        assert_eq!(rm.check_exit_gate(), ExitAttemptGate::Allowed);
+        assert!(!rm.is_exit_blocked());
+    }
+
+    #[test]
+    fn exit_blocked_persists_across_restart() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_exit_attempt();
+        rm.record_exit_attempt();
+        rm.record_exit_attempt();
+        assert!(rm.is_exit_blocked());
+        drop(rm);
+        // Restart: EXIT_BLOCKED survives; the position stays open and no
+        // automatic exit attempt is made.
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        assert!(rm2.is_exit_blocked());
+        assert_eq!(rm2.check_exit_gate(), ExitAttemptGate::Blocked);
+        assert_eq!(
+            rm2.pre_exit_check(50),
+            Err(RejectReason::ExitRetryExhausted)
+        );
+    }
+
+    #[test]
+    fn reconcile_required_blocks_entry_and_exit_until_cleared() {
+        let rm = RiskManager::new(test_config());
+        assert!(!rm.is_reconcile_required());
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+        rm.set_reconcile_required("orphan tokens without position detail");
+        assert!(rm.is_reconcile_required());
+        // Entries rejected with the dedicated code...
+        assert_eq!(
+            rm.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::ReconcileRequired)
+        );
+        assert_eq!(
+            rm.record_entry(sample_position(10_000_000)),
+            Err(RejectReason::ReconcileRequired)
+        );
+        // ...and NO automatic recovery sell: exits are refused too.
+        assert_eq!(rm.pre_exit_check(50), Err(RejectReason::ReconcileRequired));
+        // Operator resolves the mismatch.
+        rm.clear_reconcile_required("operator verified on-chain state");
+        assert!(!rm.is_reconcile_required());
+        assert!(rm.pre_trade_check(10_000_000, 50).is_ok());
+        assert!(rm.pre_exit_check(50).is_ok());
+    }
+
+    #[test]
+    fn reconcile_required_persists_across_restart() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.set_reconcile_required("orphan tokens without position detail");
+        drop(rm);
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified()); // state file parsed fine...
+        assert!(rm2.is_reconcile_required()); // ...but reconciliation persists
+        assert_eq!(
+            rm2.pre_trade_check(10_000_000, 50),
+            Err(RejectReason::ReconcileRequired)
+        );
+    }
+
+    #[test]
+    fn unverifiable_state_implies_reconcile_required() {
+        // A corrupt state file trips BOTH signals: unverifiable (hard gate)
+        // and reconcile-required (operator action flag).
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        std::fs::write(cfg.data_dir.join("risk_state.json"), "{ corrupt").unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_state_verified());
+        assert!(rm.is_reconcile_required());
+    }
+
+    #[test]
+    fn atomic_persist_leaves_no_temp_file_and_state_roundtrips() {
+        // BÖLÜM 6: persist_state must write via .tmp + atomic rename, so a
+        // crash mid-write never leaves a truncated risk_state.json. After a
+        // normal persist there must be NO leftover .tmp file, and the state
+        // must reload cleanly (verified) on restart.
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        rm.record_exit_attempt();
+        drop(rm);
+
+        let state_path = cfg.data_dir.join("risk_state.json");
+        let tmp_path = cfg.data_dir.join("risk_state.json.tmp");
+        assert!(
+            state_path.exists(),
+            "risk_state.json must exist after persist"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "no .tmp file may remain after a successful atomic persist"
+        );
+
+        // Restart: state must parse cleanly (verified) and preserve the
+        // open position + exit attempt count. The backoff timer is NOT
+        // persisted (it is per-process pacing); the count is, so the budget
+        // is preserved across restart.
+        let rm2 = RiskManager::new(cfg);
+        assert!(rm2.is_state_verified());
+        assert!(rm2.current_position().is_some());
+        assert_eq!(rm2.check_exit_gate(), ExitAttemptGate::Allowed);
+        // Persisted count was 1; the budget is 3. Two more attempts reach
+        // the cap (count 3) → EXIT_BLOCKED.
+        rm2.record_exit_attempt(); // count 2
+        assert!(!rm2.is_exit_blocked());
+        rm2.record_exit_attempt(); // count 3 → blocked
+        assert!(rm2.is_exit_blocked());
+    }
+
+    #[test]
+    fn atomic_persist_survives_interrupted_write() {
+        // Simulate a crash mid-write: a leftover .tmp file must NOT corrupt
+        // the real state. The loader reads only risk_state.json (never the
+        // .tmp), so a stale .tmp is harmless and the real file stays intact.
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_entry(sample_position(40_000_000)).unwrap();
+        drop(rm);
+
+        // Write a stale/partial .tmp as if a crash happened mid-write.
+        std::fs::write(cfg.data_dir.join("risk_state.json.tmp"), "{ partial").unwrap();
+
+        // Restart: the real state file is intact and verified; the stale
+        // .tmp is ignored (and would be overwritten on the next persist).
+        let rm2 = RiskManager::new(cfg.clone());
+        assert!(rm2.is_state_verified());
+        assert!(rm2.current_position().is_some());
+
+        // A subsequent persist overwrites the stale .tmp cleanly.
+        rm2.record_exit_attempt();
+        drop(rm2);
+        assert!(!cfg.data_dir.join("risk_state.json.tmp").exists());
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_invalid_risk_limits() {
+        // BÖLÜM 10 (config): zero/invalid risk limits must be rejected
+        // (fail-closed), never silently accepted.
+        let base = test_config();
+        assert!(base.validate().is_ok());
+
+        let mut c = base.clone();
+        c.max_trade_size_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_slippage_bps = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_slippage_bps = 10_001;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.daily_loss_limit_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_daily_trades = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_open_positions = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_total_exposure_lamports = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.price_staleness_ms = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.breaker_cooldown = Duration::ZERO;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.max_exit_attempts = 0;
+        assert!(c.validate().is_err());
+        let mut c = base.clone();
+        c.exit_attempt_backoff = Duration::ZERO;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn production_defaults_validate_and_are_env_overridable() {
+        // BÖLÜM 10 (config): production defaults must validate cleanly and
+        // the env-overridable fields must parse from the documented names.
+        let cfg = RiskConfig::production_defaults(unique_test_dir()).unwrap();
+        assert!(cfg.validate().is_ok());
+        // Defaults match the documented safe values.
+        assert_eq!(cfg.max_exit_attempts, 3);
+        assert_eq!(cfg.breaker_cooldown, Duration::from_millis(300_000));
+        assert_eq!(cfg.exit_attempt_backoff, Duration::from_millis(5_000));
+        assert_eq!(cfg.daily_loss_limit_lamports, 200_000_000);
     }
 }

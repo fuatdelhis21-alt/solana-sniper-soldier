@@ -1,16 +1,58 @@
 [Unit]
-Description=Solana HFT Platform
-After=network.target
+Description=Solana HFT Sniper bot (paper/dry-run default)
+After=network-online.target solana-hsm.service
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=solana
-Group=solana
-WorkingDirectory=/opt/solana-hft
-ExecStart=/opt/solana-hft/bin/solana-hft --config /etc/solana-hft/config.toml
+User={{ bot_user | default('solana-bot') }}
+Group={{ bot_group | default('solana-bot') }}
+WorkingDirectory={{ release_dir | default('/opt/solana-hft') }}
+
+EnvironmentFile=-{{ config_dir | default('/etc/solana-hft') }}/bot.env
+Environment=RUST_LOG=info,solana_sniper=debug
+Environment=RUST_BACKTRACE=0
+
+# DEFAULT: paper mode (no on-chain transactions, no HSM signing).
+# LIVE MODE IS NEVER THE DEFAULT. To go live an operator must set the
+# correct RPC/WS, add --live --confirm-live + HSM mTLS flags, and restart.
+ExecStart={{ release_dir | default('/opt/solana-hft') }}/bin/solana-sniper \
+    --paper \
+    --iterations 0 \
+    --rpc {{ rpc_url | default('https://api.devnet.solana.com') }} \
+    --ws {{ ws_url | default('wss://api.devnet.solana.com') }} \
+    --data-dir {{ data_dir | default('/var/lib/solana-hft') }} \
+    --metrics-addr 127.0.0.1:9898
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths={{ data_dir | default('/var/lib/solana-hft') }} {{ log_dir | default('/var/log/solana-hft') }}
+
+# --- Restart policy (bounded) ---
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 LimitNOFILE=65536
+LimitNPROC=512
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-sniper
 
 [Install]
 WantedBy=multi-user.target
