@@ -675,6 +675,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Applied to every mode (paper/dry-run/live) for consistency — if the
     // config itself cannot be validated, refuse to start at all.
     let risk_cfg = risk::RiskConfig::production_defaults(args.data_dir.clone())?;
+    // Fail-closed cross-module invariant: the strategy's per-trade position
+    // size must never exceed the risk manager's max_trade_size_lamports,
+    // otherwise every entry dies at the pre_trade_check gate with
+    // MaxSpendExceeded (or the cap is silently bypassed). Both the paper and
+    // live paths construct SimpleSnipeStrategy from StrategyConfig::default()
+    // and pass signals through the SAME pre_trade_check, so one startup
+    // check covers every mode. Refuse to start on violation.
+    strategy::validate_position_size_invariant(
+        strategy::StrategyConfig::default().max_trade_size_lamports,
+        risk_cfg.max_trade_size_lamports,
+    )?;
     let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg.clone()));
     tracing::info!(
         target: "main",
@@ -2012,5 +2023,53 @@ mod tests {
             sl_pnl + tp_pnl,
             "accumulator must equal the sum of realized simulated closes"
         );
+    }
+
+    // ── Trade-size vs risk-cap: paper never fakes a success on rejection ──
+    #[test]
+    fn paper_max_spend_exceeded_is_rejection_never_simulated_success() {
+        // Regression: pre-fix the strategy default (0.1 SOL) exceeded the
+        // production risk cap (0.05 SOL), so the EntryPending gate rejected
+        // every paper entry with MaxSpendExceeded. The rejection must never
+        // be recorded as a simulated trade: entries/P&L only move in
+        // confirm_entry, which the rejected gate never reaches.
+        let cfg =
+            risk::RiskConfig::production_defaults(std::env::temp_dir().join("paper_ms_gate_test"))
+                .unwrap();
+        let default_cfg = strategy::StrategyConfig::default();
+        // The default is now within the risk cap (startup invariant Ok)…
+        assert!(strategy::validate_position_size_invariant(
+            default_cfg.max_trade_size_lamports,
+            cfg.max_trade_size_lamports
+        )
+        .is_ok());
+        // …while the old 0.1 SOL value is fail-closed rejected by the same
+        // invariant main() enforces at startup.
+        assert!(strategy::validate_position_size_invariant(
+            100_000_000,
+            cfg.max_trade_size_lamports
+        )
+        .is_err());
+
+        // A qualifying candidate yields EntryPending, but without
+        // confirm_entry nothing is ever counted as simulated success.
+        let mut sim = PaperSimulator::new();
+        let cand = strategy::TokenCandidate {
+            liquidity_lamports: 2_000_000_000_000,
+            market_cap_lamports: 0,
+            holders: 200,
+            is_blocklisted: false,
+        };
+        match sim.tick(&cand, 1u128 << 64) {
+            PaperTick::EntryPending(sig) => {
+                assert!(
+                    sig.position_size_lamports <= cfg.max_trade_size_lamports,
+                    "paper signal must never exceed the risk cap"
+                );
+            }
+            other => panic!("expected EntryPending, got {other:?}"),
+        }
+        assert_eq!(sim.entries, 0, "no confirm_entry => no simulated success");
+        assert_eq!(sim.simulated_pnl_lamports, 0);
     }
 }
