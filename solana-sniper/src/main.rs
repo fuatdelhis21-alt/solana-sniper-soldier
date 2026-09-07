@@ -110,6 +110,14 @@ impl PaperSimulator {
         self.position.is_some()
     }
 
+    /// Open position audit fields (entry sqrt price + size) — read BEFORE
+    /// `tick` so an exit can be persisted with the entry it was computed
+    /// from (tick clears the position on close).
+    fn open_position(&self) -> Option<(u128, u64)> {
+        self.position
+            .map(|p| (p.entry_sqrt_price, p.position_size_lamports))
+    }
+
     /// One iteration tick against a REAL current sqrt price. Exit decisions
     /// (SimpleSnipeStrategy::should_exit — unchanged) run first while a
     /// simulated position is open; otherwise the unchanged entry strategy
@@ -976,6 +984,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Strategy evaluation on the REAL price (unchanged strategy code).
+            // Capture the open position's audit fields BEFORE tick: an exit
+            // clears the position, so it must be read first to persist the
+            // entry/entry-price the P&L was computed from.
+            let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
@@ -985,7 +997,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.amount_in = 0;
                     rec.context = serde_json::json!({
                         "action": "hold",
-                        "entry_sqrt": null,
+                        "entry_sqrt": open_pos.map(|(s, _)| s.to_string()),
+                        "position_size_lamports": open_pos.map(|(_, sz)| sz),
                         "current_sqrt": snapshot.current_sqrt_price.to_string(),
                         "source": snapshot.source,
                         "simulated": true,
@@ -1006,7 +1019,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.context = serde_json::json!({
                         "action": action,
                         "realized_simulated_pnl_lamports": pnl,
-                        "entry_sqrt": null,
+                        "entry_sqrt": open_pos.map(|(s, _)| s.to_string()),
+                        "position_size_lamports": open_pos.map(|(_, sz)| sz),
                         "current_sqrt": snapshot.current_sqrt_price.to_string(),
                         "source": snapshot.source,
                         "simulated": true,
@@ -2271,6 +2285,43 @@ mod tests {
         assert!(
             (recorded_pnl - 82_500_000).abs() <= 2,
             "+11% of 0.75 SOL, got {recorded_pnl}"
+        );
+    }
+
+    #[test]
+    fn exit_path_persisted_audit_fields_reproduce_recorded_pnl() {
+        // The decision record now persists entry_sqrt + position_size_lamports
+        // (captured from the open position BEFORE tick) next to the realized
+        // pnl. The audit trail must be re-verifiable offline: those two
+        // fields + current_sqrt must reproduce the recorded pnl exactly via
+        // the same quote formula the exit path used.
+        let mut sim = PaperSimulator::new();
+        let entry_sqrt = 1_000_000_000u128;
+        let size = 750_000_000u64;
+        assert_eq!(sim.open_position(), None);
+        sim.confirm_entry(entry_sqrt, entry_at(size));
+        assert_eq!(
+            sim.open_position(),
+            Some((entry_sqrt, size)),
+            "audit fields must be readable before tick"
+        );
+
+        let current_sqrt = (entry_sqrt as f64 * 0.94f64.sqrt()) as u128; // -6% SL
+        let PaperTick::ClosedStopLoss(pnl) = sim.tick(&rich_candidate(), current_sqrt) else {
+            panic!("expected stop-loss close");
+        };
+        assert_eq!(sim.open_position(), None, "position cleared after close");
+
+        // JSON-recorded fields -> formula reproduces the recorded pnl.
+        let persisted_entry_sqrt = entry_sqrt.to_string();
+        let persisted_size = size;
+        assert_eq!(
+            simulated_pnl_lamports(
+                persisted_entry_sqrt.parse::<u128>().unwrap(),
+                current_sqrt,
+                persisted_size
+            ),
+            pnl
         );
     }
 }
