@@ -32,7 +32,52 @@ pub struct HolderStats {
     /// Percentage (0-100) of total supply held by the single largest
     /// account, excluding `exclude` (typically the pool's own vault).
     pub top_holder_pct: f64,
+    /// Percentage (0-100) of total supply held by the sampled top-20
+    /// accounts combined (exclusions applied). Sample is capped at 20 by
+    /// the SPL RPC standard, so this is the best measurable concentration.
+    pub top20_holder_pct: f64,
     pub total_supply: u64,
+}
+
+/// Holder-concentration thresholds (operator-approved design):
+/// `getTokenLargestAccounts` returns at most 20 accounts per the SPL
+/// JSON-RPC standard, so an absolute holder count is structurally
+/// unmeasurable — the rug-risk gate therefore uses supply-share
+/// concentration instead. Single source of truth for both paper and live.
+/// - single largest holder (post-exclusion) > 30% of supply → reject.
+/// - combined top-20 holders (post-exclusion) > 70% of supply → reject.
+pub const MAX_SINGLE_HOLDER_PCT: f64 = 30.0;
+pub const MAX_TOP20_HOLDER_PCT: f64 = 70.0;
+/// SPL JSON-RPC cap on `getTokenLargestAccounts` results.
+pub const LARGEST_ACCOUNTS_CAP: usize = 20;
+
+/// Outcome of the holder-concentration gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HolderVerdict {
+    /// Concentration within thresholds; candidate passes the holder gate.
+    Ok,
+    /// Single largest holder (post-exclusion) holds more than 30% of supply.
+    SingleHolderConcentrated(f64),
+    /// Combined top-20 (post-exclusion) holds more than 70% of supply.
+    TopHoldersConcentrated(f64),
+    /// No measurable non-excluded holder accounts — the gate cannot be
+    /// assessed, so it fails closed (a reject, never a silent pass).
+    Unassessable,
+}
+
+/// Evaluate the holder-concentration gate from stats. Fail-closed: any
+/// unassessable or concentrated distribution returns a reject verdict.
+pub fn holder_concentration_verdict(stats: &HolderStats) -> HolderVerdict {
+    if stats.sampled_holders == 0 || stats.total_supply == 0 {
+        return HolderVerdict::Unassessable;
+    }
+    if stats.top_holder_pct > MAX_SINGLE_HOLDER_PCT {
+        return HolderVerdict::SingleHolderConcentrated(stats.top_holder_pct);
+    }
+    if stats.top20_holder_pct > MAX_TOP20_HOLDER_PCT {
+        return HolderVerdict::TopHoldersConcentrated(stats.top20_holder_pct);
+    }
+    HolderVerdict::Ok
 }
 
 /// Fetch the real on-chain token balance (in the smallest unit / lamports
@@ -48,15 +93,19 @@ pub fn fetch_vault_liquidity(rpc: &RpcClient, vault: &Pubkey) -> Result<u64, Str
         .map_err(|e| format!("failed to parse vault balance amount: {e}"))
 }
 
-/// Fetch holder concentration for `mint`, excluding `exclude` (the pool's
-/// own vault, which is not a "holder" in the rug-risk sense).
+/// Fetch holder concentration for `mint`, excluding `excludes` (the pool's
+/// own vaults — infrastructure accounts resolved by `resolve_swap_accounts`.
+/// Mint/freeze authorities are `COption<Pubkey>` fields on the mint account
+/// itself, never token-account holders, so there is nothing extra to drop
+/// for them; callers pass both pool vaults so a pool can never count as a
+/// "holder" in the rug-risk sense).
 ///
 /// Fail-closed: any RPC error propagates. If the mint has zero supply, an
 /// error is returned rather than a division-by-zero fallback.
 pub fn fetch_holder_stats(
     rpc: &RpcClient,
     mint: &Pubkey,
-    exclude: &Pubkey,
+    excludes: &[Pubkey],
 ) -> Result<HolderStats, String> {
     let supply = rpc
         .get_token_supply(mint)
@@ -75,30 +124,53 @@ pub fn fetch_holder_stats(
         .get_token_largest_accounts(mint)
         .map_err(|e| format!("failed to fetch largest accounts for {mint}: {e}"))?;
 
+    let entries: Vec<(String, u64)> = largest
+        .iter()
+        .map(|e| {
+            e.amount
+                .amount
+                .parse::<u64>()
+                .map_err(|err| format!("failed to parse largest-account amount: {err}"))
+                .map(|amount| (e.address.clone(), amount))
+        })
+        .collect::<Result<_, String>>()?;
+
+    compute_holder_stats(total_supply, &entries, excludes)
+}
+
+/// Pure, RPC-free holder-stat computation — unit-testable. Excludes the
+/// pool's own vault accounts, then measures single-holder and combined
+/// top-20 supply share (sample is capped at 20 by the SPL RPC standard).
+fn compute_holder_stats(
+    total_supply: u64,
+    entries: &[(String, u64)],
+    excludes: &[Pubkey],
+) -> Result<HolderStats, String> {
     let mut sampled_holders = 0u64;
     let mut top_amount: u64 = 0;
-    for entry in &largest {
-        let owner_pubkey = Pubkey::from_str(&entry.address)
-            .map_err(|e| format!("invalid token account address {}: {e}", entry.address))?;
-        if &owner_pubkey == exclude {
+    let mut combined_amount: u64 = 0;
+    for (address, amount) in entries {
+        let owner_pubkey = Pubkey::from_str(address)
+            .map_err(|e| format!("invalid token account address {address}: {e}"))?;
+        if excludes.contains(&owner_pubkey) {
             continue;
         }
-        let amount: u64 = entry
-            .amount
-            .amount
-            .parse()
-            .map_err(|e| format!("failed to parse largest-account amount: {e}"))?;
         sampled_holders += 1;
-        if amount > top_amount {
-            top_amount = amount;
+        combined_amount = combined_amount.saturating_add(*amount);
+        if *amount > top_amount {
+            top_amount = *amount;
         }
     }
 
-    let top_holder_pct = (top_amount as f64 / total_supply as f64) * 100.0;
+    // Round to 2 decimals so threshold comparisons and tests are exact.
+    let pct = |amount: u64| ((amount as f64 / total_supply as f64) * 10_000.0).round() / 100.0;
+    let top_holder_pct = pct(top_amount);
+    let top20_holder_pct = pct(combined_amount);
 
     Ok(HolderStats {
         sampled_holders,
         top_holder_pct,
+        top20_holder_pct,
         total_supply,
     })
 }
@@ -253,4 +325,107 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+}
+
+// ── Holder-concentration gate (operator-approved design) ──
+
+fn entry(addr: u8, amount: u64) -> (String, u64) {
+    // Deterministic pseudo-pubkey from a single byte.
+    let mut pk = [0u8; 32];
+    pk[0] = addr;
+    (Pubkey::new_from_array(pk).to_string(), amount)
+}
+
+#[test]
+fn holder_stats_excludes_pool_vaults_before_concentration() {
+    // Vault pubkey = the same account as entry(9) (first byte 9).
+    let mut vk = [0u8; 32];
+    vk[0] = 9;
+    let vault = Pubkey::new_from_array(vk);
+    // Supply 1000; vault holds 800 (pool infrastructure — must not count
+    // as a "holder"), one real holder holds 150.
+    let stats = compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[vault]).unwrap();
+    assert_eq!(stats.sampled_holders, 1, "vault must be excluded");
+    assert_eq!(stats.top_holder_pct, 15.0);
+    assert_eq!(stats.top20_holder_pct, 15.0);
+    // Without the vault in the exclusion list it would dominate.
+    let naive = compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[]).unwrap();
+    assert_eq!(naive.sampled_holders, 2);
+    assert_eq!(naive.top_holder_pct, 80.0);
+}
+
+#[test]
+fn concentration_gate_accepts_under_both_thresholds() {
+    // 10 holders of 1% each => single 1%, top-20 10%: passes.
+    let mut es = Vec::new();
+    for i in 1..=10u8 {
+        es.push(entry(i, 10));
+    }
+    let stats = compute_holder_stats(1_000, &es, &[]).unwrap();
+    assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
+}
+
+#[test]
+fn concentration_gate_rejects_single_holder_over_30pct() {
+    // One holder at 40% (top-20 at 40% too) => single-holder breach fires
+    // first with the 30% threshold.
+    let stats =
+        compute_holder_stats(1_000, &[entry(1, 400), entry(2, 100), entry(3, 100)], &[]).unwrap();
+    assert_eq!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::SingleHolderConcentrated(40.0)
+    );
+}
+
+#[test]
+fn concentration_gate_rejects_top20_over_70pct_even_if_single_under_30() {
+    // 19 holders at 4% each = 76% combined, single 4%: top-20 breach.
+    let mut es = Vec::new();
+    for i in 1..=19u8 {
+        es.push(entry(i, 40));
+    }
+    let stats = compute_holder_stats(1_000, &es, &[]).unwrap();
+    assert_eq!(stats.sampled_holders, 19);
+    assert_eq!(stats.top20_holder_pct, 76.0);
+    assert!(matches!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::TopHoldersConcentrated(76.0)
+    ));
+}
+
+#[test]
+fn concentration_gate_boundaries_are_inclusive_pass() {
+    // Exactly 30% single and exactly 70% top-20 pass (threshold is ">").
+    let stats =
+        compute_holder_stats(1_000, &[entry(1, 300), entry(2, 250), entry(3, 150)], &[]).unwrap();
+    assert_eq!(stats.top_holder_pct, 30.0);
+    assert_eq!(stats.top20_holder_pct, 70.0);
+    assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
+}
+
+#[test]
+fn concentration_gate_unassessable_fails_closed() {
+    // Every sampled account is excluded => no measurable holders => the
+    // gate must reject (never silently pass).
+    let mut vk = [0u8; 32];
+    vk[0] = 7;
+    let vault = Pubkey::new_from_array(vk);
+    let stats = compute_holder_stats(1_000, &[entry(7, 1_000)], &[vault]).unwrap();
+    assert_eq!(stats.sampled_holders, 0);
+    assert_eq!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::Unassessable
+    );
+    // Zero-supply guard also fails closed (compute never sees 0, but the
+    // verdict defends against it regardless).
+    let stats = HolderStats {
+        sampled_holders: 5,
+        top_holder_pct: 1.0,
+        top20_holder_pct: 5.0,
+        total_supply: 0,
+    };
+    assert_eq!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::Unassessable
+    );
 }
