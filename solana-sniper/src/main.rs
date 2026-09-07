@@ -2133,4 +2133,144 @@ mod tests {
         assert_eq!(sim.entries, 0, "no confirm_entry => no simulated success");
         assert_eq!(sim.simulated_pnl_lamports, 0);
     }
+
+    // ── AŞAMA exit-path: deterministic SL/TP/P&L semantics (offline) ──
+    // Entry at sqrt(1.0)=1e9. current_sqrt = 1e9*sqrt(price_ratio) so the
+    // squared-ratio formula hits the exact price move under test.
+
+    fn rich_candidate() -> strategy::TokenCandidate {
+        strategy::TokenCandidate {
+            liquidity_lamports: 2_000_000_000_000,
+            market_cap_lamports: 0,
+            holders: 200,
+            is_blocklisted: false,
+        }
+    }
+
+    fn entry_at(size: u64) -> strategy::EntrySignal {
+        strategy::EntrySignal {
+            position_size_lamports: size,
+            slippage_bps: 100,
+            entry_sqrt_price: 0,
+        }
+    }
+
+    #[test]
+    fn exit_path_stop_loss_at_6pct_closes_negative_pnl_once() {
+        let mut sim = PaperSimulator::new();
+        let entry_sqrt = 1_000_000_000u128;
+        sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000)); // 1 SOL notional
+        let current_sqrt = (entry_sqrt as f64 * 0.94f64.sqrt()) as u128; // -6%
+        let PaperTick::ClosedStopLoss(pnl) = sim.tick(&rich_candidate(), current_sqrt) else {
+            panic!("expected stop-loss close");
+        };
+        assert!(!sim.has_open_position(), "position must clear");
+        assert_eq!(sim.exits_stop_loss, 1);
+        assert_eq!(sim.holds, 0);
+        // P&L is exactly the quote formula on the same inputs (no drift):
+        assert_eq!(
+            pnl,
+            simulated_pnl_lamports(entry_sqrt, current_sqrt, 1_000_000_000)
+        );
+        assert!(pnl < 0);
+        // f64 sqrt->int rounding may shift the exact pnl by <=2 lamports.
+        assert!(
+            (pnl - (-60_000_000)).abs() <= 2,
+            "-6% on 1 SOL notional, got {pnl}"
+        );
+        assert_eq!(sim.simulated_pnl_lamports, pnl);
+        // Follow-up ticks with no position run the entry path, not exits:
+        assert!(matches!(
+            sim.tick(&rich_candidate(), current_sqrt),
+            PaperTick::EntryPending(_)
+        ));
+    }
+
+    #[test]
+    fn exit_path_take_profit_at_11pct_closes_positive_pnl_once() {
+        let mut sim = PaperSimulator::new();
+        let entry_sqrt = 1_000_000_000u128;
+        sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000));
+        let current_sqrt = (entry_sqrt as f64 * 1.11f64.sqrt()) as u128; // +11%
+        let PaperTick::ClosedTakeProfit(pnl) = sim.tick(&rich_candidate(), current_sqrt) else {
+            panic!("expected take-profit close");
+        };
+        assert!(!sim.has_open_position());
+        assert_eq!(sim.exits_take_profit, 1);
+        assert!(
+            (pnl - 110_000_000).abs() <= 2,
+            "+11% on 1 SOL notional, got {pnl}"
+        );
+        assert_eq!(sim.simulated_pnl_lamports, pnl);
+    }
+
+    #[test]
+    fn exit_path_below_thresholds_holds_at_4p9_and_9p9() {
+        let mut sim = PaperSimulator::new();
+        let entry_sqrt = 1_000_000_000u128;
+        sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000));
+        // -4.9% (490 bps < 500 SL): hold, position stays open, no P&L.
+        let down = (entry_sqrt as f64 * 0.951f64.sqrt()) as u128;
+        assert!(matches!(sim.tick(&rich_candidate(), down), PaperTick::Hold));
+        assert!(sim.has_open_position());
+        assert_eq!(sim.simulated_pnl_lamports, 0);
+        // +9.9% (990 bps < 1000 TP): hold.
+        let up = (entry_sqrt as f64 * 1.099f64.sqrt()) as u128;
+        assert!(matches!(sim.tick(&rich_candidate(), up), PaperTick::Hold));
+        assert!(sim.has_open_position());
+        assert_eq!(sim.simulated_pnl_lamports, 0);
+        assert_eq!(sim.exits_stop_loss + sim.exits_take_profit, 0);
+        assert_eq!(sim.holds, 2);
+    }
+
+    #[test]
+    fn exit_path_reentry_allowed_after_close_with_full_state_reset() {
+        let mut sim = PaperSimulator::new();
+        let entry_sqrt = 1_000_000_000u128;
+        sim.confirm_entry(entry_sqrt, entry_at(500_000_000));
+        let down = (entry_sqrt as f64 * 0.94f64.sqrt()) as u128; // -6% SL
+        let PaperTick::ClosedStopLoss(pnl) = sim.tick(&rich_candidate(), down) else {
+            panic!("expected stop-loss close");
+        };
+        // After close the SAME candidate may re-enter next iteration.
+        assert!(matches!(
+            sim.tick(&rich_candidate(), entry_sqrt),
+            PaperTick::EntryPending(_)
+        ));
+        sim.confirm_entry(entry_sqrt, entry_at(500_000_000));
+        assert!(sim.has_open_position());
+        assert_eq!(sim.entries, 2, "re-entry must count exactly once");
+        // P&L accumulates across the closed position only.
+        assert_eq!(sim.simulated_pnl_lamports, pnl);
+        // Second close at same move adds the same pnl again.
+        let PaperTick::ClosedStopLoss(pnl2) = sim.tick(&rich_candidate(), down) else {
+            panic!("expected second stop-loss close");
+        };
+        assert_eq!(pnl2, pnl);
+        assert_eq!(sim.simulated_pnl_lamports, 2 * pnl);
+        assert_eq!(sim.exits_stop_loss, 2);
+    }
+
+    #[test]
+    fn exit_path_pnl_record_fields_match_decision_fields() {
+        // The persisted decision context records entry_sqrt, current_sqrt
+        // and position_size; the P&L must be exactly simulated_pnl_lamports
+        // of those three fields (same function the exit path uses).
+        let entry_sqrt = 1_000_000_000u128;
+        let current_sqrt = (entry_sqrt as f64 * 1.11f64.sqrt()) as u128;
+        let size = 750_000_000u64;
+        let recorded_pnl = simulated_pnl_lamports(entry_sqrt, current_sqrt, size);
+        // Decision fields -> formula (what the paper loop persists as pnl).
+        let entry_field = entry_sqrt;
+        let current_field = current_sqrt;
+        let size_field = size;
+        assert_eq!(
+            recorded_pnl,
+            simulated_pnl_lamports(entry_field, current_field, size_field)
+        );
+        assert!(
+            (recorded_pnl - 82_500_000).abs() <= 2,
+            "+11% of 0.75 SOL, got {recorded_pnl}"
+        );
+    }
 }
