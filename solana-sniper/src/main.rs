@@ -327,11 +327,52 @@ fn resolve_paper_market_data(
             .map_err(|e| {
                 PaperDataError::Unavailable(format!("vault liquidity fetch failed: {e}"))
             })?;
-        let stats =
-            onchain_risk::fetch_holder_stats(rpc_client, &input_mint, &accounts.input_vault)
-                .map_err(|e| {
-                    PaperDataError::Unavailable(format!("holder stats fetch failed: {e}"))
-                })?;
+        // Exclude the pool's own vaults (infrastructure accounts resolved by
+        // resolve_swap_accounts) so the pool never counts as a "holder".
+        let vaults = [accounts.input_vault, accounts.output_vault];
+        let stats = onchain_risk::fetch_holder_stats(rpc_client, &input_mint, &vaults)
+            .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
+        // Holder-concentration gate (operator-approved design, fail-closed):
+        // single holder >30% or combined top-20 >70% of supply rejects with
+        // an explicit reason — never a silent no_entry_signal. Unassessable
+        // data (no measurable non-excluded holders) rejects the same way.
+        match onchain_risk::holder_concentration_verdict(&stats) {
+            onchain_risk::HolderVerdict::Ok => {}
+            onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %input_mint,
+                    top_holder_pct = pct,
+                    threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
+                    "holder concentration gate: single holder exceeds threshold"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+            onchain_risk::HolderVerdict::TopHoldersConcentrated(pct) => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %input_mint,
+                    top20_holder_pct = pct,
+                    threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
+                    "holder concentration gate: top-20 holders exceed threshold"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+            onchain_risk::HolderVerdict::Unassessable => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %input_mint,
+                    "holder concentration gate: no measurable holders (fail-closed reject)"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+        }
         holders = stats.sampled_holders;
         top_holder_pct = stats.top_holder_pct;
     }
@@ -1374,7 +1415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let holder_stats = match onchain_risk::fetch_holder_stats(
                         &rpc_client,
                         &input_mint,
-                        &accounts.input_vault,
+                        &[accounts.input_vault, accounts.output_vault],
                     ) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1386,6 +1427,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
+                    // Holder-concentration gate (operator-approved design):
+                    // same 30/70 thresholds as the paper path. A breach is an
+                    // explicit rejection, never a silent no_entry_signal.
+                    match onchain_risk::holder_concentration_verdict(&holder_stats) {
+                        onchain_risk::HolderVerdict::Ok => {}
+                        verdict => {
+                            tracing::warn!(
+                                target: "live",
+                                verdict = ?verdict,
+                                "holder concentration gate rejected candidate (fail-closed)"
+                            );
+                            metrics::record_trade_rejected(
+                                &metrics_registry,
+                                mode_label,
+                                risk::RejectReason::HolderConcentrationExceeded.code(),
+                            );
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    }
                     tracing::info!(
                         target: "live",
                         liquidity,

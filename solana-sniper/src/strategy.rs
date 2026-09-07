@@ -28,8 +28,6 @@ pub struct StrategyConfig {
     pub max_daily_trades: u64,
     /// Maximum market cap (lamports) — reject overvalued / already-pumped tokens.
     pub max_market_cap_lamports: u64,
-    /// Minimum number of holders required.
-    pub min_holders: u64,
 }
 
 impl Default for StrategyConfig {
@@ -54,8 +52,12 @@ impl Default for StrategyConfig {
             max_daily_trades: 20,
             // 1M SOL market cap ceiling.
             max_market_cap_lamports: 1_000_000_000_000_000,
-            // Minimum 50 holders.
-            min_holders: 50,
+            // NOTE: no `min_holders` — `getTokenLargestAccounts` returns at
+            // most 20 accounts per the SPL JSON-RPC standard, so an absolute
+            // holder count is structurally unmeasurable. Rug-risk is gated
+            // by the holder-CONCENTRATION check (30% single / 70% top-20,
+            // onchain_risk::MAX_*_HOLDER_PCT) applied in the data layer for
+            // both paper and live when --live-risk-data is on.
         }
     }
 }
@@ -126,9 +128,10 @@ impl SimpleSnipeStrategy {
         if candidate.market_cap_lamports > self.config.max_market_cap_lamports {
             return None;
         }
-        if candidate.holders < self.config.min_holders {
-            return None;
-        }
+        // NOTE: no absolute holder-count check here — see StrategyConfig
+        // default docs. Holder risk is gated by the concentration check in
+        // the data layer (onchain_risk::holder_concentration_verdict) with
+        // an explicit RejectReason, never a silent no_entry_signal.
 
         Some(EntrySignal {
             position_size_lamports: self.config.max_trade_size_lamports,
@@ -232,11 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_rejects_few_holders() {
+    fn evaluate_no_longer_gates_on_absolute_holder_count() {
+        // Regression (operator-approved design): `min_holders` (50) was
+        // removed because getTokenLargestAccounts caps at 20 accounts, so an
+        // absolute holder count can never be measured. Holder risk is gated
+        // by the concentration check in onchain_risk::holder_concentration_
+        // verdict (30% single / 70% top-20) in the data layer.
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let mut c = valid_candidate();
-        c.holders = 10;
-        assert!(s.evaluate(&c, 1u128 << 64).is_none());
+        c.holders = 10; // would have been rejected by the old min_holders=50
+        assert!(s.evaluate(&c, 1u128 << 64).is_some());
     }
 
     #[test]
