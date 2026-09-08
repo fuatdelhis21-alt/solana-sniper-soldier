@@ -1655,8 +1655,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "dry-run transaction built and signed (never sent)"
                     );
                     successful_trades += 1;
-                    risk_manager.record_trade();
-                    risk_manager.record_position_open(entry_signal.position_size_lamports);
+                    // NOTE: dry-run does NOT call risk_manager.record_trade()
+                    // or record_position_open() — those represent real
+                    // on-chain position/trade accounting. Inflating them here
+                    // would trip open_position_cap / daily_trade_cap after the
+                    // first built tx and reject every later iteration, which
+                    // defeats AŞAMA 1's purpose of repeatedly exercising the
+                    // risk gates. Dry-run only builds+sings; it never opens a
+                    // real position.
                     metrics::record_trade_executed(&metrics_registry, mode_label);
                 } else {
                     let send_result = if let Some(jito_ep) = &args.jito_endpoint {
