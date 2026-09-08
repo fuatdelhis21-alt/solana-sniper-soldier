@@ -1170,70 +1170,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if args.dry_run {
+        if args.live || args.dry_run {
+            // LIVE and DRY-RUN share one execution path so that dry-run
+            // exercises the exact same pool-resolution, risk-gate, strategy
+            // and transaction-build logic that live will run — the only
+            // difference is that dry-run never submits to the network.
+            let is_live = args.live;
+            let mode_target = if is_live { "live" } else { "dry_run" };
             tracing::info!(
-                target: "dry_run",
+                mode = mode_target,
                 iteration = i + 1,
-                hsm = hsm_configured,
-                "DRY-RUN: would build and sign transaction"
-            );
-
-            if hsm_configured {
-                // Remote HSM backend: derive `from` from the HSM, never a local keyfile.
-                let endpoint = args.hsm_endpoint.as_ref().expect("validated");
-                let ca = args.hsm_ca.as_ref().expect("validated");
-                let identity = args.hsm_client_identity.as_ref().expect("validated");
-                let from = hsm_pubkey(endpoint, ca, identity).await?;
-                let to = Pubkey::new_from_array([0u8; 32]);
-                let ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000_000);
-                let blockhash = resolve_blockhash(&args, &blockhash_mgr)?;
-                let msg = solana_sdk::message::Message::new(&[ix], Some(&from));
-                let mut tx = Transaction::new_unsigned(msg);
-                let sig = hsm_sign(endpoint, ca, identity, &mut tx).await?;
-                tx.signatures = vec![sig];
-                tracing::info!(
-                    target: "dry_run",
-                    hsm_endpoint = %endpoint,
-                    "transaction signed via remote HSM (mTLS)"
-                );
-                let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
-                println!(
-                    "[DRY-RUN] iter {}: tx (hex) = {}",
-                    i + 1,
-                    hex::encode(&tx_bytes)
-                );
-                println!("[DRY-RUN] iter {}: signature = {}", i + 1, tx.signatures[0]);
-                tracing::info!(
-                    target: "dry_run",
-                    signature = %tx.signatures[0],
-                    "dry-run transaction built"
-                );
-            } else if let Some(ref kp) = local_signer {
-                let from = kp.pubkey();
-                let to = Pubkey::new_from_array([0u8; 32]);
-                let ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000_000);
-                let blockhash = resolve_blockhash(&args, &blockhash_mgr)?;
-                let msg = solana_sdk::message::Message::new(&[ix], Some(&from));
-                let mut tx = Transaction::new_unsigned(msg);
-                tx.sign(&[kp], blockhash);
-                let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
-                println!(
-                    "[DRY-RUN] iter {}: tx (hex) = {}",
-                    i + 1,
-                    hex::encode(&tx_bytes)
-                );
-                println!("[DRY-RUN] iter {}: signature = {}", i + 1, tx.signatures[0]);
-                tracing::info!(
-                    target: "dry_run",
-                    signature = %tx.signatures[0],
-                    "dry-run transaction built"
-                );
-            }
-        } else if args.live {
-            tracing::info!(
-                target: "live",
-                iteration = i + 1,
-                "LIVE mode iteration"
+                "LIVE/DRY-RUN mode iteration"
             );
 
             if risk_manager.is_circuit_breaker_active() {
@@ -1242,25 +1189,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            // Live mode is fail-closed: the remote HSM is mandatory (validated
-            // above) and the local keyfile is never loaded. Any HSM failure
-            // (connection, TLS handshake, client cert, signature, verification)
-            // propagates via `?` and halts the trading loop.
-            let endpoint = args
-                .hsm_endpoint
-                .as_ref()
-                .expect("live mode requires remote HSM (validated)");
-            let ca = args.hsm_ca.as_ref().expect("validated");
-            let identity = args.hsm_client_identity.as_ref().expect("validated");
-            let from = match hsm_pubkey(endpoint, ca, identity).await {
-                Ok(pk) => pk,
-                Err(e) => {
-                    risk_manager
-                        .trip_circuit_breaker(&format!("HSM unavailable (fail-closed): {e}"));
-                    tracing::error!(target: "live", error = %e, "HSM pubkey fetch failed — circuit breaker tripped");
-                    sleep(Duration::from_millis(200)).await;
-                    continue;
+            // Signer resolution: LIVE is fail-closed and requires the remote
+            // HSM (validated above); the local keyfile is never loaded in live
+            // mode. DRY-RUN may use the remote HSM when configured, otherwise
+            // it falls back to the local keyfile (never sent to the network).
+            let endpoint = args.hsm_endpoint.as_ref();
+            let ca = args.hsm_ca.as_ref();
+            let identity = args.hsm_client_identity.as_ref();
+            let from = if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
+                match hsm_pubkey(ep, ca, id).await {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        risk_manager
+                            .trip_circuit_breaker(&format!("HSM unavailable (fail-closed): {e}"));
+                        tracing::error!(mode = mode_target, error = %e, "HSM pubkey fetch failed — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
                 }
+            } else if let Some(ref kp) = local_signer {
+                kp.pubkey()
+            } else {
+                risk_manager.trip_circuit_breaker(
+                    "no signer available (fail-closed): live requires HSM, dry-run requires HSM or --wallet",
+                );
+                tracing::error!(
+                    mode = mode_target,
+                    "no signer available — circuit breaker tripped"
+                );
+                sleep(Duration::from_millis(200)).await;
+                continue;
             };
             let mut to = from; // self-transfer fallback when no pool is configured
 
@@ -1318,7 +1276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             risk_manager.trip_circuit_breaker(&format!(
                                 "pool state resolution failed (fail-closed): {e}"
                             ));
-                            tracing::error!(target: "live", error = %e, "failed to resolve pool state — circuit breaker tripped");
+                            tracing::error!(mode = mode_target, error = %e, "failed to resolve pool state — circuit breaker tripped");
                             sleep(Duration::from_millis(200)).await;
                             continue;
                         }
@@ -1330,7 +1288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (Some(pool), false)
                 };
                 tracing::info!(
-                    target: "live",
+                    mode = mode_target,
                     pool_id = %pool_id,
                     sqrt_price = entry_sqrt,
                     source = if used_ws { "websocket" } else { "rpc_poll" },
@@ -1344,12 +1302,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(reason) =
                         risk::check_price_staleness(ts, risk_cfg.price_staleness_ms)
                     {
-                        tracing::warn!(target: "live", iteration = i + 1, reason = %reason, "price staleness check failed — no trade this iteration (fail-closed)");
+                        tracing::warn!(mode = mode_target, iteration = i + 1, reason = %reason, "price staleness check failed — no trade this iteration (fail-closed)");
                         sleep(Duration::from_millis(200)).await;
                         continue;
                     }
                 } else {
-                    tracing::warn!(target: "live", iteration = i + 1, "no price timestamp available — rejecting trade (fail-closed)");
+                    tracing::warn!(
+                        mode = mode_target,
+                        iteration = i + 1,
+                        "no price timestamp available — rejecting trade (fail-closed)"
+                    );
                     sleep(Duration::from_millis(200)).await;
                     continue;
                 }
@@ -1368,7 +1330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         risk_manager.trip_circuit_breaker(&format!(
                             "swap account resolution failed (fail-closed): {e}"
                         ));
-                        tracing::error!(target: "live", error = %e, "failed to resolve swap accounts — circuit breaker tripped");
+                        tracing::error!(mode = mode_target, error = %e, "failed to resolve swap accounts — circuit breaker tripped");
                         sleep(Duration::from_millis(200)).await;
                         continue;
                     }
@@ -1383,7 +1345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match onchain_risk::fetch_mint_authority_risk(&rpc_client, &mint) {
                         Ok(risk) if risk.is_risky() => {
                             tracing::warn!(
-                                target: "live",
+                                mode = mode_target,
                                 iteration = i + 1,
                                 mint_role = label,
                                 mint = %mint,
@@ -1399,7 +1361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             risk_manager.trip_circuit_breaker(&format!(
                                 "mint authority check failed (fail-closed): {e}"
                             ));
-                            tracing::error!(target: "live", error = %e, mint_role = label, "mint authority check failed — circuit breaker tripped");
+                            tracing::error!(mode = mode_target, error = %e, mint_role = label, "mint authority check failed — circuit breaker tripped");
                             sleep(Duration::from_millis(200)).await;
                             continue 'main_loop;
                         }
@@ -1421,7 +1383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             risk_manager.trip_circuit_breaker(&format!(
                                 "live risk data (fail-closed): {e}"
                             ));
-                            tracing::error!(target: "live", error = %e, "liquidity fetch failed — circuit breaker tripped");
+                            tracing::error!(mode = mode_target, error = %e, "liquidity fetch failed — circuit breaker tripped");
                             sleep(Duration::from_millis(200)).await;
                             continue;
                         }
@@ -1436,7 +1398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             risk_manager.trip_circuit_breaker(&format!(
                                 "live risk data (fail-closed): {e}"
                             ));
-                            tracing::error!(target: "live", error = %e, "holder stats fetch failed — circuit breaker tripped");
+                            tracing::error!(mode = mode_target, error = %e, "holder stats fetch failed — circuit breaker tripped");
                             sleep(Duration::from_millis(200)).await;
                             continue;
                         }
@@ -1448,7 +1410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         onchain_risk::HolderVerdict::Ok => {}
                         verdict => {
                             tracing::warn!(
-                                target: "live",
+                                mode = mode_target,
                                 verdict = ?verdict,
                                 "holder concentration gate rejected candidate (fail-closed)"
                             );
@@ -1462,7 +1424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     tracing::info!(
-                        target: "live",
+                        mode = mode_target,
                         liquidity,
                         top_holder_pct = holder_stats.top_holder_pct,
                         sampled_holders = holder_stats.sampled_holders,
@@ -1479,14 +1441,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // is only logged as a warning.
                     match discovery::fetch_snapshot(pool_id_str) {
                         Ok(snapshot) => tracing::info!(
-                            target: "live",
+                            mode = mode_target,
                             liquidity_usd = snapshot.liquidity_usd,
                             fdv = snapshot.fdv,
                             volume_24h_usd = snapshot.volume_24h_usd,
                             "dexscreener advisory snapshot (not used for trading gate)"
                         ),
                         Err(e) => tracing::warn!(
-                            target: "live",
+                            mode = mode_target,
                             error = %e,
                             "dexscreener advisory check failed — ignored, not gating trade"
                         ),
@@ -1518,8 +1480,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let entry_signal = strategy.evaluate(&candidate, entry_sqrt);
 
-            let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
-            rec.mode = "live".to_string();
+            let mut rec = decision::DecisionRecord::new("simple_snipe", mode_target);
+            rec.mode = mode_target.to_string();
             rec.pool_id = "live_pool".to_string();
             rec.token_in = "SOL".to_string();
             rec.token_out = "SOL".to_string();
@@ -1533,7 +1495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let Some(entry_signal) = entry_signal else {
                 tracing::warn!(
-                    target: "live",
+                    mode = mode_target,
                     iteration = i + 1,
                     liquidity = candidate.liquidity_lamports,
                     market_cap = candidate.market_cap_lamports,
@@ -1553,7 +1515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let max_spend_lamports = solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
             if entry_signal.position_size_lamports > max_spend_lamports {
                 tracing::warn!(
-                    target: "live",
+                    mode = mode_target,
                     iteration = i + 1,
                     position_size_lamports = entry_signal.position_size_lamports,
                     max_spend_lamports = max_spend_lamports,
@@ -1579,7 +1541,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ) {
                 metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
                 tracing::warn!(
-                    target: "live",
+                    mode = mode_target,
                     iteration = i + 1,
                     error = %e,
                     "risk gate rejected trade — no trade this iteration (fail-closed)"
@@ -1638,97 +1600,133 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     entry_signal.slippage_bps,
                 ) {
                     metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
-                    tracing::warn!(target: "live", iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
+                    tracing::warn!(mode = mode_target, iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
                     sleep(Duration::from_millis(200)).await;
                     continue;
                 }
 
-                let sig = match hsm_sign(endpoint, ca, identity, &mut tx).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        risk_manager.trip_circuit_breaker(&format!(
-                            "HSM signing failed (fail-closed): {e}"
-                        ));
-                        tracing::error!(target: "live", error = %e, "HSM signing failed — circuit breaker tripped");
-                        sleep(Duration::from_millis(200)).await;
-                        continue;
+                // Sign the transaction: via the remote HSM when configured,
+                // otherwise (dry-run only) via the local keypair. LIVE always
+                // has the HSM (validated); the local keyfile is never a live
+                // fallback.
+                let sig = if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
+                    match hsm_sign(ep, ca, id, &mut tx).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "HSM signing failed (fail-closed): {e}"
+                            ));
+                            tracing::error!(mode = mode_target, error = %e, "HSM signing failed — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
                     }
+                } else if let Some(ref kp) = local_signer {
+                    tx.sign(&[kp], tx.message.recent_blockhash);
+                    tx.signatures[0]
+                } else {
+                    risk_manager
+                        .trip_circuit_breaker("no signer available at signing time (fail-closed)");
+                    tracing::error!(
+                        mode = mode_target,
+                        "no signer available at signing time — circuit breaker tripped"
+                    );
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
                 };
                 tx.signatures = vec![sig];
 
-                // Submission: if a Jito endpoint is configured, send via Jito
-                // bundle with RPC fallback. Otherwise send directly via RPC.
-                //
-                // IMPORTANT: in Jito dry-run mode the bundle is validated but
-                // never POSTed, so the transaction must still be submitted to
-                // the RPC for confirmation. Only a real (non-dry-run) Jito
-                // bundle acceptance counts as a confirmed submission.
-                let send_result = if let Some(jito_ep) = &args.jito_endpoint {
-                    let bundle = jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
-                    let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
-                    if args.jito_dry_run {
-                        // Dry-run: validate the bundle, then submit via RPC.
-                        match client.send_bundle(&bundle).await {
-                            Ok(bundle_id) => {
-                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC");
-                                retry::send_with_retry(&*rpc_client, &tx)
+                // Submission: LIVE sends the signed transaction (via Jito
+                // bundle with RPC fallback when configured, otherwise directly
+                // via RPC). DRY-RUN never submits — it prints the built and
+                // signed transaction so an operator can inspect exactly what
+                // live would have sent.
+                if !is_live {
+                    let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
+                    println!(
+                        "[DRY-RUN] iter {}: tx (hex) = {}",
+                        i + 1,
+                        hex::encode(&tx_bytes)
+                    );
+                    println!("[DRY-RUN] iter {}: signature = {}", i + 1, tx.signatures[0]);
+                    tracing::info!(
+                        target: "dry_run",
+                        signature = %tx.signatures[0],
+                        "dry-run transaction built and signed (never sent)"
+                    );
+                    successful_trades += 1;
+                    risk_manager.record_trade();
+                    risk_manager.record_position_open(entry_signal.position_size_lamports);
+                    metrics::record_trade_executed(&metrics_registry, mode_label);
+                } else {
+                    let send_result = if let Some(jito_ep) = &args.jito_endpoint {
+                        let bundle =
+                            jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
+                        let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
+                        if args.jito_dry_run {
+                            // Dry-run: validate the bundle, then submit via RPC.
+                            match client.send_bundle(&bundle).await {
+                                Ok(bundle_id) => {
+                                    tracing::info!(mode = mode_target, bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC");
+                                    retry::send_with_retry(&*rpc_client, &tx)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(mode = mode_target, error = %e, "jito dry-run validation failed — submitting via RPC");
+                                    retry::send_with_retry(&*rpc_client, &tx)
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(target: "live", error = %e, "jito dry-run validation failed — submitting via RPC");
-                                retry::send_with_retry(&*rpc_client, &tx)
+                        } else {
+                            // Live Jito: send the bundle; fall back to RPC on failure.
+                            match client.send_bundle(&bundle).await {
+                                Ok(bundle_id) => {
+                                    tracing::info!(mode = mode_target, bundle_id = %bundle_id, "jito bundle accepted");
+                                    Ok(tx.signatures[0])
+                                }
+                                Err(e) => {
+                                    tracing::warn!(mode = mode_target, error = %e, "jito bundle failed — falling back to RPC");
+                                    jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                                }
                             }
                         }
                     } else {
-                        // Live Jito: send the bundle; fall back to RPC on failure.
-                        match client.send_bundle(&bundle).await {
-                            Ok(bundle_id) => {
-                                tracing::info!(target: "live", bundle_id = %bundle_id, "jito bundle accepted");
-                                Ok(tx.signatures[0])
-                            }
-                            Err(e) => {
-                                tracing::warn!(target: "live", error = %e, "jito bundle failed — falling back to RPC");
-                                jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
-                            }
-                        }
-                    }
-                } else {
-                    retry::send_with_retry(&*rpc_client, &tx)
-                };
+                        retry::send_with_retry(&*rpc_client, &tx)
+                    };
 
-                match send_result {
-                    Ok(sig) => {
-                        successful_trades += 1;
-                        // Record the completed trade (daily trade counter)
-                        // and the newly opened position/exposure.
-                        //
-                        // KNOWN GAP: this codebase has no exit-execution
-                        // path (SimpleSnipeStrategy::should_exit() is
-                        // computed but never acted on in the live loop), so
-                        // record_position_close() is never called and
-                        // realized P&L is not tracked for wins. See final
-                        // report for details — not fabricated here.
-                        risk_manager.record_trade();
-                        risk_manager.record_position_open(entry_signal.position_size_lamports);
-                        metrics::record_trade_executed(&metrics_registry, mode_label);
-                        tracing::info!(target: "live", signature = %sig, "transaction confirmed");
-                        let cluster = if args.rpc.contains("devnet") {
-                            "devnet"
-                        } else {
-                            "mainnet-beta"
-                        };
-                        println!(
+                    match send_result {
+                        Ok(sig) => {
+                            successful_trades += 1;
+                            // Record the completed trade (daily trade counter)
+                            // and the newly opened position/exposure.
+                            //
+                            // KNOWN GAP: this codebase has no exit-execution
+                            // path (SimpleSnipeStrategy::should_exit() is
+                            // computed but never acted on in the live loop), so
+                            // record_position_close() is never called and
+                            // realized P&L is not tracked for wins. See final
+                            // report for details — not fabricated here.
+                            risk_manager.record_trade();
+                            risk_manager.record_position_open(entry_signal.position_size_lamports);
+                            metrics::record_trade_executed(&metrics_registry, mode_label);
+                            tracing::info!(mode = mode_target, signature = %sig, "transaction confirmed");
+                            let cluster = if args.rpc.contains("devnet") {
+                                "devnet"
+                            } else {
+                                "mainnet-beta"
+                            };
+                            println!(
                             "[LIVE] iter {}: TX confirmed: https://explorer.solana.com/tx/{}?cluster={}",
                             i + 1,
                             sig,
                             cluster
                         );
+                        }
+                        Err(e) => {
+                            let _ = risk_manager.record_loss(1_000);
+                            tracing::error!(mode = mode_target, error = %e, "transaction failed after retries");
+                            eprintln!("[LIVE] iter {}: TX failed: {}", i + 1, e);
+                        }
                     }
-                    Err(e) => {
-                        let _ = risk_manager.record_loss(1_000);
-                        tracing::error!(target: "live", error = %e, "transaction failed after retries");
-                        eprintln!("[LIVE] iter {}: TX failed: {}", i + 1, e);
-                    }
-                }
+                } // end else: live-only send path
             }
         } else {
             tracing::debug!(target: "sim", iteration = i + 1, "simulation iteration");
