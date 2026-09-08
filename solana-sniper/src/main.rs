@@ -1493,20 +1493,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "blocklisted": candidate.is_blocklisted,
             });
 
-            let Some(entry_signal) = entry_signal else {
-                tracing::warn!(
-                    mode = mode_target,
-                    iteration = i + 1,
-                    liquidity = candidate.liquidity_lamports,
-                    market_cap = candidate.market_cap_lamports,
-                    holders = candidate.holders,
-                    blocklisted = candidate.is_blocklisted,
-                    "strategy rejected candidate — no trade this iteration (fail-closed)"
-                );
-                rec.save(&args.data_dir)?;
-                total_trades += 1;
-                sleep(Duration::from_millis(200)).await;
-                continue;
+            // Offline HSM smoke mode: `--dry-run` WITHOUT `--pool-id` — this is
+            // exactly what the CI mTLS smoke test invokes (fixed --blockhash,
+            // no RPC) to verify the HSM signing + audit pipeline. There is no
+            // market data for the strategy to evaluate (the static candidate
+            // args default to zero), so the gate would reject every iteration
+            // and nothing would ever reach the signer. Preserve the legacy
+            // dry-run contract for that invocation: fall through with the
+            // default-size signal so the fallback self-transfer tx is still
+            // built and signed (never sent). Never applies to live, and never
+            // applies when --pool-id IS set — the AŞAMA 1 rehearsal always
+            // passes --pool-id, so it goes through the real gates above.
+            let entry_signal = match entry_signal {
+                Some(sig) => sig,
+                None if args.pool_id.is_none() && !is_live => {
+                    tracing::info!(
+                        mode = mode_target,
+                        iteration = i + 1,
+                        "offline HSM smoke mode (no --pool-id): bypassing market-data strategy gate and building the fallback signed tx"
+                    );
+                    rec.context = serde_json::json!({
+                        "entry": true,
+                        "offline_hsm_smoke": true,
+                    });
+                    strategy::EntrySignal {
+                        position_size_lamports: strategy.config().max_trade_size_lamports,
+                        slippage_bps: strategy.config().max_slippage_bps,
+                        entry_sqrt_price: entry_sqrt,
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        mode = mode_target,
+                        iteration = i + 1,
+                        liquidity = candidate.liquidity_lamports,
+                        market_cap = candidate.market_cap_lamports,
+                        holders = candidate.holders,
+                        blocklisted = candidate.is_blocklisted,
+                        "strategy rejected candidate — no trade this iteration (fail-closed)"
+                    );
+                    rec.save(&args.data_dir)?;
+                    total_trades += 1;
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
             };
             rec.amount_in = entry_signal.position_size_lamports;
             rec.save(&args.data_dir)?;
