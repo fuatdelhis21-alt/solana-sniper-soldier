@@ -304,7 +304,7 @@ mod tests {
         );
         // Document the exact safe values so a future bump is deliberate.
         assert_eq!(strat_cfg.max_trade_size_lamports, 10_000_000, "0.01 SOL");
-        assert_eq!(risk_cfg.max_trade_size_lamports, 50_000_000, "0.05 SOL");
+        assert_eq!(risk_cfg.max_trade_size_lamports, 10_000_000, "0.01 SOL (mainnet conservative)");
     }
 
     #[test]
