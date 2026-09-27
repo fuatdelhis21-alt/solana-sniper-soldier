@@ -542,6 +542,13 @@ struct Args {
     #[arg(long, default_value_t = 50.0)]
     max_top_holder_pct: f64,
 
+    /// Comma-separated base58 mints exempt from the mint/freeze authority
+    /// rug-check (e.g. blue-chip assets like USDC whose issuer legitimately
+    /// holds these authorities). Empty by default — every mint is checked.
+    /// Only bypasses the authority gate; all other risk gates still apply.
+    #[arg(long, default_value = "")]
+    trusted_mints: String,
+
     /// Optional DexScreener cross-check for logging only. Never used to
     /// gate a trade — a DexScreener failure only logs a warning.
     #[arg(long, default_value_t = false)]
@@ -871,6 +878,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => onchain_risk::load_blocklist(path)?,
         None => std::collections::HashSet::new(),
     };
+
+    // Operator-trusted mints (e.g. USDC/USDT) exempt from the mint/freeze
+    // authority rug-check. Parsed once; invalid entries refuse to start
+    // (fail-closed — a typo'd mint must never silently trade unchecked).
+    let trusted_mints: std::collections::HashSet<Pubkey> = args
+        .trusted_mints
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            Pubkey::from_str(s)
+                .map_err(|e| format!("invalid --trusted-mints entry '{s}': {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if !trusted_mints.is_empty() {
+        tracing::info!(
+            count = trusted_mints.len(),
+            "trusted mints loaded — authority rug-check bypassed for these mints only"
+        );
+    }
 
     // Optional real-time WebSocket feed. Starts a background reconnect loop
     // via `MarketDataHandler::start_stream`; the existing RPC-polled
@@ -1533,8 +1560,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pool is configured, independent of --live-risk-data. A
                 // present mint or freeze authority means the token issuer
                 // can mint more supply or freeze accounts at will — reject
-                // fail-closed.
+                // fail-closed. Mints listed in --trusted-mints (operator
+                // decision, e.g. blue-chip USDC/USDT) bypass ONLY this gate.
                 for (label, mint) in [("input", input_mint), ("output", output_mint)] {
+                    if trusted_mints.contains(&mint) {
+                        tracing::info!(
+                            mode = mode_target,
+                            iteration = i + 1,
+                            mint_role = label,
+                            mint = %mint,
+                            "mint is operator-trusted — authority rug-check skipped for this mint"
+                        );
+                        continue;
+                    }
                     match onchain_risk::fetch_mint_authority_risk(&rpc_client, &mint) {
                         Ok(risk) if risk.is_risky() => {
                             tracing::warn!(
