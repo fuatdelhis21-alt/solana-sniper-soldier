@@ -50,6 +50,12 @@ pub struct RaydiumV4ClmmAdapter {
     program_id: String,
     accounts: Option<SwapAccounts>,
     pool: Option<ResolvedPool>,
+    /// When true, `quote()` computes the reverse direction (token_mint_1 ->
+    /// token_mint_0, i.e. selling the position back for the entry asset)
+    /// instead of the default token_mint_0 -> token_mint_1 buy direction.
+    /// Used to build the exit/sell transaction with the same adapter that
+    /// resolved the pool for entry.
+    reversed: bool,
 }
 
 impl RaydiumV4ClmmAdapter {
@@ -59,7 +65,16 @@ impl RaydiumV4ClmmAdapter {
             program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
             accounts: None,
             pool: None,
+            reversed: false,
         }
+    }
+
+    /// Mark this adapter to quote/build the exit (sell) direction: the
+    /// caller must also pass `SwapAccounts` resolved with the mints swapped
+    /// (input = the held token, output = the entry asset).
+    pub fn reversed(mut self) -> Self {
+        self.reversed = true;
+        self
     }
 
     /// Set the full swap account set. Required before `build_transaction`.
@@ -183,11 +198,22 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
         let sqrt_price = pool.sqrt_price_x64;
         // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
         let fee_rate = 500u64;
-        let expected_output = Self::compute_output_amount(input_amount, sqrt_price, fee_rate);
+        // Forward (buy, mint0->mint1) uses the raw price; reverse (sell,
+        // mint1->mint0) uses its inverse. compute_output_amount takes a
+        // sqrt_price, so invert at the sqrt level: sqrt(1/p) = (2^64)^2 / sqrt_price.
+        let (effective_sqrt_price, input_mint, output_mint) = if self.reversed {
+            let inv_sqrt_price = ((1u128 << 64) as f64 * (1u128 << 64) as f64
+                / sqrt_price as f64) as u128;
+            (inv_sqrt_price, pool.token_mint_1, pool.token_mint_0)
+        } else {
+            (sqrt_price, pool.token_mint_0, pool.token_mint_1)
+        };
+        let expected_output =
+            Self::compute_output_amount(input_amount, effective_sqrt_price, fee_rate);
         Ok(Quote {
             pool_id: self.pool_id.clone(),
-            input_mint: pool.token_mint_0.to_string(),
-            output_mint: pool.token_mint_1.to_string(),
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
             input_amount,
             expected_output,
             slippage_bps,
@@ -256,6 +282,45 @@ mod tests {
         let data = vec![0u8; 10];
         let pool_id = Pubkey::new_unique();
         assert!(RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).is_err());
+    }
+
+    #[test]
+    fn quote_reversed_inverts_price_and_mints() {
+        let pool_id = Pubkey::new_unique();
+        let mint0 = Pubkey::new_unique();
+        let mint1 = Pubkey::new_unique();
+        // price(mint1/mint0) = 4.0 => sqrt_price = 2 * 2^64
+        let sqrt_price = 2u128 << 64;
+        let pool = ResolvedPool {
+            pool_id,
+            amm_config: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            token_mint_0: mint0,
+            token_mint_1: mint1,
+            token_vault_0: Pubkey::new_unique(),
+            token_vault_1: Pubkey::new_unique(),
+            observation_key: Pubkey::new_unique(),
+            mint_decimals_0: 9,
+            mint_decimals_1: 9,
+            tick_spacing: 1,
+            liquidity: 0,
+            sqrt_price_x64: sqrt_price,
+            tick_current: 0,
+        };
+        let forward = RaydiumV4ClmmAdapter::new(pool_id.to_string()).with_resolved_pool(pool.clone());
+        let fwd_quote = forward.quote(1_000_000, 0).unwrap();
+        assert_eq!(fwd_quote.input_mint, mint0.to_string());
+        assert_eq!(fwd_quote.output_mint, mint1.to_string());
+
+        let reverse = RaydiumV4ClmmAdapter::new(pool_id.to_string())
+            .with_resolved_pool(pool)
+            .reversed();
+        let rev_quote = reverse.quote(1_000_000, 0).unwrap();
+        assert_eq!(rev_quote.input_mint, mint1.to_string());
+        assert_eq!(rev_quote.output_mint, mint0.to_string());
+        // Reverse price is ~1/4 of forward price (allow for f64 rounding).
+        let ratio = fwd_quote.expected_output as f64 / rev_quote.expected_output as f64;
+        assert!((ratio - 16.0).abs() < 0.5, "ratio was {ratio}");
     }
 
     #[test]

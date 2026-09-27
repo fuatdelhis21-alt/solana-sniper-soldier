@@ -61,6 +61,20 @@ struct PaperPosition {
     position_size_lamports: u64,
 }
 
+/// An open LIVE (on-chain) position: the entry price and everything needed
+/// to build the reverse (sell) swap when `should_exit()` fires. Unlike
+/// `PaperPosition`, this backs a real trade — closing it submits a real
+/// transaction via the same signer/send path as entry.
+#[derive(Clone)]
+struct LivePosition {
+    entry_sqrt_price: u128,
+    position_size_lamports: u64,
+    pool_id: String,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    program_id: Pubkey,
+}
+
 /// Outcome of one paper iteration against real market data.
 #[derive(Debug)]
 enum PaperTick {
@@ -407,16 +421,16 @@ fn resolve_paper_market_data(
     about = "Solana HFT Platform — ultra-low-latency trading"
 )]
 struct Args {
-    /// RPC endpoint URL
-    #[arg(long, default_value = "https://api.devnet.solana.com")]
+    /// RPC endpoint URL (also settable via RPC_URL in .env)
+    #[arg(long, env = "RPC_URL", default_value = "https://api.devnet.solana.com")]
     rpc: String,
 
-    /// WebSocket endpoint URL
-    #[arg(long, default_value = "wss://api.devnet.solana.com")]
+    /// WebSocket endpoint URL (also settable via WS_URL in .env)
+    #[arg(long, env = "WS_URL", default_value = "wss://api.devnet.solana.com")]
     ws: String,
 
-    /// Path to wallet.json
-    #[arg(long, default_value = "./wallet.json")]
+    /// Path to wallet.json (also settable via WALLET_PATH in .env)
+    #[arg(long, env = "WALLET_PATH", default_value = "./wallet.json")]
     wallet: PathBuf,
 
     /// Dry-run: build + sign transactions, print them, never send
@@ -706,6 +720,11 @@ fn validate_paper_args(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env (if present) into the process environment before parsing
+    // args, so RPC_URL / WS_URL / WALLET_PATH (and any other env-backed
+    // flags) are picked up. Missing .env is not an error — CLI flags and
+    // hardcoded defaults still apply.
+    let _ = dotenvy::dotenv();
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
     let _guard = init_tracing(&args.data_dir);
@@ -841,6 +860,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut paper_strategy_ms: u128 = 0;
     let mut paper_rejects: u64 = 0;
 
+    // Live (real on-chain) position tracker — set on a confirmed live entry,
+    // cleared on a confirmed live exit. See `LivePosition` for why this
+    // exists (closes the exit-execution gap).
+    let mut live_position: Option<LivePosition> = None;
+
     // Optional local blocklist, loaded once. Missing file => empty set (not
     // a fail-closed condition — it just means this extra gate is inactive).
     let blocklist: std::collections::HashSet<Pubkey> = match &args.blocklist_file {
@@ -878,9 +902,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             -(risk_manager.current_daily_loss() as i64),
             risk_manager.open_position_count(),
         );
-        if let Err(e) =
+        // Skip this generic dummy-amount gate while a live position is open:
+        // pre_trade_check() unconditionally rejects with
+        // OpenPositionCapExceeded once max_open_positions is reached
+        // (currently 1), which would otherwise `break` the live loop before
+        // it ever reaches the exit-check below — permanently stranding the
+        // open position with no way to sell it. Circuit breaker / kill
+        // switch are still enforced independently further down.
+        let has_open_live_position = live_position.is_some() && (args.live || args.dry_run);
+        let dummy_gate_result = if has_open_live_position {
+            Ok(())
+        } else {
             risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
-        {
+        };
+        if let Err(e) = dummy_gate_result {
             metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
             *rejected_by_reason.entry(e.code()).or_insert(0) += 1;
             tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
@@ -1220,6 +1255,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sleep(Duration::from_millis(200)).await;
                 continue;
             };
+            // Exit-execution: if a live position is already open, decide
+            // whether to hold or close it BEFORE considering any new entry.
+            // This is the fix for the KNOWN GAP where should_exit() was
+            // computed but never acted on — without it, a live position
+            // would be bought and then held forever (bot never sells).
+            if let Some(pos) = live_position.clone() {
+                let feed = marketdata::PoolPriceFeed::new(
+                    rpc_client.clone(),
+                    Pubkey::from_str(&pos.pool_id).map_err(|e| format!("invalid stored pool id: {e}"))?,
+                    pos.program_id,
+                );
+                let current_pool = match feed.refresh() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(mode = mode_target, error = %e, "exit price check failed — holding position (fail-closed, never force-exit on unknown price)");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let exit_strategy =
+                    strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+                let exit_decision =
+                    exit_strategy.should_exit(pos.entry_sqrt_price, current_pool.sqrt_price_x64);
+                if matches!(exit_decision, strategy::ExitDecision::Hold) {
+                    tracing::debug!(mode = mode_target, iteration = i + 1, "live position open — holding (no exit signal)");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                let reason = if matches!(exit_decision, strategy::ExitDecision::StopLoss) {
+                    "stop_loss"
+                } else {
+                    "take_profit"
+                };
+
+                // Build the reverse (sell) swap: input = held token
+                // (pos.output_mint), output = the entry asset (pos.input_mint).
+                let pool_id = Pubkey::from_str(&pos.pool_id)
+                    .map_err(|e| format!("invalid stored pool id: {e}"))?;
+                let (sell_accounts, resolved_pool) = match amm::account_resolver::resolve_swap_accounts(
+                    &rpc_client,
+                    &pool_id,
+                    &from,
+                    &pos.output_mint,
+                    &pos.input_mint,
+                    &pos.program_id,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        risk_manager.trip_circuit_breaker(&format!(
+                            "exit swap account resolution failed (fail-closed): {e}"
+                        ));
+                        tracing::error!(mode = mode_target, error = %e, "exit swap account resolution failed — circuit breaker tripped");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let sell_adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pos.pool_id.clone())
+                    .with_swap_accounts(sell_accounts)
+                    .with_resolved_pool(resolved_pool)
+                    .reversed();
+
+                let blockhash = match resolve_blockhash(&args, &blockhash_mgr) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(mode = mode_target, error = %e, "exit blockhash resolution failed");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let sell_result: Result<Transaction, Box<dyn std::error::Error>> = (|| {
+                    let quote = sell_adapter
+                        .quote(pos.position_size_lamports, args.max_slippage_bps)?;
+                    let intent = sell_adapter.build_intent(quote)?;
+                    let mut t = sell_adapter.build_transaction(&intent, &from, blockhash)?;
+                    t.message.recent_blockhash = blockhash;
+                    Ok(t)
+                })();
+                let mut sell_tx = match sell_result {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(mode = mode_target, error = %e, "exit swap build failed (fail-closed) — will retry next iteration");
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+
+                let sell_sig = if let (Some(ep), Some(ca), Some(id)) =
+                    (endpoint, ca, identity)
+                {
+                    match hsm_sign(ep, ca, id, &mut sell_tx).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            risk_manager.trip_circuit_breaker(&format!(
+                                "HSM exit signing failed (fail-closed): {e}"
+                            ));
+                            tracing::error!(mode = mode_target, error = %e, "HSM exit signing failed — circuit breaker tripped");
+                            sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    }
+                } else if let Some(ref kp) = local_signer {
+                    sell_tx.sign(&[kp], sell_tx.message.recent_blockhash);
+                    sell_tx.signatures[0]
+                } else {
+                    risk_manager.trip_circuit_breaker(
+                        "no signer available for exit at signing time (fail-closed)",
+                    );
+                    tracing::error!(mode = mode_target, "no signer available for exit — circuit breaker tripped");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                };
+                sell_tx.signatures = vec![sell_sig];
+
+                if !is_live {
+                    println!(
+                        "[DRY-RUN] iter {}: EXIT ({}) tx signature = {}",
+                        i + 1,
+                        reason,
+                        sell_tx.signatures[0]
+                    );
+                    tracing::info!(target: "dry_run", signature = %sell_tx.signatures[0], reason, "dry-run exit transaction built and signed (never sent)");
+                    live_position = None;
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+
+                match retry::send_with_retry(&*rpc_client, &sell_tx) {
+                    Ok(sig) => {
+                        risk_manager.record_position_close(pos.position_size_lamports);
+                        metrics::record_trade_executed(&metrics_registry, mode_label);
+                        tracing::info!(mode = mode_target, signature = %sig, reason, "exit transaction confirmed — position closed");
+                        println!(
+                            "[LIVE] iter {}: EXIT ({}) confirmed: https://explorer.solana.com/tx/{}",
+                            i + 1,
+                            reason,
+                            sig
+                        );
+                        live_position = None;
+                    }
+                    Err(e) => {
+                        tracing::error!(mode = mode_target, error = %e, "exit transaction failed after retries — position remains open, will retry next iteration");
+                    }
+                }
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
             let mut to = from; // self-transfer fallback when no pool is configured
 
             // When --pool-id is set, resolve the pool on-chain and feed the
@@ -1230,6 +1412,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut live_liquidity: Option<u64> = None;
             let mut live_holder_stats: Option<onchain_risk::HolderStats> = None;
             let mut live_blocklisted = false;
+            // Captured when --pool-id resolves, so a confirmed entry below
+            // can record a `LivePosition` with everything the future exit
+            // swap needs (reversed mints + program id).
+            let mut entry_pool_id_str: Option<String> = None;
+            let mut entry_input_mint: Option<Pubkey> = None;
+            let mut entry_output_mint: Option<Pubkey> = None;
+            let mut entry_program_id: Option<Pubkey> = None;
             if let Some(pool_id_str) = &args.pool_id {
                 let pool_id =
                     Pubkey::from_str(pool_id_str).map_err(|e| format!("invalid --pool-id: {e}"))?;
@@ -1254,6 +1443,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
                         .expect("valid mainnet program id")
                 };
+                entry_pool_id_str = Some(pool_id_str.clone());
+                entry_input_mint = Some(input_mint);
+                entry_output_mint = Some(output_mint);
+                entry_program_id = Some(program_id);
 
                 // Market data hook: prefer a fresh WebSocket update (lower
                 // latency) when the feed is connected and has data for this
@@ -1732,17 +1925,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(sig) => {
                             successful_trades += 1;
                             // Record the completed trade (daily trade counter)
-                            // and the newly opened position/exposure.
-                            //
-                            // KNOWN GAP: this codebase has no exit-execution
-                            // path (SimpleSnipeStrategy::should_exit() is
-                            // computed but never acted on in the live loop), so
-                            // record_position_close() is never called and
-                            // realized P&L is not tracked for wins. See final
-                            // report for details — not fabricated here.
+                            // and the newly opened position/exposure. The
+                            // position is closed (record_position_close) by
+                            // the exit-check block at the top of the loop,
+                            // once SimpleSnipeStrategy::should_exit() fires —
+                            // see `live_position` below.
                             risk_manager.record_trade();
                             risk_manager.record_position_open(entry_signal.position_size_lamports);
                             metrics::record_trade_executed(&metrics_registry, mode_label);
+                            // Track the opened position so a later iteration's
+                            // exit-check (top of loop) can close it with a
+                            // real reverse swap once should_exit() fires.
+                            // Only when a real pool/mints were resolved — the
+                            // self-transfer fallback path (no --pool-id) never
+                            // holds a token position.
+                            if let (Some(pool_id_str), Some(im), Some(om), Some(pid)) = (
+                                &entry_pool_id_str,
+                                entry_input_mint,
+                                entry_output_mint,
+                                entry_program_id,
+                            ) {
+                                live_position = Some(LivePosition {
+                                    entry_sqrt_price: entry_sqrt,
+                                    position_size_lamports: entry_signal.position_size_lamports,
+                                    pool_id: pool_id_str.clone(),
+                                    input_mint: im,
+                                    output_mint: om,
+                                    program_id: pid,
+                                });
+                            }
                             tracing::info!(mode = mode_target, signature = %sig, "transaction confirmed");
                             let cluster = if args.rpc.contains("devnet") {
                                 "devnet"

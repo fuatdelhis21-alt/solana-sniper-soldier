@@ -1,0 +1,345 @@
+{
+  "passed": [],
+  "all_moved": [
+    {
+      "pool_id": "6rfJZmPZgWeertBngVT7hbo62S8GJg2CbaPNEEVbL16a",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "2m8xQTfVEYmGPnZ7vUMo3AFF2pdvFHwaF2YYUSyqm716",
+      "vault0": "Hwue5kTRoMpi5BAr6BDASCayCmRsbbebwZhyiGpZKAzP",
+      "vault1": "BtRJVPwtPg6nB9yY6MbT4GEHpXTWdZ3VvS2vYojj9Xc6",
+      "sqrt_t0": "28101717324248737378835",
+      "sqrt_t1": "27917324471203598119165",
+      "delta_bps_20s": 65.62,
+      "api_volume24h_usd": 291177.47850399895,
+      "api_tvl_usd": 26187.29,
+      "api_name": "WSOL/CATS",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "2m8xQTfVEYmGPnZ7vUMo3AFF2pdvFHwaF2YYUSyqm716",
+      "input_vault": "Hwue5kTRoMpi5BAr6BDASCayCmRsbbebwZhyiGpZKAzP",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 100861468001,
+      "input_vault_sol": 100.861,
+      "verdict": "REJECT (likidite 100.9 SOL < 1000 SOL)"
+    },
+    {
+      "pool_id": "Anqeks2BvoAncXjfrRqUkYymxs6DTZStBP8Ho2UoiHGN",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "DJTu7vi8norVzdVAffgvb39VP7wjKeTsgaMBJrzfxvoF",
+      "vault0": "HaFqPU7pPnoATgnxRGnCTdzh9FRRJg9p7yoxa7Yq74jC",
+      "vault1": "A9wMckUBQyz89N6msKBRz6BvD1xyLo1Qqq6ZQ6oh3kWs",
+      "sqrt_t0": "1975143548741680549",
+      "sqrt_t1": "1976369336543636092",
+      "delta_bps_20s": 6.21,
+      "api_volume24h_usd": 972294.1493963598,
+      "api_tvl_usd": 57580.84,
+      "api_name": "WSOL/DJT",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "DJTu7vi8norVzdVAffgvb39VP7wjKeTsgaMBJrzfxvoF",
+      "input_vault": "HaFqPU7pPnoATgnxRGnCTdzh9FRRJg9p7yoxa7Yq74jC",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "3zbLadZi7cn7A6SavYkKah2QzUQEGNDtwmf5o17Rx17G",
+        "freeze_authority": "2cVYpagTt7ZGc3mmTXBa7fAznUtx5DUu6aCq8uVDaf4a"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "BMtvrWbgMfBr5aka17YWefFoYrgLBRNy8cUikA3vcXSf",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "XsfCC9VL4DamVGNgdJpfLXB3sBVa158Gbx8sh7NzmTk",
+      "vault0": "FKJjTDrp8vTHptowFfz6NkZjSmkuNdFVT81h6XUmr9qU",
+      "vault1": "AunJvDXcXfLDjzTnqXffws5mYAnS6SjAr66oKmQmWLub",
+      "sqrt_t0": "41549705855909891729",
+      "sqrt_t1": "41561863252534396989",
+      "delta_bps_20s": 2.93,
+      "api_volume24h_usd": 1547068.079341087,
+      "api_tvl_usd": 82953.96,
+      "api_name": "WSOL/VIDAx",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "XsfCC9VL4DamVGNgdJpfLXB3sBVa158Gbx8sh7NzmTk",
+      "input_vault": "FKJjTDrp8vTHptowFfz6NkZjSmkuNdFVT81h6XUmr9qU",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "7pt9tkctJPK7PPNQJ77GKg8ZffSF6QxoMiCFYHxrtaCj",
+        "freeze_authority": "JDq14BWvqCRFNu1krb12bcRpbGtJZ1FLEakMw6FdxJNs"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "CYbD9RaToYMtWKA7QZyoLahnHdWq553Vm62Lh6qWtuxq",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "vault0": "GviiXg2Xc1xCpyNY36r7h1EAy7uvse5UMkiiyHjRDU6Z",
+      "vault1": "3bWPj5eepJm8CxUzk5MMFMN2CFJkntxKvbmy4zwwtpJd",
+      "sqrt_t0": "5921786736319029868",
+      "sqrt_t1": "5920161670170628097",
+      "delta_bps_20s": 2.74,
+      "api_volume24h_usd": 983414.9546595667,
+      "api_tvl_usd": 374666.07,
+      "api_name": "WSOL/USDC",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "input_vault": "GviiXg2Xc1xCpyNY36r7h1EAy7uvse5UMkiiyHjRDU6Z",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "BJE5MMbqXjVwjAF7oxwPYXnTXDyspzZyt4vwenNw5ruG",
+        "freeze_authority": "7dGbd2QZcCKcTndnHcTL8q7SMVXAkp688NTQYwrRCrar"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "vault0": "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A",
+      "vault1": "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo",
+      "sqrt_t0": "5922219909773479936",
+      "sqrt_t1": "5921058939108127134",
+      "delta_bps_20s": 1.96,
+      "api_volume24h_usd": 24815189.154398642,
+      "api_tvl_usd": 7005260.86,
+      "api_name": "WSOL/USDC",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "input_vault": "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "BJE5MMbqXjVwjAF7oxwPYXnTXDyspzZyt4vwenNw5ruG",
+        "freeze_authority": "7dGbd2QZcCKcTndnHcTL8q7SMVXAkp688NTQYwrRCrar"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+      "vault0": "A5VBGEV5ghKGSNFLpSy83ePE1BMpd2hZ8BHxFafNBNf6",
+      "vault1": "48xDcrnnENiygxTXGu9KPAuew3xRkfyrfb5iU6BNFbQK",
+      "sqrt_t0": "97020258183246962953",
+      "sqrt_t1": "97001800769528489818",
+      "delta_bps_20s": 1.9,
+      "api_volume24h_usd": 1335768.8782280795,
+      "api_tvl_usd": 442467,
+      "api_name": "WSOL/PUMP",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+      "input_vault": "A5VBGEV5ghKGSNFLpSy83ePE1BMpd2hZ8BHxFafNBNf6",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 1256439242173,
+      "input_vault_sol": 1256.439,
+      "holder_stats": null,
+      "verdict": "REJECT (supply=0)"
+    },
+    {
+      "pool_id": "SyMgvVrTUDkAUSM34oToC1cYF3zbNNAbzrLL3ifuGt4",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "EicWvteVi2fWepEzS3FYWsnuPoP6caZfjnKqNvydLjCH",
+      "vault0": "DZuEfyRnwQ1i5yifXY8Tpk8Q7PSgPM8CwhNCodEothmu",
+      "vault1": "FJpsSARZ7rS3QGYqHa1UjmrrCwCKhDAFvsqYJmV6f1n4",
+      "sqrt_t0": "28143153126267277323",
+      "sqrt_t1": "28148358631588411908",
+      "delta_bps_20s": 1.85,
+      "api_volume24h_usd": 365192.1023217551,
+      "api_tvl_usd": 51215.31,
+      "api_name": "WSOL/LIT",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "EicWvteVi2fWepEzS3FYWsnuPoP6caZfjnKqNvydLjCH",
+      "input_vault": "DZuEfyRnwQ1i5yifXY8Tpk8Q7PSgPM8CwhNCodEothmu",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "8Ea2yErngbGWTABRVbiuuAXDFtQXmR7JqZxS7zm3TEL4",
+        "freeze_authority": null
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "2ERrusBSySAXcfnEp4CBoLE4b2ZSiRVJd55Yz9im2yg4",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "3Sv4Jriwo2V7c1wturGVrrpfKc9XbGxewnDHpMLrpbWQ",
+      "vault0": "Ds3aNaMu2e9mFGtXJEWkBxKTF1FH6oegBzBvonot4zPj",
+      "vault1": "BHFDdQP4NrMDwEnrNjfjRFAZrQyWe4QdauZQTjoAvSiU",
+      "sqrt_t0": "6620342744743669689941",
+      "sqrt_t1": "6619194987207377890415",
+      "delta_bps_20s": 1.73,
+      "api_volume24h_usd": 1530667.4552857475,
+      "api_tvl_usd": 117796.42,
+      "api_name": "WSOL/INDEX",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "3Sv4Jriwo2V7c1wturGVrrpfKc9XbGxewnDHpMLrpbWQ",
+      "input_vault": "Ds3aNaMu2e9mFGtXJEWkBxKTF1FH6oegBzBvonot4zPj",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 602218567079,
+      "input_vault_sol": 602.219,
+      "verdict": "REJECT (likidite 602.2 SOL < 1000 SOL)"
+    },
+    {
+      "pool_id": "tqeNC7ANhBfJWqyLQjoFvJXrEHiknGyr5tBGV4aSs6C",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+      "vault0": "ED4cc6GWGWoWUH2n6QZvUqr6ZFkSDUZKcy7R8mSr76HT",
+      "vault1": "G8G3cKWGv7T7siYbVGMj68pdo6NRfw952J9pPEaS7qH9",
+      "sqrt_t0": "416372730831361409562",
+      "sqrt_t1": "416311974880723835103",
+      "delta_bps_20s": 1.46,
+      "api_volume24h_usd": 377873.04931890365,
+      "api_tvl_usd": 191933.77,
+      "api_name": "WSOL/STONK",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx",
+      "input_vault": "ED4cc6GWGWoWUH2n6QZvUqr6ZFkSDUZKcy7R8mSr76HT",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 99046307795,
+      "input_vault_sol": 99.046,
+      "verdict": "REJECT (likidite 99.0 SOL < 1000 SOL)"
+    },
+    {
+      "pool_id": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+      "vault0": "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC",
+      "vault1": "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX",
+      "sqrt_t0": "5921654611602188548",
+      "sqrt_t1": "5921075293815647781",
+      "delta_bps_20s": 0.98,
+      "api_volume24h_usd": 3857862.534116913,
+      "api_tvl_usd": 916955.75,
+      "api_name": "WSOL/USDT",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+      "input_vault": "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "Q6XprfkF8RQQKoQVG33xT88H7wi8Uk1B1CC7YAs69Gi",
+        "freeze_authority": "Q6XprfkF8RQQKoQVG33xT88H7wi8Uk1B1CC7YAs69Gi"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "38rXq2BuwdNcfnwydw6S2srpNK9N4gVzf39f69suPMsF",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+      "vault0": "A5kXc8xveLnoVG16X7r5jYdsTa3M5seUHT7bsATkRTfN",
+      "vault1": "7GWA9RA7AfdYYsCsX3TK8qCxVXT2mkr93d2fuFohKnUC",
+      "sqrt_t0": "4056199087801731374",
+      "sqrt_t1": "4056533946328904538",
+      "delta_bps_20s": 0.83,
+      "api_volume24h_usd": 456645.7286066398,
+      "api_tvl_usd": 63001.87,
+      "api_name": "WSOL/NVDAx",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+      "input_vault": "A5kXc8xveLnoVG16X7r5jYdsTa3M5seUHT7bsATkRTfN",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": "7pt9tkctJPK7PPNQJ77GKg8ZffSF6QxoMiCFYHxrtaCj",
+        "freeze_authority": "JDq14BWvqCRFNu1krb12bcRpbGtJZ1FLEakMw6FdxJNs"
+      },
+      "verdict": "REJECT (mint/freeze authority var)"
+    },
+    {
+      "pool_id": "CBDLuFXmYFFvyCZhHmP9ugBNwHrxkumdUBjiGcx31HJo",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "7AoBuYcGKQYadxc9wmGxpuu29bpC1EDQezkoXACWZRFF",
+      "vault0": "8XAz8JCHaVM2NXXp83yNkc4R3AHxmCimoabVVZCpGUos",
+      "vault1": "57oNhEGKqdkrZVqiQ5f2KoCn7cZjm9Fi5rziiqdsffQ6",
+      "sqrt_t0": "449498939375348366448",
+      "sqrt_t1": "449466095281721478979",
+      "delta_bps_20s": 0.73,
+      "api_volume24h_usd": 594885.6548336551,
+      "api_tvl_usd": 868792.56,
+      "api_name": "WSOL/CAPX",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "7AoBuYcGKQYadxc9wmGxpuu29bpC1EDQezkoXACWZRFF",
+      "input_vault": "8XAz8JCHaVM2NXXp83yNkc4R3AHxmCimoabVVZCpGUos",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 1763491695995,
+      "input_vault_sol": 1763.492,
+      "holder_stats": null,
+      "verdict": "REJECT (supply=0)"
+    },
+    {
+      "pool_id": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
+      "mint0": "So11111111111111111111111111111111111111112",
+      "mint1": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+      "vault0": "9Jgp8NpqEDFd5d3RQPfuRY7gMgRFByTNFmi68Ph1yvVb",
+      "vault1": "Be1CFyoPAr8aBGxpvCPD2LD21hdz2vjYNq8EcypnmgGD",
+      "sqrt_t0": "5032022978335529463",
+      "sqrt_t1": "5032091523072603091",
+      "delta_bps_20s": 0.14,
+      "api_volume24h_usd": 8518793.510068627,
+      "api_tvl_usd": 2928602.4,
+      "api_name": "WSOL/RAY",
+      "input_mint": "So11111111111111111111111111111111111111112",
+      "output_mint": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+      "input_vault": "9Jgp8NpqEDFd5d3RQPfuRY7gMgRFByTNFmi68Ph1yvVb",
+      "authority_in": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "authority_out": {
+        "mint_authority": null,
+        "freeze_authority": null
+      },
+      "input_vault_lamports": 7642136575337,
+      "input_vault_sol": 7642.137,
+      "holder_stats": null,
+      "verdict": "REJECT (supply=0)"
+    }
+  ]
+}

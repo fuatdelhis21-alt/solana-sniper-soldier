@@ -165,13 +165,13 @@ impl RiskConfig {
             Err(_) => 5_000,
         };
         let cfg = Self {
-            max_trade_size_lamports: 50_000_000,    // 0.05 SOL
-            max_slippage_bps: 200,                  // 2%
-            daily_loss_limit_lamports: 200_000_000, // 0.20 SOL hard kill
-            max_daily_trades: 5,
+            max_trade_size_lamports: 10_000_000,    // 0.01 SOL (conservative mainnet start)
+            max_slippage_bps: 50,                   // 0.5% (tight slippage protection)
+            daily_loss_limit_lamports: 50_000_000,  // 0.05 SOL hard kill (circuit breaker)
+            max_daily_trades: 3,                    // 3 trades/day max (very conservative)
             circuit_breaker_duration: Duration::from_secs(300),
             max_open_positions: 1,
-            max_total_exposure_lamports: 50_000_000, // 0.05 SOL
+            max_total_exposure_lamports: 10_000_000, // 0.01 SOL (single position max)
             price_staleness_ms,
             data_dir,
         };
@@ -824,12 +824,12 @@ mod tests {
     #[test]
     fn production_defaults_match_spec() {
         let cfg = RiskConfig::production_defaults(unique_test_dir()).unwrap();
-        assert_eq!(cfg.max_trade_size_lamports, 50_000_000);
-        assert_eq!(cfg.max_slippage_bps, 200);
-        assert_eq!(cfg.daily_loss_limit_lamports, 200_000_000);
-        assert_eq!(cfg.max_daily_trades, 5);
+        assert_eq!(cfg.max_trade_size_lamports, 10_000_000);
+        assert_eq!(cfg.max_slippage_bps, 50);
+        assert_eq!(cfg.daily_loss_limit_lamports, 50_000_000);
+        assert_eq!(cfg.max_daily_trades, 3);
         assert_eq!(cfg.max_open_positions, 1);
-        assert_eq!(cfg.max_total_exposure_lamports, 50_000_000);
+        assert_eq!(cfg.max_total_exposure_lamports, 10_000_000);
     }
 
     #[test]

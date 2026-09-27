@@ -1,0 +1,423 @@
+[
+  {
+    "name": "BONK",
+    "pool_id": "GtKKKs3yaPdHbQd2aZS4SfWhy8zQ988BJGnKNndLxYsN",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "GDnBvA76ZAJ2K3en2F1iExPZ6qz83Xjj5srXMmSKTYDW",
+    "tvl_usd": 22096.96,
+    "liq_sol": 80.747,
+    "verdict": "REJECT liq 80.7 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "ALYy1HRt3fsn1S9McLWsXCoq6Ke7bwMiwZ6QYr6HvsYS",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "CZ7SknJbChFk2q1UP9CChusqs611ueF88Va2NAP2UVe",
+    "tvl_usd": 4371.66,
+    "liq_sol": 19.726,
+    "verdict": "REJECT liq 19.7 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "BjZKz1z4UMjJPvPfKwTwjPErVBWnewnJFvcZB6minymy",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "Q7UFU9VeeTCuMVGJdp6bukcySc2LVrafhcnAM6SPG9W",
+    "tvl_usd": 1999.47,
+    "liq_sol": 4.251,
+    "verdict": "REJECT liq 4.3 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "ysq96dVZrrMVRassYB2Vr5cHFWoSQDRzQRGNmRRtr1L",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "7B9icCwrEAwJhvpYtPixagtxM3AVXDwWrZkQiE7YiGpX",
+    "tvl_usd": 1845.61,
+    "liq_sol": 6.678,
+    "verdict": "REJECT liq 6.7 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "BATrh3N5XgBCk1M119MbUigLsDLEe8zfRwY7h1CvAuRE",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "6zTqoDhFMbGYTShPdrahspWsRJ1x4PGckw6QpiqqEM2Q",
+    "tvl_usd": 3.25,
+    "liq_sol": 0.026,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "ApuoPzTjYk4k9MtJoh9EwM57Ebpy5FMdxSgVVEgqunNi",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "F2ip9DLqCXga4pZBXrwzmQ9gqjPHNVSaTLu1GQEtHezd",
+    "tvl_usd": 0.54,
+    "liq_sol": 0.005,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "B1Erv6r5AMXRmqYFHKY13V3oUzUhqBy9f5vUV5THyep5",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "6U6KCTL83uWBamLNp89J7yM5MUk5M7yty5phJHrQDD9s",
+    "tvl_usd": 0.24,
+    "liq_sol": 0.002,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "8JKFi6XVhph9Hx8AkrHNSbQeuCtgKeCsV8WwuSMNPMCm",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "CGbwQBw73P4ZJTCBWUR3uS66weriQH37GgtNMnxAk8zu",
+    "tvl_usd": 0.09,
+    "liq_sol": 0.001,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "6bH1fe3mrA6yVUEFAEF7evHGWAbVSGyJ6RQF5hWM6dUS",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "21VHfZhrbGsz3xC9W6pkSub897kkjVH8qtTtT8SuVa6K",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "9f6kCM8PsdiFtnN8MowE6YVzy5nBcueZ5pSioX6KHTUm",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "5UEwcYF1KfVMGC1vLD1D3KKdT5Xsp31vJG557RNQwLnS",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "BcaRuczQ9YkvvjthE72KZFFh8XUmfUoeEg1aZjgMdopL",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "4wMWKVs3TTLAocgHATkV68H14Deb7c1rXvL43d9bvRWf",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "CALSyhXs28EGeYbEcqy7ZoQ5WkVu6M3uagaYEpDxANyr",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "7Mz9gkvEM9Lvgi7tBsPooM2MFXqrsQkgQEms5Rkcpvqw",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "Cf8X5jikK5KNKogPb65XFqRF8mUt5Mov1z7256nQ9eAL",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "BgA3DzceK4YDXFTFmVBy9qTvcWBWcqabCUUy3UE829gp",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "CxLKmLVoAbt4odD2LWPExjLUnzjNK4saGZaSjNC52L4M",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "8XHGTD13KT7DbDKWa2vCzoRuZTzcvEDcjxeiYHd4HbGn",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "BONK",
+    "pool_id": "DC76FfF8N4ErVa1XPvaCkaibMW6reKKN372d5TkMV8SH",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "input_vault": "7bVBj6fiheNx4R5YcLoznRFUYGC1s15KyGLDA2xvQK8R",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "9n3dSLrERZQp95dHXywft7xV8D8xnGFLaUHtEhQVaXaC",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "2rMFRuYiEexJu58ugqRrdzV521yUAaF1gghXHzJ44QuT",
+    "tvl_usd": 414926.08,
+    "liq_sol": 1993.915,
+    "holders": null,
+    "verdict": "REJECT no holders"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "D2P4D7xtUAwzd8WRDaNQRcojoKKVyoWVG2PUPYscMT7p",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "DvNkTuk8qbtKxNDpeMu4q9RRvurg4TCGwgPymLDKwG39",
+    "tvl_usd": 5411.28,
+    "liq_sol": 18.342,
+    "verdict": "REJECT liq 18.3 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "bWpDAyJ8UidQoYU2rDemfoLE8pWP1p8GYKrxFrCtPbN",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "GdK8FRYE5BLuiokqXZQyRsBbKEjRFXcd24iERD2JxPn6",
+    "tvl_usd": 3276.73,
+    "liq_sol": 5.819,
+    "verdict": "REJECT liq 5.8 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "CP3J4WkKwDyDxm7uSucQfPgrKBwFe5wM4UsURscdytsX",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "4rLTXjCBEYUqop9rnZkC5zLwrTGpznNa8EWk5v1Wk7iP",
+    "tvl_usd": 7.29,
+    "liq_sol": 0.049,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "41fnNxxc7Y1BMP9AtZCvC9mgTDe476rxAPW9wA9E89Tw",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "AT17ZNoXmRd7oon4ubwKnHH8WNNyqQF7rh9fmW8FrDov",
+    "tvl_usd": 66.91,
+    "liq_sol": 0.157,
+    "verdict": "REJECT liq 0.2 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "4sgeoZsAkAkN62RWniDB7qVnGfsGWSNZEcHwfqKgFxps",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "GYUZk7drKNNPryNtuahmdykCvgek8Y3HnQR7m52YP1Uk",
+    "tvl_usd": 5.78,
+    "liq_sol": 0.025,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "9dqxCtKKpwd9XDFBuGgNRn69ZYHyeDCyYUWak5SyfeX5",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "49PFqziCWibyhNFx4PZ3Nr4Rp9V63P2mbzoAgtAtSEwr",
+    "tvl_usd": 4.19,
+    "liq_sol": 0.036,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "5SVTEaAYiegHac1ksj2S6pd6p8MjkyC3faqwSgdRqTXi",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "BZnpwjbHXcokkPkn96KVTFvnR5eyVqKmzdKDg7cgbDBK",
+    "tvl_usd": 0.03,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "6GLPSGbStfcxChv4YZ5ySupgf71bTbDrDNoeE1Mkp4VW",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "4GM9jKirqYwrzSNzjSfmggEYkG6TjExJajUX2Ngh5Lvd",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "PYTH",
+    "pool_id": "HJLdG3tLLWjXf75mNoqs19ASimaSJzmQJkC7GXkKnmyb",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "input_vault": "7bbVVx87yWCV1MEZJAJLfxN5ebfHDbmpwtNbXp9qxkZf",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "JTO",
+    "pool_id": "JVoPtWWDsRcLvQosu5fWc2CaNF6jEtJzbxdPtcEuvZo",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "input_vault": "5cerU1uk6iPzndEK8AZguamz52e75am4NRXWrL9C19Bw",
+    "tvl_usd": 132565.35,
+    "liq_sol": 769.239,
+    "verdict": "REJECT liq 769.2 SOL"
+  },
+  {
+    "name": "JTO",
+    "pool_id": "296QdpvTmcnmNwzXu3VRuFV13UMaj2LsV65sGRrUnjBv",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "input_vault": "Hx63bW2KSzQEqCjcpGEmihGyPyPGbmAuL9td76dtux5e",
+    "tvl_usd": 1082.3,
+    "liq_sol": 1.542,
+    "verdict": "REJECT liq 1.5 SOL"
+  },
+  {
+    "name": "JTO",
+    "pool_id": "DopeAY2EEX2UUqJQcvWmoA6DdMaTvfk2bL85J65QxtFF",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+    "input_vault": "CBtouz8m24bw272phmkvirRxUwxxmgqEigGTcNYFi2eX",
+    "tvl_usd": 0.06,
+    "liq_sol": 0.001,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "4mMDQ5kG9fFrBSQeedErsUoTBhY5KKnsKWGvenXRTwSy",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "CLiNLqt3pVQcFKATnC3iF1ADxZtNBpfUYC4cBmi8Eaa4",
+    "tvl_usd": 6997.17,
+    "liq_sol": 38.18,
+    "verdict": "REJECT liq 38.2 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "BuavWdfsNTfmEQbnPt2PLc51B7pifRNhqNiDUtGLeNNn",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "7pHUxpAUxPfkYad3Dwbxuoz4bDDcmtjUi3MFtmrYs1yc",
+    "tvl_usd": 2015.69,
+    "liq_sol": 1.327,
+    "verdict": "REJECT liq 1.3 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "HoXVLJZmj19XPydDmUauJfFVZVG4zEJBAz7HJcVXBWWG",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "DrXMpBjeA2mBCnx8riDEXz2AJSTMr9ZXF7AfEsiJ3YAg",
+    "tvl_usd": 3.1,
+    "liq_sol": 0.025,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "BJ3MC7VXog1Ggirq1zmzfY6VEWLgtPE9uZJfM7BvUKGe",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "FTbtjyZ4ZY9SjkMxGBQ51YFBsGSGnZ7wJTV6N7JaSVUe",
+    "tvl_usd": 0.89,
+    "liq_sol": 0.008,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "JEHJjj8c7xvrCVSacy4Dqm84RU35pWtbJzGUtbPKciFp",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "ELr2EyQuBHPpDxVfYGJSWPUzpRrZdmiD8eS2RMGmmooS",
+    "tvl_usd": 0.12,
+    "liq_sol": 0.001,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "A9adngbfj1yNG2vrcR1NvXoHbe8Tupb8Lk4gz6zks6ah",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "54xBMgpEBVdFZciDNHRJKtnXNyXAeDGyQGW7Ws5XEV8T",
+    "tvl_usd": 0.05,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "4fJE4yHkSNNvC2QcHenzW51Kpj8zj58nGawYeRQmQihA",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "E4nNHb8yeKRLYBM4BJydMQDYEn3DLp6XpgeRmJwBPK3p",
+    "tvl_usd": 0.02,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "44VYBGsN87GnaRj3bC4xyqmAUCtAavMkx4k4X8HsnMaW",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "H5FaKhqRYnjt4cViZ25Vv8pfTLUZacuj5BqGKWZsWHRN",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "CSg9TNpipf3QbV1DmpptRvro3FHunQTrvTuy44h9kD4w",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "7yoyev3Noxi5a24dbohRh4o5UGrXEoNvu1bSkBreqkY3",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "WIF",
+    "pool_id": "HFD9jYTScERGrMP8bFM2WE1m9m1rx8rNjA94RvPNojT2",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "input_vault": "3F8RE4nSNjkG61dxwCDeWCdB8kthbdCfJpc8BefmngFx",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "DRIFT",
+    "pool_id": "9p7YGLb3wSitQAEzNw6nzjTmbFPjMftibwYqWxuc3hCL",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7",
+    "input_vault": "6PGzvQaXdrSXVPm7fqKwrvTTpZm8Va986f1nTFrWGLVV",
+    "tvl_usd": 769.09,
+    "liq_sol": 1.225,
+    "verdict": "REJECT liq 1.2 SOL"
+  },
+  {
+    "name": "DRIFT",
+    "pool_id": "bj6i6Zt7yHgfE5bxN8E9UMhEnXeiAyQiTLtq8F2yq9m",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7",
+    "input_vault": "8R2X8QfPFJiY68vyTSNqkMS1xtKwEVe8oDga5WcvjaLG",
+    "tvl_usd": 0.01,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "DRIFT",
+    "pool_id": "6JXDM8QLK9c94k9CkrvzNQcZE4KREjtkCzUiqZfvapoM",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7",
+    "input_vault": "HxBftFRiPFprX86hVaEZ7gt14dJqiZR4HF3S5zwoamfX",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  },
+  {
+    "name": "DRIFT",
+    "pool_id": "H7Cy5bfjbgMEXKCcYQ8gHAANdFctAnBMJpL2ZfX73c1a",
+    "input_mint": "So11111111111111111111111111111111111111112",
+    "output_mint": "DriFtupJYLTosbwoN8koMbEYSx54aFAVLddWsbksjwg7",
+    "input_vault": "H3B8zWZi39DygeAzqnjRZKMiCtDduxnHxj8AUXRC6zZG",
+    "tvl_usd": 0,
+    "liq_sol": 0.0,
+    "verdict": "REJECT liq 0.0 SOL"
+  }
+]
