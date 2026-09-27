@@ -358,7 +358,7 @@ fn resolve_paper_market_data(
         // single holder >30% or combined top-20 >70% of supply rejects with
         // an explicit reason — never a silent no_entry_signal. Unassessable
         // data (no measurable non-excluded holders) rejects the same way.
-        match onchain_risk::holder_concentration_verdict(&stats) {
+        match onchain_risk::holder_concentration_verdict(&input_mint, &stats) {
             onchain_risk::HolderVerdict::Ok => {}
             onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
                 tracing::warn!(
@@ -1637,7 +1637,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Holder-concentration gate (operator-approved design):
                     // same 30/70 thresholds as the paper path. A breach is an
                     // explicit rejection, never a silent no_entry_signal.
-                    match onchain_risk::holder_concentration_verdict(&holder_stats) {
+                    match onchain_risk::holder_concentration_verdict(&input_mint, &holder_stats)
+                    {
                         onchain_risk::HolderVerdict::Ok => {}
                         verdict => {
                             tracing::warn!(

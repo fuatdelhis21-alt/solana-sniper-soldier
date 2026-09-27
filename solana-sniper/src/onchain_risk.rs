@@ -67,7 +67,13 @@ pub enum HolderVerdict {
 
 /// Evaluate the holder-concentration gate from stats. Fail-closed: any
 /// unassessable or concentrated distribution returns a reject verdict.
-pub fn holder_concentration_verdict(stats: &HolderStats) -> HolderVerdict {
+/// The native SOL mint is exempt: it is not an SPL mint account (no supply
+/// record, no holders in the token-account sense), so concentration is
+/// structurally unmeasurable AND not a rug vector — the gate passes.
+pub fn holder_concentration_verdict(mint: &Pubkey, stats: &HolderStats) -> HolderVerdict {
+    if *mint == solana_sdk::pubkey!("So11111111111111111111111111111111111111112") {
+        return HolderVerdict::Ok;
+    }
     if stats.sampled_holders == 0 || stats.total_supply == 0 {
         return HolderVerdict::Unassessable;
     }
@@ -101,12 +107,23 @@ pub fn fetch_vault_liquidity(rpc: &RpcClient, vault: &Pubkey) -> Result<u64, Str
 /// "holder" in the rug-risk sense).
 ///
 /// Fail-closed: any RPC error propagates. If the mint has zero supply, an
-/// error is returned rather than a division-by-zero fallback.
+/// error is returned rather than a division-by-zero fallback. The native
+/// SOL mint short-circuits to zeroed stats without any RPC call: it is not
+/// an SPL mint (getTokenSupply returns 0), and `holder_concentration_
+/// verdict` exempts it by mint id.
 pub fn fetch_holder_stats(
     rpc: &RpcClient,
     mint: &Pubkey,
     excludes: &[Pubkey],
 ) -> Result<HolderStats, String> {
+    if *mint == solana_sdk::pubkey!("So11111111111111111111111111111111111111112") {
+        return Ok(HolderStats {
+            sampled_holders: 0,
+            top_holder_pct: 0.0,
+            top20_holder_pct: 0.0,
+            total_supply: 0,
+        });
+    }
     let supply = rpc
         .get_token_supply(mint)
         .map_err(|e| format!("failed to fetch token supply for {mint}: {e}"))?;
@@ -260,6 +277,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_mint_is_exempt_from_holder_gate() {
+        let native = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+        // Zeroed stats would be Unassessable for a normal mint; the native
+        // mint must pass regardless (it is not an SPL mint — the gate does
+        // not apply).
+        let zeroed = HolderStats {
+            sampled_holders: 0,
+            top_holder_pct: 0.0,
+            top20_holder_pct: 0.0,
+            total_supply: 0,
+        };
+        assert_eq!(
+            holder_concentration_verdict(&native, &zeroed),
+            HolderVerdict::Ok
+        );
+        // Same stats on a regular mint stay fail-closed.
+        assert_eq!(
+            holder_concentration_verdict(&test_mint(), &zeroed),
+            HolderVerdict::Unassessable
+        );
+    }
+
+    #[test]
     fn load_blocklist_missing_file_is_empty() {
         let set = load_blocklist(Path::new("/nonexistent/path/blocklist.txt")).unwrap();
         assert!(set.is_empty());
@@ -329,6 +369,11 @@ mod tests {
 
 // ── Holder-concentration gate (operator-approved design) ──
 
+/// A stand-in SPL mint for gate tests (any non-native pubkey works).
+fn test_mint() -> Pubkey {
+    Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap()
+}
+
 fn entry(addr: u8, amount: u64) -> (String, u64) {
     // Deterministic pseudo-pubkey from a single byte.
     let mut pk = [0u8; 32];
@@ -362,7 +407,7 @@ fn concentration_gate_accepts_under_both_thresholds() {
         es.push(entry(i, 10));
     }
     let stats = compute_holder_stats(1_000, &es, &[]).unwrap();
-    assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
+    assert_eq!(holder_concentration_verdict(&test_mint(), &stats), HolderVerdict::Ok);
 }
 
 #[test]
@@ -372,7 +417,7 @@ fn concentration_gate_rejects_single_holder_over_30pct() {
     let stats =
         compute_holder_stats(1_000, &[entry(1, 400), entry(2, 100), entry(3, 100)], &[]).unwrap();
     assert_eq!(
-        holder_concentration_verdict(&stats),
+        holder_concentration_verdict(&test_mint(), &stats),
         HolderVerdict::SingleHolderConcentrated(40.0)
     );
 }
@@ -388,7 +433,7 @@ fn concentration_gate_rejects_top20_over_70pct_even_if_single_under_30() {
     assert_eq!(stats.sampled_holders, 19);
     assert_eq!(stats.top20_holder_pct, 76.0);
     assert!(matches!(
-        holder_concentration_verdict(&stats),
+        holder_concentration_verdict(&test_mint(), &stats),
         HolderVerdict::TopHoldersConcentrated(76.0)
     ));
 }
@@ -400,7 +445,7 @@ fn concentration_gate_boundaries_are_inclusive_pass() {
         compute_holder_stats(1_000, &[entry(1, 300), entry(2, 250), entry(3, 150)], &[]).unwrap();
     assert_eq!(stats.top_holder_pct, 30.0);
     assert_eq!(stats.top20_holder_pct, 70.0);
-    assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
+    assert_eq!(holder_concentration_verdict(&test_mint(), &stats), HolderVerdict::Ok);
 }
 
 #[test]
@@ -413,7 +458,7 @@ fn concentration_gate_unassessable_fails_closed() {
     let stats = compute_holder_stats(1_000, &[entry(7, 1_000)], &[vault]).unwrap();
     assert_eq!(stats.sampled_holders, 0);
     assert_eq!(
-        holder_concentration_verdict(&stats),
+        holder_concentration_verdict(&test_mint(), &stats),
         HolderVerdict::Unassessable
     );
     // Zero-supply guard also fails closed (compute never sees 0, but the
@@ -425,7 +470,7 @@ fn concentration_gate_unassessable_fails_closed() {
         total_supply: 0,
     };
     assert_eq!(
-        holder_concentration_verdict(&stats),
+        holder_concentration_verdict(&test_mint(), &stats),
         HolderVerdict::Unassessable
     );
 }
