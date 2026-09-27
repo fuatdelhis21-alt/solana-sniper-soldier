@@ -242,7 +242,48 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
         blockhash: Hash,
     ) -> Result<Transaction, Box<dyn std::error::Error>> {
         let swap_ix = self.build_swap_instruction(intent, signer)?;
-        let message = Message::new(&[swap_ix], Some(signer));
+
+        // Preamble (mirrors devnet_swap_test): a fresh wallet has no token
+        // accounts, so a swap-only transaction fails simulation with an
+        // account-not-found error on every iteration. Ensure both user ATAs
+        // exist (idempotent create), and if the input mint is native SOL,
+        // wrap the exact swap amount into the input (wSOL) ATA before the
+        // swap instruction runs.
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)
+            .map_err(|e| format!("invalid token program id: {e}"))?;
+        let input_mint = Pubkey::from_str(&intent.quote.input_mint)
+            .map_err(|e| format!("invalid input mint '{}': {e}", intent.quote.input_mint))?;
+        let output_mint = Pubkey::from_str(&intent.quote.output_mint)
+            .map_err(|e| format!("invalid output mint '{}': {e}", intent.quote.output_mint))?;
+        let mut ixs = Vec::with_capacity(5);
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                signer, signer, &input_mint, &token_program,
+            ),
+        );
+        ixs.push(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                signer, signer, &output_mint, &token_program,
+            ),
+        );
+        if input_mint == spl_token::native_mint::ID {
+            let accounts = self
+                .accounts
+                .as_ref()
+                .ok_or("swap accounts not set — call with_swap_accounts first")?;
+            ixs.push(solana_sdk::system_instruction::transfer(
+                signer,
+                &accounts.input_token_account,
+                intent.quote.input_amount,
+            ));
+            ixs.push(
+                spl_token::instruction::sync_native(&token_program, &accounts.input_token_account)
+                    .map_err(|e| format!("failed to build sync_native instruction: {e}"))?,
+            );
+        }
+        ixs.push(swap_ix);
+
+        let message = Message::new(&ixs, Some(signer));
         let mut tx = Transaction::new_unsigned(message);
         tx.message.recent_blockhash = blockhash;
         Ok(tx)
@@ -447,8 +488,8 @@ mod tests {
         let blockhash = Hash::new_unique();
         let quote = Quote {
             pool_id: "pool_test".into(),
-            input_mint: "SOL".into(),
-            output_mint: "USDC".into(),
+            input_mint: "So11111111111111111111111111111111111111112".into(),
+            output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             input_amount: 1_000,
             expected_output: 999,
             slippage_bps: 100,
@@ -458,6 +499,9 @@ mod tests {
             .build_transaction(&intent, &signer, blockhash)
             .unwrap();
         assert_eq!(tx.message.recent_blockhash, blockhash);
+        // Preamble: create-ATA(input) + create-ATA(output) + native wrap
+        // (transfer + sync_native) + the swap instruction itself.
+        assert_eq!(tx.message.instructions.len(), 5);
         // Unsigned: the fee-payer signature slot is a default (all-zero) placeholder.
         assert_eq!(tx.signatures.len(), 1);
         assert_eq!(
