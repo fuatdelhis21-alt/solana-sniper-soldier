@@ -107,9 +107,9 @@ struct PaperSimulator {
 }
 
 impl PaperSimulator {
-    fn new() -> Self {
+    fn new(strategy_cfg: strategy::StrategyConfig) -> Self {
         Self {
-            strategy: strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default()),
+            strategy: strategy::SimpleSnipeStrategy::new(strategy_cfg),
             position: None,
             entries: 0,
             exits_stop_loss: 0,
@@ -761,6 +761,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         strategy::StrategyConfig::default().max_trade_size_lamports,
         risk_cfg.max_trade_size_lamports,
     )?;
+    // Slippage mirror of the position-size invariant above: the strategy's
+    // EntrySignal slippage feeds the SAME pre_trade_check, which rejects any
+    // trade whose slippage_bps exceeds the risk cap. Align the strategy
+    // config with the risk cap at the source so both the paper and live
+    // entry paths produce signals the risk gate accepts.
+    let mut strategy_cfg = strategy::StrategyConfig::default();
+    strategy_cfg.max_slippage_bps = risk_cfg.max_slippage_bps;
     let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg.clone()));
     tracing::info!(
         target: "main",
@@ -860,7 +867,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paper-only accumulators (AŞAMA 3/4): real RPC-fetch and strategy timings
     // plus data-error counts. A paper iteration with a data error is neither a
     // trade nor a success — it is rejected with its real reason.
-    let mut paper_sim = PaperSimulator::new();
+    let mut paper_sim = PaperSimulator::new(strategy_cfg.clone());
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -1696,7 +1703,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Strategy gate: evaluate the token candidate. If the strategy
             // rejects it (fail-closed), no trade is built or sent this
             // iteration. This wires SimpleSnipeStrategy into the live path.
-            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            let strategy =
+                strategy::SimpleSnipeStrategy::new(strategy_cfg.clone());
             let candidate = strategy::TokenCandidate {
                 liquidity_lamports: live_liquidity.unwrap_or(args.pool_liquidity),
                 market_cap_lamports: args.pool_market_cap,
@@ -2333,7 +2341,7 @@ mod tests {
 
     #[test]
     fn paper_simulator_never_counts_unconfirmed_iterations() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         assert!(!sim.has_open_position());
         let cand = rejected_candidate();
         // No open position + rejected candidate => no entry signal.
@@ -2356,7 +2364,7 @@ mod tests {
 
     #[test]
     fn paper_simulator_exits_update_pnl_once_and_clear_position() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let cand = rejected_candidate();
 
         sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
@@ -2412,7 +2420,7 @@ mod tests {
 
         // A qualifying candidate yields EntryPending, but without
         // confirm_entry nothing is ever counted as simulated success.
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let cand = strategy::TokenCandidate {
             liquidity_lamports: 2_000_000_000_000,
             market_cap_lamports: 0,
@@ -2455,7 +2463,7 @@ mod tests {
 
     #[test]
     fn exit_path_stop_loss_at_6pct_closes_negative_pnl_once() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let entry_sqrt = 1_000_000_000u128;
         sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000)); // 1 SOL notional
         let current_sqrt = (entry_sqrt as f64 * 0.94f64.sqrt()) as u128; // -6%
@@ -2486,7 +2494,7 @@ mod tests {
 
     #[test]
     fn exit_path_take_profit_at_11pct_closes_positive_pnl_once() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let entry_sqrt = 1_000_000_000u128;
         sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000));
         let current_sqrt = (entry_sqrt as f64 * 1.11f64.sqrt()) as u128; // +11%
@@ -2504,7 +2512,7 @@ mod tests {
 
     #[test]
     fn exit_path_below_thresholds_holds_at_4p9_and_9p9() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let entry_sqrt = 1_000_000_000u128;
         sim.confirm_entry(entry_sqrt, entry_at(1_000_000_000));
         // -4.9% (490 bps < 500 SL): hold, position stays open, no P&L.
@@ -2523,7 +2531,7 @@ mod tests {
 
     #[test]
     fn exit_path_reentry_allowed_after_close_with_full_state_reset() {
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let entry_sqrt = 1_000_000_000u128;
         sim.confirm_entry(entry_sqrt, entry_at(500_000_000));
         let down = (entry_sqrt as f64 * 0.94f64.sqrt()) as u128; // -6% SL
@@ -2579,7 +2587,7 @@ mod tests {
         // pnl. The audit trail must be re-verifiable offline: those two
         // fields + current_sqrt must reproduce the recorded pnl exactly via
         // the same quote formula the exit path used.
-        let mut sim = PaperSimulator::new();
+        let mut sim = PaperSimulator::new(strategy::StrategyConfig::default());
         let entry_sqrt = 1_000_000_000u128;
         let size = 750_000_000u64;
         assert_eq!(sim.open_position(), None);
