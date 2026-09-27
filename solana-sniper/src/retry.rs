@@ -80,11 +80,11 @@ pub fn send_with_retry(
             Err(e) => {
                 attempt += 1;
                 if attempt >= max_retries {
-                    error!("send failed after {max_retries} retries: {e:#}");
+                    error!(error_debug = ?e, "send failed after {max_retries} retries: {e:#}");
                     return Err(Box::new(e));
                 }
                 let delay = Duration::from_millis(200 * 2u64.pow(attempt));
-                warn!("send attempt {attempt} failed: {e:#}; retrying in {delay:?}");
+                warn!(error_debug = ?e, "send attempt {attempt} failed: {e:#}; retrying in {delay:?}");
                 std::thread::sleep(delay);
             }
         }
