@@ -208,7 +208,7 @@ fn main() -> Result<()> {
             "resolved pool state and swap accounts"
         );
 
-        let adapter = RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+        let mut adapter = RaydiumV4ClmmAdapter::new(pool_id_str.clone())
             .with_swap_accounts(accounts)
             .with_resolved_pool(pool)
             .with_program_id(program_id.to_string());
