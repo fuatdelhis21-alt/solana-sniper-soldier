@@ -33,8 +33,9 @@ pub struct StrategyConfig {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            // 1000 SOL liquidity floor (conservative for devnet testing).
-            min_liquidity_lamports: 1_000_000_000_000,
+            // 10 SOL liquidity floor (mainnet-realistic for new tokens).
+            // Devnet testing used 1000 SOL; mainnet has much more fragmentation.
+            min_liquidity_lamports: 10_000_000_000,
             // 0.01 SOL max position per trade — deliberately BELOW the
             // production risk cap (0.05 SOL, risk::RiskConfig::
             // production_defaults). Invariant:
@@ -50,8 +51,9 @@ impl Default for StrategyConfig {
             take_profit_bps: 1_000,
             // 20 trades/day cap.
             max_daily_trades: 20,
-            // 1M SOL market cap ceiling.
-            max_market_cap_lamports: 1_000_000_000_000_000,
+            // 100M SOL market cap ceiling (realistic for new tokens).
+            // Prevents trading already-pumped tokens but allows legitimate new launches.
+            max_market_cap_lamports: 100_000_000_000_000,
             // NOTE: no `min_holders` — `getTokenLargestAccounts` returns at
             // most 20 accounts per the SPL JSON-RPC standard, so an absolute
             // holder count is structurally unmeasurable. Rug-risk is gated
