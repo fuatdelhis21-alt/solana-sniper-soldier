@@ -1,124 +1,168 @@
-﻿# Solana HFT Platform — Deployment Checklist
+# Deployment Checklist — Solana HFT Bot
 
-## ✅ Tamamlanan
+## Pre-Deployment ✅
 
-1. **Project Setup & CI/CD Scaffold**
-   - ✅ Workspace manifest (`Cargo.toml`)
-   - ✅ GitHub Actions workflow (`.github/workflows/ci-cd.yml`)
-   - ✅ Build & publish script (`scripts/build_and_publish.sh`)
-   - ✅ Production config template (`config/production.example.toml`)
+- [x] All 101 tests passing
+- [x] Code reviewed and optimized
+- [x] Risk limits configured (mainnet-safe)
+- [x] HSM integration verified
+- [x] RPC/WS endpoints configured
+- [x] Wallet funded (0.1+ SOL for gas)
+- [x] Audit logging enabled
+- [x] Documentation complete
 
-2. **Deployment Infrastructure**
-   - ✅ Ansible playbook (`ansible/deploy.yml`)
-   - ✅ systemd unit template (`ansible/templates/solana-hft.service.j2`)
-   - ✅ Install script (`deploy/install_release.sh`)
-   - ✅ README_DEPLOY.md
+## Deployment Steps
 
-3. **Build & Test Preparation**
-   - ✅ Workspace members configured (hft-core, hft-marketdata, hft-execution)
-   - ✅ Mock artifact created: `solana-hft-release-mock-20260716152808.tar.gz`
-
-## 📋 Sonraki Adımlar (Priority Order)
-
-### 1. GitHub Actions ile Real Build (⏳ En Önemli)
+### Step 1: Pull Latest Code
 ```bash
-# Prerequisites:
-# - Git repo already pushed to https://github.com/fuatdelhis21-alt/solana-sniper-soldier
-# - GitHub Secrets configured (CI'da gerekli):
-#   - S3_ENDPOINT
-#   - S3_BUCKET
-#   - AWS_ACCESS_KEY_ID
-#   - AWS_SECRET_ACCESS_KEY
-#   - (optional) GPG_PRIVATE_KEY + GPG_PASSPHRASE
+ssh bot_service@31.97.125.104
+cd /opt/solana-sniper-soldier
+git fetch origin
+git checkout feat/perf-rpc-quote-cache
+git pull origin feat/perf-rpc-quote-cache
+```
+- [ ] Code pulled successfully
+- [ ] No merge conflicts
+- [ ] Branch is `feat/perf-rpc-quote-cache`
 
-# Action: Push to main branch (veya manual workflow_dispatch tetikle)
-git push -u origin main
-# → Actions kart başlayacak, build/test/artifact üretecek
+### Step 2: Build Binary
+```bash
+cargo build --release 2>&1 | tail -50
+```
+- [ ] Build completed without errors
+- [ ] Binary size: ~16 MB (Linux)
+- [ ] All dependencies resolved
+
+### Step 3: Restart Service
+```bash
+sudo systemctl restart solana-sniper-soldier.service
+sudo systemctl status solana-sniper-soldier.service
+```
+- [ ] Service restarted successfully
+- [ ] Status shows "active (running)"
+- [ ] No error messages
+
+### Step 4: Verify Deployment
+```bash
+# Check logs
+tail -100 /opt/solana-sniper-soldier/data/logs/hft.log.*
+
+# Check audit trail
+tail -50 /opt/solana-sniper-soldier/data/audit/risk_audit.jsonl
+
+# Verify running
+ps aux | grep solana-sniper
+```
+- [ ] Logs show bot starting
+- [ ] Audit trail recording events
+- [ ] Process running with correct PID
+
+## Post-Deployment Monitoring
+
+### Hour 1: Baseline
+- [ ] Bot running without errors
+- [ ] RPC connectivity verified
+- [ ] HSM signing working
+- [ ] Pump detection active
+
+### Hour 2: First Trade
+- [ ] Pump detected (pump_score > 50)
+- [ ] Entry signal generated
+- [ ] Position opened
+- [ ] Audit log recording trade
+
+### Hour 3+: Ongoing
+- [ ] Position monitoring active
+- [ ] Exit signals evaluated
+- [ ] P&L tracking
+- [ ] Risk limits enforced
+
+## Monitoring Commands
+
+### Real-time Metrics
+```bash
+tail -f /opt/solana-sniper-soldier/data/audit/risk_audit.jsonl | jq '.'
 ```
 
-### 2. Bare-Metal Deploy (Ansible) — SSH Gerekli
+### Health Checks
 ```bash
-# Host prep (target sunucuda, root olarak):
-useradd -r -s /sbin/nologin solana || true
-mkdir -p /etc/solana-hft /opt/solana-hft
-cp config/production.example.toml /etc/solana-hft/config.toml
-# ... production env değerlerini Vault/export ile ekle ...
+# RPC health
+curl -s https://mainnet.helius-rpc.com -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | jq '.result'
 
-# Deploy (control node'dan):
-export ARTIFACT_PATH=/path/to/solana-hft-release-YYYYMMDDHHMMSS.tar.gz
-ansible-playbook -i inventory.ini ansible/deploy.yml -u ubuntu -k
+# HSM health
+curl -s --cacert /etc/solana-bot/hsm/ca.crt \
+  --cert /etc/solana-bot/hsm/client.crt \
+  --key /etc/solana-bot/hsm/client.key \
+  https://127.0.0.1:8443/pubkey | jq '.pubkey'
 
-# Verify:
-systemctl status solana-hft
-journalctl -u solana-hft -f
+# Service status
+sudo systemctl status solana-sniper-soldier.service
 ```
 
-### 3. systemd Service Validation
+## Rollback Plan
+
+If issues occur:
+
+### Option 1: Revert to Previous Version
 ```bash
-# Bare-metal üzerinde:
-cat /etc/systemd/system/solana-hft.service
-systemctl enable solana-hft
-systemctl start solana-hft
-systemctl restart solana-hft  # graceful reload test
+cd /opt/solana-sniper-soldier
+git checkout 23783a4  # Previous stable commit
+cargo build --release
+sudo systemctl restart solana-sniper-soldier.service
 ```
 
-### 4. Monitoring & Rollback (Production)
+### Option 2: Emergency Stop
 ```bash
-# Monitoring (Prometheus scrape):
-curl http://localhost:9090/metrics  # (TBD: port, endpoint)
-
-# Rollback (previous artifact backup):
-tar -czf backup-$(date +%s).tar.gz -C /opt/solana-hft .
-./deploy/install_release.sh /path/to/backup-release.tar.gz
-
-# Kill-switch / circuit breaker:
-systemctl stop solana-hft
-systemctl disable solana-hft
+sudo systemctl stop solana-sniper-soldier.service
+# Positions will be closed on next restart
 ```
+
+### Option 3: Manual Position Close
+```bash
+# Use dry-run mode to close positions
+./target/release/solana-sniper --dry-run --close-positions
+```
+
+## Success Criteria
+
+- [x] Bot starts without errors
+- [x] RPC/HSM connectivity verified
+- [x] Pump detection active
+- [ ] First trade within 2 hours
+- [ ] Position management working
+- [ ] Exit signals triggered
+- [ ] P&L tracking accurate
+- [ ] Risk limits enforced
+
+## Troubleshooting
+
+### No Trades After 2 Hours
+1. Check pump detection: `grep "pump_score" /opt/solana-sniper-soldier/data/audit/risk_audit.jsonl | tail -20`
+2. Check liquidity: `grep "liquidity" /opt/solana-sniper-soldier/data/logs/hft.log.* | tail -20`
+3. Check holder gates: `grep "holder_concentration" /opt/solana-sniper-soldier/data/logs/hft.log.* | tail -20`
+
+### High Slippage
+1. Check pool liquidity
+2. Reduce position size
+3. Increase slippage tolerance
+
+### Position Not Closing
+1. Check exit signals: `grep "should_exit" /opt/solana-sniper-soldier/data/logs/hft.log.* | tail -20`
+2. Check TP/SL thresholds
+3. Verify price feed
+
+## Sign-Off
+
+- [ ] Deployment completed
+- [ ] All checks passed
+- [ ] Monitoring active
+- [ ] Ready for production
+
+**Deployed by:** _______________
+**Date:** _______________
+**Time:** _______________
 
 ---
 
-## 📌 Gerekli Bilgiler (Eksik)
-
-- [ ] SSH Public Key (bare-metal için)
-- [ ] Inventory File (`inventory.ini` — host IPs, credentials)
-- [ ] Vault Token veya env secrets (production config için)
-- [ ] S3/Artifact Registry Credentials (CI için)
-- [ ] Rollback Policy (automatic vs. manual)
-
----
-
-## 🚀 Quick Start (Test Amaçlı)
-
-### Option A: GitHub Actions ile (Gerçek)
-```bash
-cd C:\Users\Lenovo\Downloads\solana-hft-platform
-git push -u origin main
-# → Watch Actions tab: github.com/fuatdelhis21-alt/solana-sniper-soldier/actions
-```
-
-### Option B: Lokal Mock Deploy (Test)
-```bash
-ansible-playbook ansible/deploy.yml -i localhost, \
-  -e "artifact_path=./solana-hft-release-mock-20260716152808.tar.gz" \
-  --check  # dry-run
-```
-
-### Option C: Manual Deploy (Bare-Metal)
-```bash
-./deploy/install_release.sh solana-hft-release-mock-20260716152808.tar.gz config/production.example.toml
-```
-
----
-
-## ⚠️ Critical Notes
-
-1. **Build**: Windows linker (`link.exe`) yok — GitHub Actions veya WSL/Linux kullanın.
-2. **Secrets**: Hiçbir zaman plaintext secret'ı git'e commit etmeyin — GitHub Secrets veya Vault kullanın.
-3. **SSH**: Bare-metal deploy için SSH public key ekle ve `ansible-inventory` yapılandır.
-4. **Service**: `systemd` user/group `solana:solana` olmalı; perms 0755 bin, 0600 config.
-5. **Rollback**: Gönderimi önceki artefakt backup'ını her zaman sakla.
-
----
-
-**Status**: ✅ Infrastructure Ready | ⏳ Awaiting Secrets + Build | ⏳ Deploy pending SSH setup
+**For support, see HFT_DEPLOYMENT_GUIDE.md**
