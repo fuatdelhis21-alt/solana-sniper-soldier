@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn quote_fails_closed_without_resolved_pool() {
-        let adapter = sample_adapter();
+        let mut adapter = sample_adapter();
         assert!(adapter.quote(1_000_000, 100).is_err());
     }
 
@@ -279,7 +279,8 @@ mod tests {
         data[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
         let pool_id = Pubkey::new_unique();
         let pool = RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).unwrap();
-        let adapter = sample_adapter().with_resolved_pool(pool);
+        
+        let mut adapter = sample_adapter().with_resolved_pool(pool);
         let quote = adapter.quote(1_000_000, 100).unwrap();
         // price=1.0, fee 0.05% => output slightly below input.
         assert!(quote.expected_output < 1_000_000);
