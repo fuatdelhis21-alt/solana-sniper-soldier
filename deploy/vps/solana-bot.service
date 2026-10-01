@@ -1,0 +1,23 @@
+[Unit]
+Description=Solana HFT trading bot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/solana-bot/ARM_LIVE
+
+[Service]
+Type=simple
+User=bot_service
+Group=bot_service
+WorkingDirectory=/opt/solana-bot
+ExecStart=/opt/solana-bot/run_bot.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/solana-bot/data /opt/solana-bot/logs
+EnvironmentFile=/etc/solana-bot.env
+
+[Install]
+WantedBy=multi-user.target

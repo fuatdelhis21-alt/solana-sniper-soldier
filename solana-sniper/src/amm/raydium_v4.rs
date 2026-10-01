@@ -45,11 +45,13 @@ pub struct SwapAccounts {
 }
 
 /// Adapter for Raydium V4 CLMM pools.
+#[derive(Clone)]
 pub struct RaydiumV4ClmmAdapter {
     pool_id: String,
     program_id: String,
     accounts: Option<SwapAccounts>,
     pool: Option<ResolvedPool>,
+    last_quote: Option<(u64, Quote)>,
 }
 
 impl RaydiumV4ClmmAdapter {
@@ -59,6 +61,7 @@ impl RaydiumV4ClmmAdapter {
             program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
             accounts: None,
             pool: None,
+            last_quote: None,
         }
     }
 
@@ -78,6 +81,7 @@ impl RaydiumV4ClmmAdapter {
     /// Attach a resolved pool state so `quote` uses the real on-chain price.
     pub fn with_resolved_pool(mut self, pool: ResolvedPool) -> Self {
         self.pool = Some(pool);
+        self.last_quote = None;
         self
     }
 
@@ -170,28 +174,32 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
     }
 
     fn quote(
-        &self,
+        &mut self,
         input_amount: u64,
         slippage_bps: u64,
     ) -> Result<Quote, Box<dyn std::error::Error>> {
-        // Real quote computation using the resolved pool's on-chain sqrt_price.
-        // If no pool is attached, fail closed rather than quote a fabricated price.
+        if let Some((cached_amount, cached_quote)) = &self.last_quote {
+            if *cached_amount == input_amount && cached_quote.slippage_bps == slippage_bps {
+                return Ok(cached_quote.clone());
+            }
+        }
         let pool = self
             .pool
             .as_ref()
             .ok_or("no resolved pool attached — call with_resolved_pool before quote")?;
         let sqrt_price = pool.sqrt_price_x64;
-        // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
         let fee_rate = 500u64;
         let expected_output = Self::compute_output_amount(input_amount, sqrt_price, fee_rate);
-        Ok(Quote {
+        let quote = Quote {
             pool_id: self.pool_id.clone(),
             input_mint: pool.token_mint_0.to_string(),
             output_mint: pool.token_mint_1.to_string(),
             input_amount,
             expected_output,
             slippage_bps,
-        })
+        };
+        self.last_quote = Some((input_amount, quote.clone()));
+        Ok(quote)
     }
 
     fn build_intent(&self, quote: Quote) -> Result<TradeIntent, Box<dyn std::error::Error>> {

@@ -1590,7 +1590,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
                 // Build the transaction: a real AMM swap when a pool is
                 // configured, otherwise the safe self-transfer test path.
-                let mut tx = if let Some(adapter) = &swap_adapter {
+                let mut tx = if let Some(mut adapter) = swap_adapter.clone() {
                     // Real swap: quote from the resolved on-chain price, apply
                     // slippage (min_amount_out), and build the CLMM swap tx.
                     let quote = adapter

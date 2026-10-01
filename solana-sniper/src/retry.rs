@@ -24,7 +24,7 @@ impl BlockhashManager {
         Self {
             rpc,
             cached_blockhash: None,
-            refresh_interval: Duration::from_secs(30),
+            refresh_interval: Duration::from_secs(10),
         }
     }
 
@@ -62,7 +62,7 @@ pub fn send_with_retry(
     rpc: &RpcClient,
     tx: &Transaction,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
-    let max_retries: u32 = 3;
+    let max_retries: u32 = 5;
     let mut attempt = 0u32;
     loop {
         match rpc.send_transaction(tx) {
@@ -83,7 +83,7 @@ pub fn send_with_retry(
                     error!("send failed after {max_retries} retries: {e:#}");
                     return Err(Box::new(e));
                 }
-                let delay = Duration::from_millis(200 * 2u64.pow(attempt));
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
                 warn!("send attempt {attempt} failed: {e:#}; retrying in {delay:?}");
                 std::thread::sleep(delay);
             }
@@ -94,7 +94,7 @@ pub fn send_with_retry(
 /// Poll `getSignatureStatuses` until the transaction reaches `confirmed`
 /// commitment, or the retry budget is exhausted.
 fn confirm_transaction(rpc: &RpcClient, sig: &Signature) -> Result<(), Box<dyn std::error::Error>> {
-    let max_confirm_retries: u32 = 10;
+    let max_confirm_retries: u32 = 15;
     for attempt in 0..max_confirm_retries {
         let statuses = rpc.get_signature_statuses(&[*sig])?;
         if let Some(Some(status)) = statuses.value.first() {
@@ -110,7 +110,8 @@ fn confirm_transaction(rpc: &RpcClient, sig: &Signature) -> Result<(), Box<dyn s
                 return Ok(());
             }
         }
-        std::thread::sleep(Duration::from_millis(300));
+        let delay = Duration::from_millis(150 + (attempt as u64 * 50));
+        std::thread::sleep(delay);
     }
     Err(format!("transaction {sig} not confirmed after {max_confirm_retries} polls").into())
 }

@@ -32,7 +32,7 @@ pub struct TradeIntent {
 pub trait AmmAdapter: Send + Sync {
     fn protocol_name(&self) -> &'static str;
     fn quote(
-        &self,
+        &mut self,
         input_amount: u64,
         slippage_bps: u64,
     ) -> Result<Quote, Box<dyn std::error::Error>>;

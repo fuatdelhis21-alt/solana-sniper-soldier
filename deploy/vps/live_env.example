@@ -1,0 +1,22 @@
+RPC_URL=https://api.mainnet-beta.solana.com
+WS_URL=wss://api.mainnet-beta.solana.com
+HSM_ENDPOINT=https://127.0.0.1:8443
+HSM_CA=/etc/solana-bot/hsm/ca.pem
+HSM_CLIENT_IDENTITY=/etc/solana-bot/hsm/client_all.pem
+POOL_ID=3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv
+INPUT_MINT=So11111111111111111111111111111111111111112
+OUTPUT_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+EXPECTED_WALLET_PUBKEY=Ci7doqZXLxVbmNkuyLR5yZgcau5vHWZPUZxV7z6bzUfn
+DATA_DIR=/opt/solana-bot/data
+LOG_DIR=/opt/solana-bot/logs
+MAX_POSITION_SOL=0.01
+MAX_DAILY_LOSS_SOL=0.05
+MAX_DAILY_TRADES=5
+MAX_SLIPPAGE_BPS=50
+ARM_LIVE=/opt/solana-bot/ARM_LIVE
+LIVE_TRADING_ENABLED=false
+LIVE_TRADING_CONFIRMED=false
+
+# Required for bot service user
+# File ownership is root:bot_service with mode 0640 so systemd and the launcher can read it.
+# The service runs under bot_service, not root.
