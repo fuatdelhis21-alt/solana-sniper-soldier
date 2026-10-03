@@ -3,7 +3,7 @@
 //! Implements `AmmAdapter` for Raydium's Concentrated Liquidity Market Maker (CLMM).
 //!
 //! ## Program ID
-//! Mainnet: `CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3`
+//! Mainnet: `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`
 
 use crate::amm::account_resolver::ResolvedPool;
 use crate::amm::{AmmAdapter, Quote, TradeIntent};
@@ -16,7 +16,7 @@ use solana_sdk::transaction::Transaction;
 use std::str::FromStr;
 
 /// Raydium CLMM mainnet program ID.
-pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3";
+pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 /// SPL Token program ID.
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
