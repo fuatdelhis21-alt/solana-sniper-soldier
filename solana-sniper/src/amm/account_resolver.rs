@@ -83,6 +83,10 @@ impl ResolvedPool {
     /// The tick-array start index for the current tick.
     pub fn tick_array_start_index(&self) -> i32 {
         let ticks_in_array = TICK_ARRAY_SIZE * i32::from(self.tick_spacing);
+        // Prevent division by zero if tick_spacing is 0
+        if ticks_in_array == 0 {
+            return 0;
+        }
         // Floor division (not truncation) — required for negative ticks, since
         // Rust's `/` truncates toward zero and Raydium's on-chain program
         // expects the mathematical floor of tick_current / ticks_in_array.
