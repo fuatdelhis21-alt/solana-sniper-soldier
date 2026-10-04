@@ -325,7 +325,7 @@ fn main() {
         loop {
             let msg = match receiver.recv_timeout(Duration::from_secs(5)) {
                 Ok(m) => m,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                     reap_finished(&mut children);
                     if daily_state.date != today_str() {
                         daily_state = DailyState {
@@ -336,7 +336,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     tracing::warn!("logsSubscribe channel disconnected — reconnecting");
                     break;
                 }

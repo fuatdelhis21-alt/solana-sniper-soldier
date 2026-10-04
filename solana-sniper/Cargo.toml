@@ -23,6 +23,7 @@ tokio.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 chrono.workspace = true
+crossbeam.workspace = true
 hex.workspace = true
 bincode.workspace = true
 tracing-appender.workspace = true
