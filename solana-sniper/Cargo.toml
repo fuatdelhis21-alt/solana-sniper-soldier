@@ -33,6 +33,7 @@ solana-client.workspace = true
 solana-program.workspace = true
 solana-rpc-client.workspace = true
 solana-rpc-client-api.workspace = true
+solana-pubsub-client.workspace = true
 solana-signature.workspace = true
 solana-pubkey.workspace = true
 solana-commitment-config.workspace = true
@@ -64,3 +65,7 @@ path = "src/bin/ledger_sign_test.rs"
 [[bin]]
 name = "devnet_swap_test"
 path = "src/bin/devnet_swap_test.rs"
+
+[[bin]]
+name = "solana-sniper-discovery"
+path = "src/bin/discovery.rs"
