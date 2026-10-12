@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::time::sleep;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use solana_commitment_config::CommitmentConfig;
@@ -338,8 +339,10 @@ fn resolve_paper_market_data(
             })?;
         // Exclude the pool's own vaults (infrastructure accounts resolved by
         // resolve_swap_accounts) so the pool never counts as a "holder".
+        // Holder risk is measured on the token being BOUGHT (output mint),
+        // never on the pay-side mint (wSOL has no meaningful holder set).
         let vaults = [accounts.input_vault, accounts.output_vault];
-        let stats = onchain_risk::fetch_holder_stats(rpc_client, &input_mint, &vaults)
+        let stats = onchain_risk::fetch_holder_stats(rpc_client, &output_mint, &vaults)
             .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
         // Holder-concentration gate (operator-approved design, fail-closed):
         // single holder >30% or combined top-20 >70% of supply rejects with
@@ -350,7 +353,7 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     top_holder_pct = pct,
                     threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
                     "holder concentration gate: single holder exceeds threshold"
@@ -362,7 +365,7 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::TopHoldersConcentrated(pct) => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     top20_holder_pct = pct,
                     threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
                     "holder concentration gate: top-20 holders exceed threshold"
@@ -374,7 +377,7 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::Unassessable => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     "holder concentration gate: no measurable holders (fail-closed reject)"
                 );
                 return Err(PaperDataError::Rejected(
@@ -626,7 +629,9 @@ fn init_tracing(data_dir: &std::path::Path) -> tracing_appender::non_blocking::W
         .with_file(true)
         .with_line_number(true)
         .json()
-        .with_writer(non_blocking)
+        // File (daily rotation) AND stdout, so `journalctl -u solana-hft`
+        // shows the same JSON lines under systemd.
+        .with_writer(non_blocking.and(std::io::stdout))
         .init();
 
     tracing::info!(target: "main", log_dir = %log_dir.display(), "logging initialized (JSON + daily rotation)");
@@ -1934,9 +1939,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
+                    // Holder risk of the token being bought (never wSOL).
                     let holder_stats = match onchain_risk::fetch_holder_stats(
                         &rpc_client,
-                        &input_mint,
+                        &output_mint,
                         &[accounts.input_vault, accounts.output_vault],
                     ) {
                         Ok(v) => v,
