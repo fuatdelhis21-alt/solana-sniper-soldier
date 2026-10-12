@@ -356,6 +356,7 @@ fn resolve_paper_market_data(
                     target: "paper",
                     mint = %output_mint,
                     top_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
                     threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
                     "holder concentration gate: single holder exceeds threshold"
                 );
@@ -368,6 +369,7 @@ fn resolve_paper_market_data(
                     target: "paper",
                     mint = %output_mint,
                     top20_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
                     threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
                     "holder concentration gate: top-20 holders exceed threshold"
                 );
@@ -1992,6 +1994,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mode = mode_target,
                         liquidity,
                         top_holder_pct = holder_stats.top_holder_pct,
+                        top20_holder_pct = holder_stats.top20_holder_pct,
+                        program_owned_pct = holder_stats.program_owned_pct,
                         sampled_holders = holder_stats.sampled_holders,
                         "fetched real on-chain liquidity + holder concentration"
                     );
