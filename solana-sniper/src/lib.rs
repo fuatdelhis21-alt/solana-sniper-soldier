@@ -11,6 +11,7 @@ pub mod marketdata;
 pub mod metrics;
 pub mod onchain_risk;
 pub mod position;
+pub mod redact;
 pub mod remote_hsm;
 pub mod retry;
 pub mod risk;

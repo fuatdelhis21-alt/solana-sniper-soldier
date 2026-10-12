@@ -40,6 +40,7 @@ mod marketdata;
 mod metrics;
 mod onchain_risk;
 mod position;
+mod redact;
 mod remote_hsm;
 mod retry;
 mod risk;
@@ -635,8 +636,11 @@ fn init_tracing(data_dir: &std::path::Path) -> tracing_appender::non_blocking::W
         .with_line_number(true)
         .json()
         // File (daily rotation) AND stdout, so `journalctl -u solana-hft`
-        // shows the same JSON lines under systemd.
-        .with_writer(non_blocking.and(std::io::stdout))
+        // shows the same JSON lines under systemd. Every line is redacted:
+        // RPC URLs carry provider API keys (also inside RPC error messages).
+        .with_writer(redact::RedactingMakeWriter::new(
+            non_blocking.and(std::io::stdout),
+        ))
         .init();
 
     tracing::info!(target: "main", log_dir = %log_dir.display(), "logging initialized (JSON + daily rotation)");
