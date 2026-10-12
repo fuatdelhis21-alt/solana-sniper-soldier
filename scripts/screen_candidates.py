@@ -88,12 +88,14 @@ def rpc_url():
 
 
 RPC = rpc_url()
+# Raydium's API (Cloudflare) answers 403 to the default "Python-urllib" agent.
+HEADERS = {"content-type": "application/json", "user-agent": "Mozilla/5.0 (screen_candidates)"}
 
 
 def rpc(method, params, retries=3):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     for attempt in range(retries):
-        req = urllib.request.Request(RPC, body, {"content-type": "application/json"})
+        req = urllib.request.Request(RPC, body, HEADERS)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 d = json.load(r)
@@ -101,14 +103,18 @@ def rpc(method, params, retries=3):
                 return d["result"]
             err = d.get("error")
         except Exception as e:  # noqa: BLE001
-            err = str(e).split("api-key")[0]
+            err = "RPC " + str(e).split("api-key")[0]
         time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"{method}: {err}")
 
 
 def http_json(url):
-    with urllib.request.urlopen(url, timeout=20) as r:
-        return json.load(r)
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Raydium API: {e}") from None
 
 
 def best_pool(mint):
