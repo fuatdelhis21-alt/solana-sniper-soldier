@@ -93,6 +93,11 @@ struct PaperSimulator {
     holds: u64,
     no_entry_signals: u64,
     simulated_pnl_lamports: i64,
+    /// Swap direction of the configured pool: true when the pay-side
+    /// (input) mint is the pool's token0. The pool price is token1/token0,
+    /// so with token0 as input a RISING price means the held token is
+    /// worth LESS — exits and P&L must use the inverted ratio.
+    input_is_token0: bool,
 }
 
 impl PaperSimulator {
@@ -106,6 +111,7 @@ impl PaperSimulator {
             holds: 0,
             no_entry_signals: 0,
             simulated_pnl_lamports: 0,
+            input_is_token0: false,
         }
     }
 
@@ -131,31 +137,31 @@ impl PaperSimulator {
         current_sqrt_price: u128,
     ) -> PaperTick {
         if let Some(pos) = self.position {
-            let exit = self
-                .strategy
-                .should_exit(pos.entry_sqrt_price, current_sqrt_price);
+            // Orient the ratio so "up" always means the held token gained
+            // value in input units: (current/entry)^2 for token1 input,
+            // (entry/current)^2 for token0 input (args swapped).
+            let (from_sqrt, to_sqrt) = if self.input_is_token0 {
+                (current_sqrt_price, pos.entry_sqrt_price)
+            } else {
+                (pos.entry_sqrt_price, current_sqrt_price)
+            };
+            let exit = self.strategy.should_exit(from_sqrt, to_sqrt);
             return match exit {
                 strategy::ExitDecision::Hold => {
                     self.holds += 1;
                     PaperTick::Hold
                 }
                 strategy::ExitDecision::StopLoss => {
-                    let pnl = simulated_pnl_lamports(
-                        pos.entry_sqrt_price,
-                        current_sqrt_price,
-                        pos.position_size_lamports,
-                    );
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
                     self.simulated_pnl_lamports += pnl;
                     self.exits_stop_loss += 1;
                     self.position = None;
                     PaperTick::ClosedStopLoss(pnl)
                 }
                 strategy::ExitDecision::TakeProfit => {
-                    let pnl = simulated_pnl_lamports(
-                        pos.entry_sqrt_price,
-                        current_sqrt_price,
-                        pos.position_size_lamports,
-                    );
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
                     self.simulated_pnl_lamports += pnl;
                     self.exits_take_profit += 1;
                     self.position = None;
@@ -215,6 +221,8 @@ struct PaperMarketSnapshot {
     holders: u64,
     is_blocklisted: bool,
     source: &'static str,
+    /// True when the input (pay-side) mint is the pool's token0.
+    input_is_token0: bool,
 }
 
 /// Paper market-data failure. Data that could not be fetched at all is
@@ -300,7 +308,7 @@ fn resolve_paper_market_data(
     //    derives them deterministically (the dry-run path uses the same
     //    all-zero-owner pattern).
     let dummy_user = Pubkey::new_from_array([0u8; 32]);
-    let (accounts, _pool) = amm::account_resolver::resolve_swap_accounts(
+    let (accounts, pool) = amm::account_resolver::resolve_swap_accounts(
         rpc_client,
         &pool_id,
         &dummy_user,
@@ -404,6 +412,7 @@ fn resolve_paper_market_data(
         holders,
         is_blocklisted,
         source,
+        input_is_token0: accounts.input_vault == pool.token_vault_0,
     })
 }
 
@@ -1557,6 +1566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // entry/entry-price the P&L was computed from.
             let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
+            paper_sim.input_is_token0 = snapshot.input_is_token0;
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
 
@@ -1702,6 +1712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         entry_sqrt = entry_sqrt,
                         size_lamports = signal.position_size_lamports,
                         source = snapshot.source,
+                        input_is_token0 = snapshot.input_is_token0,
                         "paper ENTRY simulated on real on-chain data (no on-chain tx — would execute)"
                     );
                 }
@@ -2667,6 +2678,34 @@ mod tests {
             .unwrap()
             .normalized();
         assert!(args.expected_signer.is_none());
+    }
+
+    #[test]
+    fn paper_exit_direction_follows_pool_orientation() {
+        // Price token1/token0 rises 20% (sqrt * ~1.0954). With token1 as
+        // input (held = token0) that is a gain => take-profit; with token0
+        // as input (held = token1) the held token lost value => stop-loss.
+        let entry = 1u128 << 64;
+        let up = (entry as f64 * 1.2f64.sqrt()) as u128;
+        let cand = strategy::TokenCandidate {
+            liquidity_lamports: u64::MAX,
+            market_cap_lamports: 0,
+            holders: 100,
+            is_blocklisted: false,
+        };
+        for (input_is_token0, expect_tp) in [(false, true), (true, false)] {
+            let mut sim = PaperSimulator::new();
+            sim.input_is_token0 = input_is_token0;
+            let PaperTick::EntryPending(sig) = sim.tick(&cand, entry) else {
+                panic!("expected entry signal");
+            };
+            sim.confirm_entry(entry, sig);
+            match sim.tick(&cand, up) {
+                PaperTick::ClosedTakeProfit(pnl) => assert!(expect_tp && pnl > 0),
+                PaperTick::ClosedStopLoss(pnl) => assert!(!expect_tp && pnl < 0),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]
