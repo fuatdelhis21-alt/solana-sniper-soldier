@@ -17,8 +17,9 @@
 # prints the remaining manual steps instead of starting an unconfigured bot.
 set -euo pipefail
 
-if [ "$#" -lt 1 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
   echo "Usage: $0 <artifact.tar.gz> [solana-hft.env]" >&2
+  echo "(a glob like solana-hft-release-*.tar.gz must match exactly one file)" >&2
   exit 2
 fi
 if [ "$(id -u)" -ne 0 ]; then
@@ -28,6 +29,14 @@ fi
 
 ARTIFACT="$1"
 ENV_SRC="${2:-}"
+# The env file must be a small text file — never another artifact (e.g. when
+# a glob matched two release tarballs and the second one landed here).
+if [ -n "$ENV_SRC" ]; then
+  if [ ! -f "$ENV_SRC" ] || ! grep -Iq . "$ENV_SRC" || [ "$(wc -c < "$ENV_SRC")" -gt 65536 ]; then
+    echo "refusing env file '$ENV_SRC': not a small text file (did a glob match several tarballs?)" >&2
+    exit 2
+  fi
+fi
 RELEASE_DIR=/opt/solana-hft
 BIN_DIR="$RELEASE_DIR/bin"
 CONFIG_DIR=/etc/solana-hft
