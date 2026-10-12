@@ -30,7 +30,7 @@ solana-hft-platform/
 ├── Cargo.toml                 # Workspace kökü, merkezî bağımlılık yönetimi
 ├── config/                    # Örnek konfigürasyon dosyaları
 │   ├── default.toml           # Güvenli varsayılanlar (development)
-│   └── production.example.toml# Production şablonu (kopyalayıp kullanın)
+│   └── (kaldırıldı — config artık .env.example / SNIPER_* env değişkenleri)
 └── crates/
     ├── hft-core/              # Çekirdek tipler + hata yönetimi + eşzamanlılık
     ├── hft-config/            # TOML/ENV konfigürasyon + doğrulama + hot-reload

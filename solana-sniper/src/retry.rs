@@ -93,7 +93,10 @@ pub fn send_with_retry(
 
 /// Poll `getSignatureStatuses` until the transaction reaches `confirmed`
 /// commitment, or the retry budget is exhausted.
-fn confirm_transaction(rpc: &RpcClient, sig: &Signature) -> Result<(), Box<dyn std::error::Error>> {
+pub fn confirm_transaction(
+    rpc: &RpcClient,
+    sig: &Signature,
+) -> Result<(), Box<dyn std::error::Error>> {
     let max_confirm_retries: u32 = 10;
     for attempt in 0..max_confirm_retries {
         let statuses = rpc.get_signature_statuses(&[*sig])?;

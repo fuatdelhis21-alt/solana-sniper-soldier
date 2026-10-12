@@ -49,9 +49,8 @@ pub struct Metrics {
     pub trade_executed_total: IntCounterVec,
     /// Circuit breaker state gauge (1=open/tripped, 0=closed/normal).
     pub circuit_breaker_state: Gauge,
-    /// Realized P&L for the current UTC day, in lamports (loss-only today —
-    /// see final report for the known gap: no exit-execution path exists to
-    /// compute realized wins).
+    /// Realized loss for the current day, in lamports (published as a
+    /// negative number). Fed by the live exit path's real balance deltas.
     pub daily_realized_pnl: Gauge,
     /// Number of currently tracked open positions.
     pub open_position_count: Gauge,

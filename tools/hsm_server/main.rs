@@ -10,7 +10,9 @@
 //! ## Key source
 //! The signing key is loaded from the `HSM_KEY_B64` environment variable
 //! (base64-encoded 64-byte private key bytes). If unset/invalid, an ephemeral
-//! keypair is generated at startup (dev/test scaffold only).
+//! keypair is generated at startup (dev/test scaffold only) — unless
+//! `HSM_REQUIRE_KEY=1` is set (production), in which case the server refuses
+//! to start without a valid key.
 //!
 //! ## mTLS
 //! When `server.pem`, `server.key` and `ca.pem` exist in the certs directory,
@@ -93,8 +95,18 @@ impl AuditLogger {
     }
 }
 
-/// Load signer from `HSM_KEY_B64`, otherwise generate an ephemeral keypair.
+/// `HSM_REQUIRE_KEY` truthy => production: never fall back to an ephemeral key.
+fn key_required() -> bool {
+    matches!(
+        std::env::var("HSM_REQUIRE_KEY").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Load signer from `HSM_KEY_B64`, otherwise generate an ephemeral keypair
+/// (or exit when `HSM_REQUIRE_KEY` is set — fail-closed for production).
 fn load_or_create_signer() -> Keypair {
+    let required = key_required();
     if let Ok(key_b64) = std::env::var("HSM_KEY_B64") {
         if let Ok(bytes) = general_purpose::STANDARD.decode(key_b64) {
             if let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) {
@@ -103,7 +115,18 @@ fn load_or_create_signer() -> Keypair {
                 }
             }
         }
+        if required {
+            eprintln!(
+                "[hsm_server] FATAL: HSM_KEY_B64 invalid and HSM_REQUIRE_KEY is set (fail-closed)"
+            );
+            std::process::exit(1);
+        }
         println!("[hsm_server] HSM_KEY_B64 invalid; using ephemeral keypair");
+    } else if required {
+        eprintln!(
+            "[hsm_server] FATAL: HSM_KEY_B64 missing and HSM_REQUIRE_KEY is set (fail-closed)"
+        );
+        std::process::exit(1);
     }
     let kp = Keypair::new();
     println!("[hsm_server] ephemeral signer pubkey: {}", kp.pubkey());
@@ -201,7 +224,14 @@ async fn main() {
             let line =
                 build_audit_line(now_ms, &request_id(), &signature, status, error.as_deref());
             audit2.log(&line.to_string());
-            warp::reply::json(&SignResponse { signature })
+            // A failed signing request is an HTTP error, never a 200 with a
+            // placeholder signature a client could mistake for a real one.
+            let code = if error.is_some() {
+                warp::http::StatusCode::BAD_REQUEST
+            } else {
+                warp::http::StatusCode::OK
+            };
+            warp::reply::with_status(warp::reply::json(&SignResponse { signature }), code)
         });
 
     // Public-key endpoint: lets the client build transactions without ever

@@ -3,43 +3,58 @@ name: CI/CD
 on:
   push:
     branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  build-and-publish:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install AWS CLI and other tools
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install awscli
-
-      - name: Build release
-        run: cargo build --release
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --all
+        run: cargo test --workspace
+
+      - name: Check deploy scripts
+        run: |
+          bash -n deploy/install_release.sh deploy/rollback.sh \
+            scripts/build_and_publish.sh tools/hsm_server/certs/generate_certs.sh
+
+  build-and-publish:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release -p solana-sniper -p tools-hsm-server
 
       - name: Run benchmarks (best-effort)
-        run: |
-          set -o pipefail
-          cargo bench -p hft-core || true
+        run: cargo bench -p hft-core || true
 
-      - name: Package and publish artifact
+      - name: Package (and publish to S3 when configured)
         env:
+          SKIP_BUILD: "1"
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          chmod +x ./scripts/build_and_publish.sh
-          ./scripts/build_and_publish.sh
+        run: ./scripts/build_and_publish.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solana-hft-release
+          path: solana-hft-release-*.tar.gz
+          retention-days: 30

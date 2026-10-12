@@ -834,9 +834,11 @@ mod tests {
 
     #[test]
     fn audit_log_written_on_kill_switch() {
-        let rm = RiskManager::new(test_config());
+        let cfg = test_config();
+        let data_dir = cfg.data_dir.clone();
+        let rm = RiskManager::new(cfg);
         rm.trigger_kill_switch("unit test");
-        let path = std::env::temp_dir().join("audit").join("risk_audit.jsonl");
+        let path = data_dir.join("audit").join("risk_audit.jsonl");
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("kill_switch_triggered"));
         assert!(content.contains("unit test"));

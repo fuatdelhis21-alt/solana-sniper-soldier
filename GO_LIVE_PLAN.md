@@ -78,19 +78,20 @@ cargo run --bin solana-sniper -- ^
 ```
 
 ### 5.5 Mainnet Go-Live Steps
-1. Copy `.env.example` → `.env` and fill mainnet values
-2. Fund mainnet wallet with ~0.1 SOL (conservative start)
-3. Start with `--dry-run` first to verify tx format
-4. Start live with `--live` flag + small amount
-5. Monitor `data/logs/hft.log` and `data/metrics.jsonl`
-6. If circuit breaker trips, investigate and reset `data/circuit_breaker.bin`
+Ayrıntılar: [`README_DEPLOY.md`](README_DEPLOY.md).
+1. `./scripts/build_and_publish.sh` → paketi sunucuya `install_release.sh` ile kur
+2. `generate_certs.sh` ile mTLS PKI, `hsm.env` içine `HSM_KEY_B64`, `systemctl start solana-hsm`
+3. `/etc/solana-hft/solana-hft.env`: mainnet RPC/WS, `SNIPER_POOL_ID`, `SNIPER_OUTPUT_MINT`,
+   `SNIPER_EXPECTED_SIGNER`, `SNIPER_LIVE_RISK_DATA=true`
+4. `SNIPER_PAPER=true` → `SNIPER_DRY_RUN=true` → `SNIPER_LIVE=true` + `SNIPER_CONFIRM_LIVE=true`
+5. İzleme: `journalctl -u solana-hft -f`, `curl 127.0.0.1:9090/metrics`
+6. Kill switch / günlük limit tetiklenirse bot durur (exit 0); inceleyip `risk_state.json`'ı temizle
 
 ### 5.6 Final Mainnet Go-Live Checklist
-- [ ] wallet.json funded with mainnet SOL (minimum 0.02 SOL for fees)
-- [ ] `.env` configured with mainnet RPC (no free tier — use Helius/Triton/RPCFast)
-- [ ] Risk limits set: `MAX_TRADE_SIZE_SOL=0.01`, `DAILY_LOSS_LIMIT_SOL=0.05`
-- [ ] Circuit breaker tested: run `--dry-run` first
-- [ ] File rotation logging active: `data/logs/hft.log.*`
-- [ ] Jito TPU URL set: `JITO_TPU_URL=frankfurt.mainnet.block-engine.jito.wtf`
-- [ ] Raydium CLMM pool IDs configured in config (or auto-discover via WS)
-- [ ] Bot started as Windows scheduled task or manual terminal
+- [ ] Cüzdan mainnet SOL ile fonlandı (≥ 0.02 SOL: işlem + ücret + ATA rent)
+- [ ] Ücretli mainnet RPC (Helius/Triton/QuickNode) `SNIPER_RPC`/`SNIPER_WS`'te
+- [ ] HSM `HSM_REQUIRE_KEY=1` ile çalışıyor, pubkey = `SNIPER_EXPECTED_SIGNER`
+- [ ] Paper ve dry-run aynı havuzda hatasız çalıştı (dry-run tx'i imzalandı)
+- [ ] `/metrics` ve `/health` izleniyor, alert kuralları yüklü
+- [ ] Risk limitleri (kodda sabit): 0.05 SOL/işlem, 5 işlem/gün, 0.20 SOL günlük zarar, 1 açık pozisyon
+- [ ] Jito (opsiyonel): `SNIPER_JITO_ENDPOINT`, `SNIPER_JITO_TIP_LAMPORTS`
