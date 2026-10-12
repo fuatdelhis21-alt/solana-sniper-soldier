@@ -447,6 +447,11 @@ struct Args {
     #[arg(long, env = "SNIPER_ITERATIONS", default_value_t = 30)]
     iterations: u32,
 
+    /// Pause between loop iterations in milliseconds (minimum 50). Raise it
+    /// on rate-limited RPC plans: every iteration makes several RPC calls.
+    #[arg(long, env = "SNIPER_LOOP_INTERVAL_MS", default_value_t = 200)]
+    loop_interval_ms: u64,
+
     /// Optional blockhash (base58) to use for dry-run. When set, dry-run does
     /// not contact the RPC for a blockhash (deterministic / offline smoke tests).
     #[arg(long)]
@@ -1316,6 +1321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Pause between iterations (and after every rejected/failed one). Each
+    // iteration makes several RPC calls, so raise this on rate-limited RPC
+    // plans (public mainnet RPC answers 429 at the 200 ms default).
+    let loop_interval = Duration::from_millis(args.loop_interval_ms.max(50));
     let max_iterations: u64 = if args.iterations == 0 {
         u64::MAX
     } else {
@@ -1417,7 +1426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 total_latency_ms =
                     total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             }
         }
@@ -1441,7 +1450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
                 break;
             }
-            sleep(Duration::from_millis(200)).await;
+            sleep(loop_interval).await;
             continue;
         }
 
@@ -1498,7 +1507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Rejection is not a trade: counters stay untouched.
                     total_latency_ms =
                         total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
                 Err(PaperDataError::Unavailable(err)) => {
@@ -1519,7 +1528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     total_latency_ms =
                         total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
             };
@@ -1659,7 +1668,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rec.save(&args.data_dir)?;
                         total_latency_ms =
                             total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                     // Entry accepted: the ONLY place total_trades and
@@ -1719,7 +1728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            sleep(Duration::from_millis(200)).await;
+            sleep(loop_interval).await;
             continue;
         }
 
@@ -1760,7 +1769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         risk_manager
                             .trip_circuit_breaker(&format!("HSM unavailable (fail-closed): {e}"));
                         tracing::error!(mode = mode_target, error = %e, "HSM pubkey fetch failed — circuit breaker tripped");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 }
@@ -1774,7 +1783,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mode = mode_target,
                     "no signer available — circuit breaker tripped"
                 );
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             };
             let mut to = from; // self-transfer fallback when no pool is configured
@@ -1828,7 +1837,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "pool state resolution failed (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "failed to resolve pool state — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -1854,7 +1863,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         risk::check_price_staleness(ts, risk_cfg.price_staleness_ms)
                     {
                         tracing::warn!(mode = mode_target, iteration = i + 1, reason = %reason, "price staleness check failed — no trade this iteration (fail-closed)");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 } else {
@@ -1863,7 +1872,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         iteration = i + 1,
                         "no price timestamp available — rejecting trade (fail-closed)"
                     );
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
 
@@ -1882,7 +1891,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "swap account resolution failed (fail-closed): {e}"
                         ));
                         tracing::error!(mode = mode_target, error = %e, "failed to resolve swap accounts — circuit breaker tripped");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 };
@@ -1904,7 +1913,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 freeze_authority_present = risk.freeze_authority_present,
                                 "token authority risk detected — no trade this iteration (fail-closed)"
                             );
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue 'main_loop;
                         }
                         Ok(_) => {}
@@ -1913,7 +1922,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "mint authority check failed (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, mint_role = label, "mint authority check failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue 'main_loop;
                         }
                     }
@@ -1935,7 +1944,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "live risk data (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "liquidity fetch failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -1951,7 +1960,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "live risk data (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "holder stats fetch failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -1971,7 +1980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mode_label,
                                 risk::RejectReason::HolderConcentrationExceeded.code(),
                             );
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     }
@@ -2087,7 +2096,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     rec.save(&args.data_dir)?;
                     total_trades += 1;
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
             };
@@ -2111,7 +2120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 rec.save(&args.data_dir)?;
                 total_trades += 1;
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             }
 
@@ -2135,7 +2144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 rec.save(&args.data_dir)?;
                 total_trades += 1;
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             }
 
@@ -2149,7 +2158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(mode = mode_target, error = %e, "blockhash unavailable — no trade this iteration");
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
             };
@@ -2208,7 +2217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ) {
                     metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
                     tracing::warn!(mode = mode_target, iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
 
@@ -2227,7 +2236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     risk_manager
                         .trip_circuit_breaker(&format!("signing failed (fail-closed): {e}"));
                     tracing::error!(mode = mode_target, error = %e, "signing/verification failed — circuit breaker tripped");
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
 
@@ -2269,7 +2278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (Ok(a), Ok(b)) => (a, b),
                         (Err(e), _) | (_, Err(e)) => {
                             tracing::error!(mode = mode_target, error = %e, "pre-entry balance fetch failed — no trade (fail-closed)");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -2384,7 +2393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        sleep(Duration::from_millis(200)).await;
+        sleep(loop_interval).await;
     }
 
     // Paper iterations all accumulate latency (rejections included), while
