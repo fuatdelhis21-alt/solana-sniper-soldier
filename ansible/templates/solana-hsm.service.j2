@@ -1,0 +1,49 @@
+[Unit]
+Description=Solana HFT Remote HSM signer (mTLS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ hsm_user | default('solana-hsm') }}
+Group={{ hsm_group | default('solana-hsm') }}
+WorkingDirectory={{ hsm_release_dir | default('/opt/solana-hft-hsm') }}
+
+# HSM_KEY_B64 read from this file (0600, owned by solana-hsm). Never inline.
+EnvironmentFile={{ hsm_config_dir | default('/etc/solana-hft-hsm') }}/hsm.env
+
+ExecStart={{ hsm_release_dir | default('/opt/solana-hft-hsm') }}/bin/hsm_server \
+    --certs {{ hsm_config_dir | default('/etc/solana-hft-hsm') }}/certs \
+    --log-file {{ hsm_log_dir | default('/var/log/solana-hft-hsm') }}/hsm_audit.log
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths={{ hsm_log_dir | default('/var/log/solana-hft-hsm') }}
+
+# --- Restart policy (bounded) ---
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-hsm
+
+[Install]
+WantedBy=multi-user.target

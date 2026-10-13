@@ -10,7 +10,7 @@
 //! liveness but `/metrics` returns 503.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use prometheus::{
     Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
@@ -19,10 +19,45 @@ use prometheus::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[derive(Debug, Clone, Default)]
+pub struct ReadinessSnapshot {
+    pub process_alive: bool,
+    pub state_verified: bool,
+    pub reconcile_required: bool,
+    pub exit_blocked: bool,
+    pub breaker_state: u8,
+    pub kill_switch_active: bool,
+    pub live_armed: bool,
+    pub hsm_ready: Option<bool>,
+    pub rpc_ready: Option<bool>,
+    pub market_data_ready: Option<bool>,
+    pub mode: String,
+}
+
+impl ReadinessSnapshot {
+    pub fn ready_paper_dry_run(&self) -> bool {
+        self.process_alive && self.state_verified && !self.reconcile_required
+    }
+
+    pub fn ready_live(&self) -> bool {
+        self.process_alive
+            && self.state_verified
+            && !self.reconcile_required
+            && !self.exit_blocked
+            && self.breaker_state != 2
+            && !self.kill_switch_active
+            && self.live_armed
+            && self.hsm_ready == Some(true)
+            && self.rpc_ready == Some(true)
+            && self.market_data_ready == Some(true)
+    }
+}
+
 /// Shared metrics registry + counters, cheaply cloneable across tasks.
 #[derive(Clone)]
 pub struct Metrics {
     registry: Registry,
+    readiness: Arc<Mutex<ReadinessSnapshot>>,
     pub trades_total: IntCounter,
     pub trades_success: IntCounter,
     pub trades_failed: IntCounter,
@@ -109,6 +144,7 @@ impl Metrics {
 
     pub fn new() -> Arc<Self> {
         let registry = Registry::new();
+        let readiness = Arc::new(Mutex::new(ReadinessSnapshot::default()));
 
         let trades_total = IntCounter::new("hft_trades_total", "Total trade attempts").unwrap();
         let trades_success = IntCounter::new("hft_trades_success", "Successful trades").unwrap();
@@ -195,6 +231,7 @@ impl Metrics {
             .ok();
         Arc::new(Self {
             registry,
+            readiness,
             trades_total,
             trades_success,
             trades_failed,
@@ -262,6 +299,34 @@ pub async fn spawn_metrics_server(addr: &str, metrics: Arc<Metrics>) -> Result<(
                     Ok(()) => ("200 OK", "ok".to_string()),
                     Err(e) => ("503 Service Unavailable", e),
                 },
+                "/ready" => {
+                    let snapshot = metrics.readiness.lock().unwrap().clone();
+                    let ready = if snapshot.mode == "live" {
+                        snapshot.ready_live()
+                    } else {
+                        snapshot.ready_paper_dry_run()
+                    };
+                    let body = serde_json::json!({
+                        "ready": ready,
+                        "mode": snapshot.mode,
+                        "process_alive": snapshot.process_alive,
+                        "state_verified": snapshot.state_verified,
+                        "reconcile_required": snapshot.reconcile_required,
+                        "exit_blocked": snapshot.exit_blocked,
+                        "breaker_state": snapshot.breaker_state,
+                        "kill_switch_active": snapshot.kill_switch_active,
+                        "live_armed": snapshot.live_armed,
+                        "hsm_ready": snapshot.hsm_ready,
+                        "rpc_ready": snapshot.rpc_ready,
+                        "market_data_ready": snapshot.market_data_ready,
+                    })
+                    .to_string();
+                    if ready {
+                        ("200 OK", body)
+                    } else {
+                        ("503 Service Unavailable", body)
+                    }
+                }
                 "/metrics" => ("200 OK", metrics.render()),
                 _ => ("404 Not Found", "not found".to_string()),
             };
@@ -356,6 +421,10 @@ pub fn set_risk_gauges(
 /// on-chain realized P&L.
 pub fn set_paper_simulated_pnl(metrics: &Metrics, pnl_lamports: i64) {
     metrics.paper_simulated_pnl.set(pnl_lamports as f64);
+}
+
+pub fn set_readiness(metrics: &Metrics, snapshot: ReadinessSnapshot) {
+    *metrics.readiness.lock().unwrap() = snapshot;
 }
 
 #[cfg(test)]
@@ -459,6 +528,42 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
+        let resp = reqwest::get(&format!("http://{server_addr}/ready"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        set_readiness(
+            &m,
+            ReadinessSnapshot {
+                process_alive: true,
+                state_verified: true,
+                mode: "paper".to_string(),
+                ..Default::default()
+            },
+        );
+        let resp = reqwest::get(&format!("http://{server_addr}/ready"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
         handle.abort();
+    }
+
+    #[test]
+    fn live_readiness_requires_every_gate() {
+        let snapshot = ReadinessSnapshot {
+            process_alive: true,
+            state_verified: true,
+            live_armed: true,
+            hsm_ready: Some(true),
+            rpc_ready: Some(true),
+            market_data_ready: Some(true),
+            mode: "live".to_string(),
+            ..Default::default()
+        };
+        assert!(snapshot.ready_live());
+        let mut blocked = snapshot;
+        blocked.breaker_state = 2;
+        assert!(!blocked.ready_live());
     }
 }

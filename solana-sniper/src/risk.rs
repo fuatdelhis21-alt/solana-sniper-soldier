@@ -335,10 +335,14 @@ impl RiskManager {
         if let Ok(json) = serde_json::to_string(&state) {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
                 let path = self.config.data_dir.join("risk_state.json");
-                if std::fs::write(&path, json).is_err() {
+                let tmp = self.config.data_dir.join("risk_state.json.tmp");
+                let write_ok =
+                    std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+                if !write_ok {
+                    let _ = std::fs::remove_file(&tmp);
                     self.write_audit(
                         "state_persist_failed",
-                        "failed to write risk_state.json — restart safety degraded",
+                        "failed to atomically write risk_state.json — restart safety degraded",
                     );
                 }
             }
@@ -842,5 +846,24 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("kill_switch_triggered"));
         assert!(content.contains("unit test"));
+    }
+
+    #[test]
+    fn state_persistence_uses_atomic_rename() {
+        let cfg = test_config();
+        let rm = RiskManager::new(cfg.clone());
+        rm.record_position_open(40_000_000);
+        let state_path = cfg.data_dir.join("risk_state.json");
+        let tmp_path = cfg.data_dir.join("risk_state.json.tmp");
+        assert!(state_path.exists());
+        assert!(!tmp_path.exists());
+
+        std::fs::write(&tmp_path, "{ partial").unwrap();
+        let restored = RiskManager::new(cfg.clone());
+        assert!(restored.is_state_verified());
+        assert_eq!(restored.open_position_count(), 1);
+        restored.record_position_open(10_000_000);
+        assert!(!tmp_path.exists());
+        assert_eq!(RiskManager::new(cfg).open_position_count(), 2);
     }
 }

@@ -1609,6 +1609,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
+        if live_position.is_none() {
+            let endpoint = args.hsm_endpoint.as_deref().expect("validated in live");
+            let ca = args.hsm_ca.as_deref().expect("validated in live");
+            let identity = args
+                .hsm_client_identity
+                .as_deref()
+                .expect("validated in live");
+            let signer = hsm_pubkey(endpoint, ca, identity).await?;
+            remote_hsm::validate_hsm_pubkey(&signer, expected_signer.as_ref())?;
+            let mint = Pubkey::from_str(args.output_mint.as_deref().expect("validated in live"))?;
+            let ata = amm::account_resolver::resolve_user_ata(&signer, &mint);
+            let account = rpc_client
+                .get_account_with_commitment(&ata, CommitmentConfig::confirmed())
+                .map_err(|e| format!("startup token reconciliation failed (fail-closed): {e}"))?
+                .value;
+            if let Some(account) = account {
+                if account.owner != spl_token::ID || account.data.len() < 72 {
+                    return Err(
+                        "startup token reconciliation found an invalid token account (fail-closed)"
+                            .into(),
+                    );
+                }
+                let raw_amount =
+                    u64::from_le_bytes(account.data[64..72].try_into().expect("8-byte slice"));
+                if raw_amount > 0 {
+                    return Err(format!(
+                        "orphan token balance of {raw_amount} raw units found in {ata}; \
+                         refusing live startup without automatic recovery sell (fail-closed)"
+                    )
+                    .into());
+                }
+            }
+        }
     }
 
     // The local keyfile is used ONLY for dry-run without a remote HSM. In live
@@ -1759,6 +1792,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_manager.open_position_count(),
         );
         metrics::set_kill_switch(&metrics_registry, risk_manager.is_kill_switch_active());
+        let breaker_state = if risk_manager.is_circuit_breaker_active() {
+            2
+        } else {
+            0
+        };
+        metrics::set_readiness(
+            &metrics_registry,
+            metrics::ReadinessSnapshot {
+                process_alive: true,
+                state_verified: risk_manager.is_state_verified(),
+                reconcile_required: false,
+                exit_blocked: false,
+                breaker_state,
+                kill_switch_active: risk_manager.is_kill_switch_active(),
+                live_armed: risk_manager.is_live_armed(),
+                hsm_ready: args.live.then_some(breaker_state != 2),
+                rpc_ready: Some(breaker_state != 2),
+                market_data_ready: Some(ws_provider.is_some() || !args.live || breaker_state != 2),
+                mode: mode_label.to_string(),
+            },
+        );
 
         // LIVE exit management: while a position is open, every iteration
         // evaluates stop-loss / take-profit on the real pool state and sells
