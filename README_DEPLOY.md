@@ -51,9 +51,10 @@ vi /etc/solana-hft/hsm.env           # HSM_KEY_B64=..., HSM_REQUIRE_KEY=1
 systemctl start solana-hsm
 ```
 
-Sunucu geçerli `HSM_KEY_B64` yoksa **başlamaz**; ephemeral anahtara düşme
-yolu yoktur (yalnızca test için açık `--dev-ephemeral-key` bayrağı, systemd
-kullanmaz). Her işlem imzalama politikasından geçer: yalnızca botun swap /
+Sunucu geçerli `HSM_KEY_B64` yoksa **başlamaz**; ephemeral / üretilmiş
+anahtara düşme yolu hiçbir koşulda yoktur (CI de geçici anahtarı aynı
+şekilde `HSM_KEY_B64` ile verir). Bilinmeyen komut satırı argümanı da
+başlatmayı durdurur. Her işlem imzalama politikasından geçer: yalnızca botun swap /
 wSOL wrap / Jito tip şekli imzalanır, fonlar cüzdanın kendi hesaplarında
 kalmak zorundadır, cüzdandan çıkan toplam ≤ `HSM_MAX_TRANSFER_LAMPORTS`
 (varsayılan 0.06 SOL). Token transferi, yabancı hesaba swap çıktısı, başka

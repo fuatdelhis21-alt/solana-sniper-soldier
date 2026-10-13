@@ -10,9 +10,8 @@
 //! ## Key source
 //! The signing key is loaded from the `HSM_KEY_B64` environment variable
 //! (base64-encoded 64-byte private key bytes). Fail-closed: a missing or
-//! invalid key stops the server. A throwaway ephemeral key is used ONLY with
-//! the explicit `--dev-ephemeral-key` flag (CI / local tests; never set by
-//! the systemd unit). No environment variable can enable the fallback.
+//! invalid key stops the server. There is no ephemeral / generated-key
+//! fallback of any kind (tests and CI pass a throwaway key the same way).
 //!
 //! ## Signing policy
 //! Every transaction is checked by [`policy::check`] before it is signed:
@@ -102,31 +101,22 @@ impl AuditLogger {
     }
 }
 
-/// Load the signer from `HSM_KEY_B64`. Fail-closed: exits when the key is
-/// missing or invalid, unless `dev_ephemeral` (the `--dev-ephemeral-key`
-/// CLI flag) explicitly asks for a throwaway key.
-fn load_signer(dev_ephemeral: bool) -> Keypair {
-    match std::env::var("HSM_KEY_B64")
-        .ok()
+/// The signer from an `HSM_KEY_B64` value. Fail-closed: a missing, empty or
+/// invalid key is an error — the server never generates a key itself.
+fn signer_from_env_value(value: Option<String>) -> Result<Keypair, String> {
+    let key_b64 = value
         .filter(|v| !v.trim().is_empty())
-    {
-        Some(key_b64) => match parse_key(&key_b64) {
-            Some(kp) => kp,
-            None => {
-                eprintln!("[hsm_server] FATAL: HSM_KEY_B64 is not a valid base64 64-byte keypair (fail-closed)");
-                std::process::exit(1);
-            }
-        },
-        None if dev_ephemeral => {
-            let kp = Keypair::new();
-            println!(
-                "[hsm_server] WARNING: --dev-ephemeral-key: throwaway signer {} (never use with funds)",
-                kp.pubkey()
-            );
-            kp
-        }
-        None => {
-            eprintln!("[hsm_server] FATAL: HSM_KEY_B64 missing (fail-closed; --dev-ephemeral-key is for tests only)");
+        .ok_or("HSM_KEY_B64 missing (fail-closed: no ephemeral key fallback)")?;
+    parse_key(&key_b64).ok_or_else(|| {
+        "HSM_KEY_B64 is not a valid base64 64-byte keypair (fail-closed)".to_string()
+    })
+}
+
+fn load_signer() -> Keypair {
+    match signer_from_env_value(std::env::var("HSM_KEY_B64").ok()) {
+        Ok(kp) => kp,
+        Err(e) => {
+            eprintln!("[hsm_server] FATAL: {e}");
             std::process::exit(1);
         }
     }
@@ -179,13 +169,22 @@ fn build_audit_line(
     line.to_string()
 }
 
-/// Minimal CLI arg parser: `--certs <dir>`, `--log-file <path>`,
-/// `--dev-ephemeral-key`.
-fn parse_args() -> (PathBuf, Option<PathBuf>, bool) {
+/// Minimal CLI arg parser: `--certs <dir>` and `--log-file <path>`.
+/// Unknown arguments are fatal (fail-closed: e.g. a stale
+/// `--dev-ephemeral-key` must not be silently ignored).
+fn parse_args() -> (PathBuf, Option<PathBuf>) {
+    match parse_args_from(std::env::args().collect()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[hsm_server] FATAL: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_args_from(args: Vec<String>) -> Result<(PathBuf, Option<PathBuf>), String> {
     let mut certs_dir = PathBuf::from("certs");
     let mut log_file: Option<PathBuf> = None;
-    let mut dev_ephemeral = false;
-    let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -201,18 +200,17 @@ fn parse_args() -> (PathBuf, Option<PathBuf>, bool) {
                     log_file = Some(PathBuf::from(&args[i]));
                 }
             }
-            "--dev-ephemeral-key" => dev_ephemeral = true,
-            _ => {}
+            other => return Err(format!("unknown argument {other}")),
         }
         i += 1;
     }
-    (certs_dir, log_file, dev_ephemeral)
+    Ok((certs_dir, log_file))
 }
 
 #[tokio::main]
 async fn main() {
-    let (certs_dir, log_file, dev_ephemeral) = parse_args();
-    let signer = Arc::new(load_signer(dev_ephemeral));
+    let (certs_dir, log_file) = parse_args();
+    let signer = Arc::new(load_signer());
     let policy = match policy::Policy::from_env() {
         Ok(p) => Arc::new(p),
         Err(e) => {
@@ -356,6 +354,30 @@ mod tests {
         let mut bad = kp.to_bytes();
         bad[63] ^= 1;
         assert!(parse_key(&general_purpose::STANDARD.encode(bad)).is_none());
+    }
+
+    #[test]
+    fn no_key_means_no_signer() {
+        assert!(signer_from_env_value(None).is_err());
+        assert!(signer_from_env_value(Some("   ".into())).is_err());
+        assert!(signer_from_env_value(Some("not base64!".into())).is_err());
+        let kp = Keypair::new();
+        let good = general_purpose::STANDARD.encode(kp.to_bytes());
+        assert_eq!(
+            signer_from_env_value(Some(good)).unwrap().pubkey(),
+            kp.pubkey()
+        );
+    }
+
+    #[test]
+    fn unknown_arguments_are_fatal() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (certs, log) =
+            parse_args_from(a(&["hsm", "--certs", "/c", "--log-file", "/l"])).unwrap();
+        assert_eq!(certs, PathBuf::from("/c"));
+        assert_eq!(log, Some(PathBuf::from("/l")));
+        assert!(parse_args_from(a(&["hsm", "--dev-ephemeral-key"])).is_err());
+        assert!(parse_args_from(a(&["hsm", "--whatever"])).is_err());
     }
 
     #[test]

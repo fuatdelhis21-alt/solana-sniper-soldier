@@ -22,7 +22,7 @@
 - **Client** (`solana-sniper/src/remote_hsm.rs`): rustls TLS, presents `client_all.pem` identity, trusts `ca.pem`.
 - **Server** (`tools/hsm_server/main.rs`): requires client cert signed by `ca.pem` (`client_auth_required_path`). **Fail-closed**: if `server.pem`/`server.key`/`ca.pem` are missing the server refuses to start (no plain-HTTP fallback).
 - **Endpoints**: `POST /sign` (returns base64 64-byte signature) and `GET /pubkey` (returns the signer's base58 pubkey so the client never needs a local keyfile).
-- **Signing key**: loaded from `HSM_KEY_B64` env var (base64 64-byte private key). If missing/invalid → ephemeral keypair (dev/test only).
+- **Signing key**: loaded from `HSM_KEY_B64` env var (base64 64-byte private key). If missing/invalid → the server **refuses to start** (no ephemeral / generated-key fallback). Every transaction must also pass the signing policy (`tools/hsm_server/policy.rs`).
 
 ---
 
@@ -132,7 +132,7 @@ Select-String -Path client_all.pem -Pattern "BEGIN (CERTIFICATE|PRIVATE KEY)"
 
 ### 4.1 Sunucuyu Başlatma
 ```powershell
-# Geliştirme ortamı (ephemeral key veya HSM_KEY_B64 ile)
+# Geliştirme ortamı (HSM_KEY_B64 zorunlu — test için geçici bir anahtar da aynı şekilde verilir)
 cd C:\Users\Lenovo\Downloads\solana-hft-platform
 .\tools\hsm_server\start_server.bat
 
@@ -173,11 +173,13 @@ curl -k -s --max-time 5 https://127.0.0.1:8443/sign --data "{}"
 
 ### 5.1 `HSM_KEY_B64` Nasıl Çalışır
 - Sunucu, imzalama anahtarını `HSM_KEY_B64` ortam değişkeninden (base64 kodlu 64-byte özel anahtar) yükler.
-- **Boş / geçersizse**: Sunucu başlangıçta **ephemeral** (geçici) bir anahtar üretir ve pubkey'i loglar.
+- **Boş / geçersizse**: Sunucu **başlamaz** (fail-closed):
   ```
-  [hsm_server] ephemeral signer pubkey: <PUBKEY>
+  [hsm_server] FATAL: HSM_KEY_B64 missing (fail-closed: no ephemeral key fallback)
   ```
-- Ephemeral anahtar sunucu kapatıldığında **kaybolur** — bu yalnızca test/demo içindir.
+- Kendiliğinden anahtar üretme yolu yoktur. Test için geçici bir anahtar gerekiyorsa
+  (ör. CI), `openssl genpkey -algorithm ed25519` ile üretilip `HSM_KEY_B64` olarak
+  verilir — bkz. `.github/workflows/hsm-mtls-smoke-test.yml`.
 
 ### 5.2 Gerçek Anahtar Kullanma
 ```powershell
@@ -306,7 +308,7 @@ cd tools\hsm_server\certs
 ### 8.3 Veri/Dosya Kaybı Kontrolü
 - `logs/hsm_audit.log` — denetim geçmişi (silinirse yeni isteklerle yeniden oluşur)
 - `tools/hsm_server/certs/` — PKI (kaybolursa yeniden üretilir)
-- Yedek anahtar (`HSM_KEY_B64`) — kaybolursa ve ephemeral kullanılıyorsa imzalanan adres değişir.
+- Yedek anahtar (`HSM_KEY_B64`) — kaybolursa sunucu başlamaz; cüzdan anahtarının güvenli yedeği tutulmalıdır.
 
 ---
 
