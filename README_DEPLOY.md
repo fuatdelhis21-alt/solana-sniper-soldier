@@ -74,6 +74,10 @@ işlem yapılmaz.
 systemctl restart solana-hft
 journalctl -u solana-hft -f
 curl -s 127.0.0.1:9090/health; curl -s 127.0.0.1:9090/metrics
+# /health 503 = ana döngü takıldı (son iterasyon > 4 dk önce)
+# Yeni havuz sniper'ı (solana-hft-sniper) kendi uç noktası:
+curl -s 127.0.0.1:9091/health      # 503 = döngü takıldı veya WS log akışı 3 dk sessiz
+curl -s 127.0.0.1:9091/metrics
 ```
 
 Live akışı: giriş (wSOL → token) onaylanınca pozisyon `live_position.json`'a

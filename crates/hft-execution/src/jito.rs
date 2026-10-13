@@ -65,6 +65,8 @@ impl JitoConfig {
 
 /// Jito bundle yürütme backend'i.
 pub struct JitoBackend {
+    // Only read by the `live` feature build (network submission).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     config: JitoConfig,
     /// Emir kimliği → serialized tx deposu.
     store: TransactionStore,
@@ -106,6 +108,8 @@ impl JitoBackend {
     }
 
     /// `sendBundle` JSON-RPC gövdesini oluşturur.
+    // Only read by the `live` feature build (network submission).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     fn build_bundle_body(tx_b64: &str) -> String {
         format!(r#"{{"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[["{tx_b64}"]]}}"#)
     }

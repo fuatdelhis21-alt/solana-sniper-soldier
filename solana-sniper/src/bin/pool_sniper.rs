@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,88 @@ struct Args {
     /// Maximum pools handed to a trading process per UTC day.
     #[arg(long, env = "SNIPER_DISCOVERY_MAX_POOLS_PER_DAY", default_value_t = 20)]
     max_pools_per_day: u32,
+
+    /// Health / status endpoint of the supervisor ("" disables). The
+    /// trading process's own metrics server only exists while it runs.
+    #[arg(
+        long,
+        env = "SNIPER_DISCOVERY_HEALTH_ADDR",
+        default_value = "127.0.0.1:9091"
+    )]
+    health_addr: String,
+}
+
+/// Supervisor liveness, shared with the health server.
+#[derive(Default)]
+struct Status {
+    /// Unix ms of the last supervisor loop pass.
+    loop_ms: AtomicU64,
+    /// Unix ms of the last message on the CLMM log stream.
+    ws_ms: AtomicU64,
+    watched: AtomicU64,
+    started_today: AtomicU64,
+    child_running: AtomicBool,
+}
+
+/// A busy program like the CLMM emits logs every few seconds; minutes of
+/// silence mean the stream is dead even if the socket looks open.
+const WS_SILENCE_LIMIT_MS: u64 = 180_000;
+const LOOP_STALL_LIMIT_MS: u64 = 30_000;
+
+fn health_verdict(loop_ms: u64, ws_ms: u64, now: u64) -> Result<(), String> {
+    if now.saturating_sub(loop_ms) > LOOP_STALL_LIMIT_MS {
+        return Err("supervisor loop stalled".into());
+    }
+    if ws_ms == 0 || now.saturating_sub(ws_ms) > WS_SILENCE_LIMIT_MS {
+        return Err("no CLMM log stream messages (WebSocket down?)".into());
+    }
+    Ok(())
+}
+
+fn render_status(st: &Status, now: u64) -> String {
+    let ws = st.ws_ms.load(Ordering::SeqCst);
+    format!(
+        "pool_sniper_ws_last_message_age_ms {}\npool_sniper_watch_list {}\npool_sniper_pools_started_today {}\npool_sniper_child_running {}\n",
+        if ws == 0 { -1 } else { now.saturating_sub(ws) as i64 },
+        st.watched.load(Ordering::SeqCst),
+        st.started_today.load(Ordering::SeqCst),
+        st.child_running.load(Ordering::SeqCst) as u8,
+    )
+}
+
+fn spawn_health_server(addr: &str, st: Arc<Status>) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("health server bind failed on {addr}: {e}"))?;
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { continue };
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/");
+            let now = now_ms();
+            let (code, body) = match path {
+                "/health" => match health_verdict(
+                    st.loop_ms.load(Ordering::SeqCst),
+                    st.ws_ms.load(Ordering::SeqCst),
+                    now,
+                ) {
+                    Ok(()) => ("200 OK", "ok".to_string()),
+                    Err(e) => ("503 Service Unavailable", e),
+                },
+                "/metrics" => ("200 OK", render_status(&st, now)),
+                _ => ("404 Not Found", "not found".to_string()),
+            };
+            let _ = write!(
+                sock,
+                "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -254,6 +336,7 @@ fn spawn_log_listener(
     program: Pubkey,
     tx: mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
+    status: Arc<Status>,
 ) {
     std::thread::spawn(move || {
         let mut backoff = 1u64;
@@ -282,6 +365,7 @@ fn spawn_log_listener(
                 }
                 match receiver.recv_timeout(Duration::from_secs(120)) {
                     Ok(resp) => {
+                        status.ws_ms.store(now_ms(), Ordering::SeqCst);
                         let v = resp.value;
                         if v.err.is_none() && logs_contain_create_pool(&v.logs) {
                             tracing::info!(target: "discovery", signature = %v.signature, "CreatePool seen");
@@ -499,7 +583,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rpc = RpcClient::new_with_commitment(args.rpc.clone(), CommitmentConfig::confirmed());
     let (sig_tx, sig_rx) = mpsc::channel::<String>();
-    spawn_log_listener(args.ws.clone(), program, sig_tx, shutdown.clone());
+    let status = Arc::new(Status::default());
+    status.loop_ms.store(now_ms(), Ordering::SeqCst);
+    if !args.health_addr.trim().is_empty() {
+        spawn_health_server(args.health_addr.trim(), status.clone())?;
+        tracing::info!(target: "discovery", addr = %args.health_addr, "health server listening (/health, /metrics)");
+    }
+    spawn_log_listener(
+        args.ws.clone(),
+        program,
+        sig_tx,
+        shutdown.clone(),
+        status.clone(),
+    );
 
     let mut pending = PendingSignatures::default();
     let mut watch = WatchList::new(
@@ -515,6 +611,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_child = Duration::from_secs(args.entry_window_secs + args.max_hold_secs + 900);
 
     loop {
+        let now = now_ms();
+        status.loop_ms.store(now, Ordering::SeqCst);
+        status.watched.store(watch.len() as u64, Ordering::SeqCst);
+        status
+            .started_today
+            .store(daily.count(now) as u64, Ordering::SeqCst);
+        status
+            .child_running
+            .store(running.is_some(), Ordering::SeqCst);
         // 1) Child lifecycle.
         if let Some(r) = running.as_mut() {
             match r.child.try_wait() {
@@ -734,6 +839,20 @@ mod tests {
         ] {
             assert!(CHILD_ENV_REMOVE.contains(&k), "{k}");
         }
+    }
+
+    #[test]
+    fn health_requires_live_loop_and_log_stream() {
+        let now = 10_000_000;
+        assert!(health_verdict(now, now - 1_000, now).is_ok());
+        assert!(health_verdict(now, 0, now).is_err(), "never received a log");
+        assert!(health_verdict(now, now - WS_SILENCE_LIMIT_MS - 1, now).is_err());
+        assert!(health_verdict(now - LOOP_STALL_LIMIT_MS - 1, now, now).is_err());
+        let st = Status::default();
+        st.watched.store(3, Ordering::SeqCst);
+        let out = render_status(&st, now);
+        assert!(out.contains("pool_sniper_watch_list 3"));
+        assert!(out.contains("pool_sniper_ws_last_message_age_ms -1"));
     }
 
     #[test]

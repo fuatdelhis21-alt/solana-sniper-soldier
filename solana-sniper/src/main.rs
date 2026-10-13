@@ -1656,10 +1656,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.iterations as u64
     };
     let mut completed_iterations: u64 = 0;
+    // /health turns 503 when the loop stops iterating. Generous limit: one
+    // iteration may legitimately wait up to 180 s for a confirmation.
+    metrics_registry.set_health_max_age(240_000 + 10 * args.loop_interval_ms.max(50));
     // --single-trade / --entry-window-secs (pool discovery supervisor).
     let run_start = std::time::Instant::now();
     let mut single_trade_done = false;
     'main_loop: for i in 0..max_iterations {
+        metrics_registry.heartbeat();
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }

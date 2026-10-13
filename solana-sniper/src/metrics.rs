@@ -9,6 +9,7 @@
 //! if the metrics registry is unavailable, `/health` still reports the process
 //! liveness but `/metrics` returns 503.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use prometheus::{
@@ -57,9 +58,55 @@ pub struct Metrics {
     /// (negative = simulated loss). NEVER mixed with `daily_realized_pnl`
     /// which tracks real on-chain P&L only.
     pub paper_simulated_pnl: Gauge,
+    /// Unix ms of the last main-loop heartbeat (see [`Metrics::heartbeat`]);
+    /// shared by clones like the prometheus handles.
+    heartbeat_ms: Arc<AtomicU64>,
+    /// /health fails when the heartbeat is older than this; 0 = not enforced.
+    health_max_age_ms: Arc<AtomicU64>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Health verdict from the last heartbeat: a stuck or dead trading loop
+/// must not look healthy just because the HTTP server still answers.
+pub fn health_status(heartbeat_ms: u64, max_age_ms: u64, now_ms: u64) -> Result<(), String> {
+    if max_age_ms == 0 {
+        return Ok(());
+    }
+    let age = now_ms.saturating_sub(heartbeat_ms);
+    if age > max_age_ms {
+        return Err(format!(
+            "trading loop stalled: last heartbeat {age} ms ago (limit {max_age_ms} ms)"
+        ));
+    }
+    Ok(())
 }
 
 impl Metrics {
+    /// Enable the heartbeat check of /health (counts from now).
+    pub fn set_health_max_age(&self, max_age_ms: u64) {
+        self.heartbeat();
+        self.health_max_age_ms.store(max_age_ms, Ordering::SeqCst);
+    }
+
+    /// Record that the main loop is alive (call once per iteration).
+    pub fn heartbeat(&self) {
+        self.heartbeat_ms.store(unix_ms(), Ordering::SeqCst);
+    }
+
+    pub fn health(&self) -> Result<(), String> {
+        health_status(
+            self.heartbeat_ms.load(Ordering::SeqCst),
+            self.health_max_age_ms.load(Ordering::SeqCst),
+            unix_ms(),
+        )
+    }
+
     pub fn new() -> Arc<Self> {
         let registry = Registry::new();
 
@@ -164,6 +211,8 @@ impl Metrics {
             daily_realized_pnl,
             open_position_count,
             paper_simulated_pnl,
+            heartbeat_ms: Arc::new(AtomicU64::new(0)),
+            health_max_age_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -197,12 +246,22 @@ pub async fn spawn_metrics_server(addr: &str, metrics: Arc<Metrics>) -> Result<(
         let metrics = metrics.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            let _ = socket.read(&mut buf).await;
-            let req = String::from_utf8_lossy(&buf);
+            // A client that never sends its request must not hold the task.
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buf))
+                    .await;
+            let n = match read {
+                Ok(Ok(n)) => n,
+                _ => return,
+            };
+            let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
 
             let (status, body) = match path.as_str() {
-                "/health" => ("200 OK", "ok".to_string()),
+                "/health" => match metrics.health() {
+                    Ok(()) => ("200 OK", "ok".to_string()),
+                    Err(e) => ("503 Service Unavailable", e),
+                },
                 "/metrics" => ("200 OK", metrics.render()),
                 _ => ("404 Not Found", "not found".to_string()),
             };
@@ -347,6 +406,18 @@ mod tests {
         assert!(out.contains("open_position_count 1"));
     }
 
+    #[test]
+    fn health_follows_the_loop_heartbeat() {
+        assert!(health_status(0, 0, 10_000_000).is_ok(), "not enforced");
+        assert!(health_status(1_000, 5_000, 6_000).is_ok());
+        assert!(health_status(1_000, 5_000, 6_001).is_err());
+        let m = Metrics::new();
+        m.set_health_max_age(60_000);
+        assert!(m.health().is_ok());
+        m.heartbeat_ms.store(1, Ordering::SeqCst);
+        assert!(m.health().unwrap_err().contains("stalled"));
+    }
+
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
         let m = Metrics::new();
@@ -372,6 +443,21 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         assert_eq!(body, "ok");
+
+        // A stalled loop turns /health into a 503.
+        m.set_health_max_age(1);
+        m.heartbeat_ms.store(1, Ordering::SeqCst);
+        let resp = reqwest::get(&format!("http://{server_addr}/health"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+
+        // An idle connection is dropped instead of blocking the server.
+        let _idle = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+        let resp = reqwest::get(&format!("http://{server_addr}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
 
         handle.abort();
     }
