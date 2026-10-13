@@ -129,6 +129,16 @@ cargo test --workspace
 | `--hsm-endpoint <URL>` | Remote HSM endpoint (ör. `https://127.0.0.1:8443`) |
 | `--hsm-ca <path>` | HSM sunucusunu doğrulamak için CA sertifikası (PEM) |
 | `--hsm-client-identity <path>` | Sunucuya sunulan birleşik client cert + key (PEM) |
+| `--expected-signer <pubkey>` | HSM'in imzalaması gereken cüzdan (live'da zorunlu; uyuşmazlıkta işlem yok) |
+| `--pool-id` / `--input-mint` / `--output-mint` | İşlem yapılacak Raydium CLMM havuzu ve yönü (live'da zorunlu) |
+| `--live-risk-data` | Gerçek on-chain likidite + holder yoğunluğu (live'da zorunlu) |
+| `--metrics-addr <host:port>` | Prometheus `/metrics` + `/health` sunucusu |
+| `--priority-fee-micro-lamports` / `--compute-unit-limit` | Swap tx compute budget |
+
+Her flag aynı zamanda `SNIPER_*` ortam değişkeniyle verilebilir (örn.
+`SNIPER_POOL_ID`); çalışma dizinindeki `.env` otomatik yüklenir. Şablon:
+[`.env.example`](.env.example). `--iterations 0` = durdurulana kadar çalış.
+Sunucu kurulumu: [`README_DEPLOY.md`](README_DEPLOY.md).
 
 ### Örnekler
 

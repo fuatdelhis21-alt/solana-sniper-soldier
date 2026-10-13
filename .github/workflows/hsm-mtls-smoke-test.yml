@@ -22,7 +22,8 @@ jobs:
 
       - name: Run HSM Server (Background)
         run: |
-          nohup ./target/debug/hsm_server --certs tools/hsm_server/certs --log-file hsm_audit.log > hsm_server.log 2>&1 &
+          # Throwaway key for CI only; production has no ephemeral fallback.
+          nohup ./target/debug/hsm_server --dev-ephemeral-key --certs tools/hsm_server/certs --log-file hsm_audit.log > hsm_server.log 2>&1 &
 
       - name: Wait for HSM Server + Verify mTLS Enabled
         run: |

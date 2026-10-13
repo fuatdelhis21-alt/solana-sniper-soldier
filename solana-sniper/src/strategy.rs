@@ -28,8 +28,6 @@ pub struct StrategyConfig {
     pub max_daily_trades: u64,
     /// Maximum market cap (lamports) — reject overvalued / already-pumped tokens.
     pub max_market_cap_lamports: u64,
-    /// Minimum number of holders required.
-    pub min_holders: u64,
 }
 
 impl Default for StrategyConfig {
@@ -37,8 +35,13 @@ impl Default for StrategyConfig {
         Self {
             // 1000 SOL liquidity floor (conservative for devnet testing).
             min_liquidity_lamports: 1_000_000_000_000,
-            // 0.1 SOL max position per trade.
-            max_trade_size_lamports: 100_000_000,
+            // 0.01 SOL max position per trade — deliberately BELOW the
+            // production risk cap (0.05 SOL, risk::RiskConfig::
+            // production_defaults). Invariant:
+            //   strategy_position_size <= risk.max_trade_size_lamports
+            // is enforced at startup (main.rs) and by the unit tests here,
+            // so the two constants can never silently diverge again.
+            max_trade_size_lamports: 10_000_000,
             // 1% max slippage.
             max_slippage_bps: 100,
             // 5% stop-loss.
@@ -49,8 +52,12 @@ impl Default for StrategyConfig {
             max_daily_trades: 20,
             // 1M SOL market cap ceiling.
             max_market_cap_lamports: 1_000_000_000_000_000,
-            // Minimum 50 holders.
-            min_holders: 50,
+            // NOTE: no `min_holders` — `getTokenLargestAccounts` returns at
+            // most 20 accounts per the SPL JSON-RPC standard, so an absolute
+            // holder count is structurally unmeasurable. Rug-risk is gated
+            // by the holder-CONCENTRATION check (30% single / 70% top-20,
+            // onchain_risk::MAX_*_HOLDER_PCT) applied in the data layer for
+            // both paper and live when --live-risk-data is on.
         }
     }
 }
@@ -88,6 +95,27 @@ pub enum ExitDecision {
     StopLoss,
     /// Exit because price reached the take-profit threshold.
     TakeProfit,
+    /// Exit because the position reached its maximum holding time
+    /// (live only; set by the caller, never by the price checks).
+    MaxHoldTime,
+    /// Exit because the SOL-side pool liquidity fell far below its level at
+    /// entry (liquidity being pulled — the classic new-pool rug). Set by the
+    /// caller via [`liquidity_dropped`], never by the price checks.
+    LiquidityDrop,
+}
+
+/// SOL-side liquidity drop (bps of the entry level) that forces an exit.
+pub const LIQUIDITY_DROP_EXIT_BPS: u64 = 5_000;
+
+/// True when `current` liquidity is at least [`LIQUIDITY_DROP_EXIT_BPS`]
+/// below `at_entry`. `at_entry == 0` (unknown, e.g. an older position
+/// record) never triggers.
+pub fn liquidity_dropped(at_entry: u64, current: u64) -> bool {
+    if at_entry == 0 {
+        return false;
+    }
+    let floor = at_entry as u128 * (10_000 - LIQUIDITY_DROP_EXIT_BPS) as u128 / 10_000;
+    (current as u128) <= floor
 }
 
 /// Pure strategy logic. Deterministic — no I/O, no randomness.
@@ -121,9 +149,10 @@ impl SimpleSnipeStrategy {
         if candidate.market_cap_lamports > self.config.max_market_cap_lamports {
             return None;
         }
-        if candidate.holders < self.config.min_holders {
-            return None;
-        }
+        // NOTE: no absolute holder-count check here — see StrategyConfig
+        // default docs. Holder risk is gated by the concentration check in
+        // the data layer (onchain_risk::holder_concentration_verdict) with
+        // an explicit RejectReason, never a silent no_entry_signal.
 
         Some(EntrySignal {
             position_size_lamports: self.config.max_trade_size_lamports,
@@ -160,6 +189,46 @@ impl SimpleSnipeStrategy {
         }
         ExitDecision::Hold
     }
+
+    /// Value-based exit decision for a REAL position: `cost` is what the
+    /// entry actually spent and `current_value` what selling the held tokens
+    /// would return right now (both in input-token units, e.g. lamports).
+    /// Unlike `should_exit` this is direction-independent — it does not
+    /// matter whether the bought token is the pool's token0 or token1 — and
+    /// it includes the pool fee on the way out.
+    pub fn should_exit_value(&self, cost: u64, current_value: u64) -> ExitDecision {
+        if cost == 0 {
+            return ExitDecision::Hold;
+        }
+        let ratio = current_value as f64 / cost as f64;
+        if ratio >= 1.0 {
+            if (ratio - 1.0) * 10_000.0 >= self.config.take_profit_bps as f64 {
+                return ExitDecision::TakeProfit;
+            }
+        } else if (1.0 - ratio) * 10_000.0 >= self.config.stop_loss_bps as f64 {
+            return ExitDecision::StopLoss;
+        }
+        ExitDecision::Hold
+    }
+}
+
+/// Fail-closed cross-module invariant, checked at startup (main.rs) and in
+/// tests: the strategy must never size a position above the risk manager's
+/// hard per-trade cap, otherwise every entry would be rejected at the
+/// `pre_trade_check` gate (MaxSpendExceeded) — or worse, silently bypass it.
+/// Breaking this invariant is a configuration error: refuse to start.
+pub fn validate_position_size_invariant(
+    strategy_position_size_lamports: u64,
+    risk_max_trade_size_lamports: u64,
+) -> Result<(), String> {
+    if strategy_position_size_lamports > risk_max_trade_size_lamports {
+        return Err(format!(
+            "config error: strategy position size ({strategy_position_size_lamports} lamports) \
+             exceeds risk max_trade_size_lamports ({risk_max_trade_size_lamports} lamports); \
+             refusing to start (fail-closed)"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -179,7 +248,7 @@ mod tests {
     fn evaluate_accepts_valid_candidate() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let sig = s.evaluate(&valid_candidate(), 1u128 << 64).unwrap();
-        assert_eq!(sig.position_size_lamports, 100_000_000);
+        assert_eq!(sig.position_size_lamports, 10_000_000);
         assert_eq!(sig.slippage_bps, 100);
     }
 
@@ -208,11 +277,38 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_rejects_few_holders() {
+    fn evaluate_no_longer_gates_on_absolute_holder_count() {
+        // Regression (operator-approved design): `min_holders` (50) was
+        // removed because getTokenLargestAccounts caps at 20 accounts, so an
+        // absolute holder count can never be measured. Holder risk is gated
+        // by the concentration check in onchain_risk::holder_concentration_
+        // verdict (30% single / 70% top-20) in the data layer.
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let mut c = valid_candidate();
-        c.holders = 10;
-        assert!(s.evaluate(&c, 1u128 << 64).is_none());
+        c.holders = 10; // would have been rejected by the old min_holders=50
+        assert!(s.evaluate(&c, 1u128 << 64).is_some());
+    }
+
+    #[test]
+    fn should_exit_value_thresholds() {
+        let s = SimpleSnipeStrategy::new(StrategyConfig::default());
+        assert_eq!(
+            s.should_exit_value(10_000_000, 10_000_000),
+            ExitDecision::Hold
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 11_000_000),
+            ExitDecision::TakeProfit
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 9_500_000),
+            ExitDecision::StopLoss
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 9_600_000),
+            ExitDecision::Hold
+        );
+        assert_eq!(s.should_exit_value(0, 1), ExitDecision::Hold);
     }
 
     #[test]
@@ -255,5 +351,46 @@ mod tests {
     fn should_exit_holds_on_zero_entry() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         assert_eq!(s.should_exit(0, 1u128 << 64), ExitDecision::Hold);
+    }
+
+    // ── Trade-size vs risk-cap invariant (fail-closed) ──
+
+    #[test]
+    fn strategy_default_position_size_stays_below_production_risk_limit() {
+        use crate::risk::RiskConfig;
+        let risk_cfg =
+            RiskConfig::production_defaults(std::env::temp_dir().join("size_inv_test")).unwrap();
+        let strat_cfg = StrategyConfig::default();
+        assert!(
+            strat_cfg.max_trade_size_lamports <= risk_cfg.max_trade_size_lamports,
+            "strategy {strat_cfg:?} must never exceed risk cap {}",
+            risk_cfg.max_trade_size_lamports
+        );
+        // Document the exact safe values so a future bump is deliberate.
+        assert_eq!(strat_cfg.max_trade_size_lamports, 10_000_000, "0.01 SOL");
+        assert_eq!(risk_cfg.max_trade_size_lamports, 50_000_000, "0.05 SOL");
+    }
+
+    #[test]
+    fn oversized_strategy_configuration_is_fail_closed_rejected() {
+        let err = validate_position_size_invariant(100_000_000, 50_000_000).unwrap_err();
+        assert!(err.contains("config error"), "got: {err}");
+        assert!(err.contains("refusing to start"), "got: {err}");
+        // Equal sizes are allowed; only exceeding the risk cap is an error.
+        assert!(validate_position_size_invariant(50_000_000, 50_000_000).is_ok());
+        assert!(validate_position_size_invariant(10_000_000, 50_000_000).is_ok());
+    }
+
+    #[test]
+    fn liquidity_drop_threshold() {
+        assert!(
+            !liquidity_dropped(0, 0),
+            "unknown entry liquidity never triggers"
+        );
+        assert!(!liquidity_dropped(100, 51));
+        assert!(liquidity_dropped(100, 50));
+        assert!(liquidity_dropped(100, 0));
+        assert!(!liquidity_dropped(100, 500), "rising liquidity is fine");
+        assert!(liquidity_dropped(u64::MAX, 1));
     }
 }

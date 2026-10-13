@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         mode = "mock_dex".to_string();
         // Mock DEX instruction: a self-contained transfer that exercises the
         // HSM sign → submit → confirm pipeline without a real pool.
-        let ix = solana_sdk::system_instruction::transfer(&from, &from, 1_000);
+        let ix = solana_system_interface::instruction::transfer(&from, &from, 1_000);
         let msg = Message::new(&[ix], Some(&from));
         let mut t = Transaction::new_unsigned(msg);
         t.message.recent_blockhash = blockhash;
@@ -257,7 +257,7 @@ fn main() -> Result<()> {
         if input_mint == native_mint {
             let input_ata =
                 spl_associated_token_account::get_associated_token_address(&from, &input_mint);
-            ixs.push(solana_sdk::system_instruction::transfer(
+            ixs.push(solana_system_interface::instruction::transfer(
                 &from,
                 &input_ata,
                 args.amount_lamports,

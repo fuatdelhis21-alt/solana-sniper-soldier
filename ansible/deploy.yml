@@ -1,145 +1,59 @@
 ---
-# Solana HFT Platform — VPS deployment (Ansible)
-#
-# Deploys TWO separate services with separate non-root users:
-#   - solana-sniper.service  (user: solana-bot)  — bot, paper/dry-run default
-#   - solana-hsm.service     (user: solana-hsm)  — HSM signer, mTLS
-#
-# The bot NEVER holds the HSM private key. The HSM key is injected at deploy
-# time via /etc/solana-hft-hsm/hsm.env (0600, owned by solana-hsm) — this
-# playbook does NOT create or write any secret. Real secrets are provisioned
-# out-of-band by an operator.
-#
-# Mainnet is never configured here. Default RPC/WS are devnet. Live mode is
-# never enabled by this playbook (the unit defaults to --paper).
-#
-# Usage:
-#   ansible-playbook -i hosts ansible/deploy.yml \
-#     -e artifact_path=/path/to/release.tar.gz
-#
-# Required host vars (inventory group_vars):
-#   bot_user / hsm_user  (defaults: solana-bot / solana-hsm)
-#   release_dir / hsm_release_dir
-#   data_dir / log_dir / hsm_log_dir
-#   config_dir / hsm_config_dir
-
-- name: Deploy Solana HFT Platform (bot + HSM)
+# Deploy a release artifact built by scripts/build_and_publish.sh.
+#   ARTIFACT_PATH=./solana-hft-release-*.tar.gz \
+#   BOT_ENV_FILE=./prod/solana-hft.env \        # optional, kept on host if unset
+#   ansible-playbook -i inventory.ini ansible/deploy.yml
+- name: Deploy Solana HFT Platform
   hosts: hft_nodes
   become: yes
   vars:
-    release_dir: /opt/solana-hft
-    hsm_release_dir: /opt/solana-hft-hsm
-    data_dir: /var/lib/solana-hft
-    log_dir: /var/log/solana-hft
-    hsm_log_dir: /var/log/solana-hft-hsm
-    config_dir: /etc/solana-hft
-    hsm_config_dir: /etc/solana-hft-hsm
-    bot_user: solana-bot
-    bot_group: solana-bot
-    hsm_user: solana-hsm
-    hsm_group: solana-hsm
+    artifact_path: "{{ lookup('env', 'ARTIFACT_PATH') }}"
+    bot_env_file: "{{ lookup('env', 'BOT_ENV_FILE') }}"
+    staging_dir: /tmp/solana-hft-deploy
 
   tasks:
-    - name: Create non-root service users
-      user:
-        name: "{{ item }}"
-        system: yes
-        shell: /usr/sbin/nologin
-        create_home: no
-      loop:
-        - "{{ bot_user }}"
-        - "{{ hsm_user }}"
+    - name: Require an artifact
+      assert:
+        that: artifact_path | length > 0
+        fail_msg: "set ARTIFACT_PATH to a solana-hft-release-*.tar.gz"
 
-    - name: Ensure release directories exist
+    - name: Staging directory
       file:
-        path: "{{ item }}"
+        path: "{{ staging_dir }}"
         state: directory
-        owner: root
-        group: root
-        mode: '0755'
-      loop:
-        - "{{ release_dir }}"
-        - "{{ hsm_release_dir }}"
+        mode: "0700"
 
-    - name: Ensure writable data/log dirs exist (bot)
-      file:
-        path: "{{ item }}"
-        state: directory
-        owner: "{{ bot_user }}"
-        group: "{{ bot_group }}"
-        mode: '0750'
-      loop:
-        - "{{ data_dir }}"
-        - "{{ log_dir }}"
+    - name: Upload artifact (from the control node)
+      copy:
+        src: "{{ artifact_path }}"
+        dest: "{{ staging_dir }}/release.tar.gz"
+        mode: "0600"
 
-    - name: Ensure HSM log dir exists (hsm)
-      file:
-        path: "{{ hsm_log_dir }}"
-        state: directory
-        owner: "{{ hsm_user }}"
-        group: "{{ hsm_group }}"
-        mode: '0750'
+    - name: Upload bot env file
+      copy:
+        src: "{{ bot_env_file }}"
+        dest: "{{ staging_dir }}/solana-hft.env"
+        mode: "0600"
+      when: bot_env_file | length > 0
 
-    - name: Ensure config dirs exist (root-owned, 0755)
-      file:
-        path: "{{ item }}"
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
-      loop:
-        - "{{ config_dir }}"
-        - "{{ hsm_config_dir }}"
-
-    - name: Upload bot artifact
+    - name: Extract installer
       unarchive:
-        src: "{{ lookup('env','ARTIFACT_PATH') }}"
-        dest: "{{ release_dir }}"
+        src: "{{ staging_dir }}/release.tar.gz"
+        dest: "{{ staging_dir }}"
         remote_src: yes
+        include: [install_release.sh]
 
-    - name: Upload HSM artifact
-      unarchive:
-        src: "{{ lookup('env','HSM_ARTIFACT_PATH') }}"
-        dest: "{{ hsm_release_dir }}"
-        remote_src: yes
+    - name: Install release
+      command: >-
+        /bin/bash {{ staging_dir }}/install_release.sh {{ staging_dir }}/release.tar.gz
+        {{ (staging_dir ~ '/solana-hft.env') if bot_env_file | length > 0 else '' }}
+      register: install_out
 
-    - name: Copy bot systemd unit
-      template:
-        src: solana-hft.service.j2
-        dest: /etc/systemd/system/solana-sniper.service
-        owner: root
-        group: root
-        mode: '0644'
-
-    - name: Copy HSM systemd unit
-      template:
-        src: solana-hsm.service.j2
-        dest: /etc/systemd/system/solana-hsm.service
-        owner: root
-        group: root
-        mode: '0644'
-
-    - name: Reload systemd
-      systemd:
-        daemon_reload: yes
-
-    - name: Enable HSM service (started manually by operator)
-      systemd:
-        name: solana-hsm
-        enabled: yes
-        state: stopped
-
-    - name: Enable bot service (paper/dry-run default; started manually)
-      systemd:
-        name: solana-sniper
-        enabled: yes
-        state: stopped
-
-    - name: Report deployment summary
+    - name: Installer output
       debug:
-        msg: |
-          Deployed. Services are ENABLED but STOPPED (operator starts them).
-          - solana-hsm:  systemctl start solana-hsm   (HSM_KEY_B64 must be in {{ hsm_config_dir }}/hsm.env)
-          - solana-sniper: systemctl start solana-sniper  (paper/dry-run default)
-          Live mode requires manual operator action (--live --confirm-live + HSM mTLS).
-          Mainnet is never configured by this playbook.
+        var: install_out.stdout_lines
+
+    - name: Remove staging directory (contains secrets)
+      file:
+        path: "{{ staging_dir }}"
+        state: absent

@@ -138,19 +138,14 @@ async fn main() -> Result<()> {
 
     // Build transfer instruction
     let transfer_ix =
-        solana_sdk::system_instruction::transfer(&payer_pubkey, &to_pubkey, amount_lamports);
+        solana_system_interface::instruction::transfer(&payer_pubkey, &to_pubkey, amount_lamports);
 
-    // Build priority fee instruction (ComputeBudget program)
-    let mut instructions: Vec<Instruction> = Vec::new();
-
-    // Set compute unit price (priority fee) — raw instruction building
-    instructions.push(set_compute_unit_price_ix(args.priority_fee_microlamports));
-
-    // Set compute unit limit
-    instructions.push(set_compute_unit_limit_ix(args.compute_units));
-
-    // Add the actual transfer
-    instructions.push(transfer_ix);
+    // Priority fee + compute limit (ComputeBudget program), then the transfer.
+    let instructions: Vec<Instruction> = vec![
+        set_compute_unit_price_ix(args.priority_fee_microlamports),
+        set_compute_unit_limit_ix(args.compute_units),
+        transfer_ix,
+    ];
 
     // Get recent blockhash
     let blockhash = rpc_client

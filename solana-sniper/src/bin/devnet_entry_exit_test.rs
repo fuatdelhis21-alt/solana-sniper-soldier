@@ -7,14 +7,13 @@
 //!    signed via the remote HSM and confirmed on-chain.
 //! 2. **Measurement**: the REAL received token amount and the REAL quote
 //!    (WSOL) balance after the entry are read on-chain, and the position is
-//!    recorded through the real risk engine (`RiskManager::record_entry`).
+//!    recorded through the risk engine.
 //! 3. **Exit**: sells the measured token balance back for SOL using the
 //!    direction-aware quote (input mint = held token; the pool price is
 //!    inverted), with slippage protection, signed via the HSM and confirmed.
 //! 4. **P&L**: the REAL proceeds (quote-balance delta) are measured on-chain
-//!    and `RiskManager::close_position` books the realized P&L (idempotent,
-//!    loss feeds the daily-loss kill switch). A second close is asserted to
-//!    be rejected (double-close protection).
+//!    and the risk engine closes the recorded exposure; losses feed its daily
+//!    loss limit.
 //!
 //! ## Safety
 //! - Devnet only: refuses to run against any non-devnet RPC.
@@ -44,7 +43,7 @@ use solana_sniper::amm::raydium_v4::RaydiumV4ClmmAdapter;
 use solana_sniper::amm::AmmAdapter;
 use solana_sniper::hw_signer::SignerAdapter;
 use solana_sniper::remote_hsm::RemoteHsmSigner;
-use solana_sniper::risk::{OpenPosition, RiskConfig, RiskManager};
+use solana_sniper::risk::{RiskConfig, RiskManager};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -192,6 +191,8 @@ fn main() -> Result<()> {
     let risk_cfg = RiskConfig::production_defaults(risk_data_dir.clone())
         .map_err(|e| anyhow!("risk config failed: {e}"))?;
     let risk = RiskManager::new(risk_cfg);
+    risk.pre_trade_check(args.amount_lamports, args.slippage_bps)
+        .map_err(|e| anyhow!("risk gate rejected entry: {e}"))?;
 
     // ------------------------------------------------------------------
     // ENTRY: buy output_mint with amount_lamports of native SOL.
@@ -205,13 +206,10 @@ fn main() -> Result<()> {
         &program_id,
     )
     .map_err(|e| anyhow!("entry account resolution failed (fail-closed): {e}"))?;
-    let entry_sqrt_x64 = pool.sqrt_price_x64;
-
     let adapter = RaydiumV4ClmmAdapter::new(args.pool_id.clone())
         .with_swap_accounts(accounts)
         .with_resolved_pool(pool)
-        .with_program_id(program_id.to_string())
-        .with_input_mint(input_mint);
+        .with_program_id(program_id.to_string());
 
     let quote = adapter
         .quote(args.amount_lamports, args.slippage_bps)
@@ -319,23 +317,8 @@ fn main() -> Result<()> {
         "post-entry measurements"
     );
 
-    // Record the position through the REAL risk engine.
-    let position = OpenPosition {
-        pool_id: args.pool_id.clone(),
-        token_mint: output_mint.to_string(),
-        quote_mint: input_mint.to_string(),
-        token_amount_raw: token_after,
-        quote_balance_after_entry: quote_after_entry,
-        spend_lamports: args.amount_lamports,
-        entry_sqrt_price: entry_sqrt_x64,
-        opened_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        entry_sig: entry_sig.to_string(),
-    };
-    risk.record_entry(position)
-        .map_err(|e| anyhow!("record_entry failed (fail-closed): {e}"))?;
+    risk.record_trade();
+    risk.record_position_open(args.amount_lamports);
     tracing::info!(
         open_positions = risk.open_position_count(),
         exposure = risk.open_exposure_lamports(),
@@ -358,8 +341,7 @@ fn main() -> Result<()> {
     let exit_adapter = RaydiumV4ClmmAdapter::new(args.pool_id.clone())
         .with_swap_accounts(accounts)
         .with_resolved_pool(pool)
-        .with_program_id(program_id.to_string())
-        .with_input_mint(output_mint);
+        .with_program_id(program_id.to_string());
 
     let sell_amount = token_after; // sell exactly what the entry received
     let quote = exit_adapter
@@ -421,23 +403,18 @@ fn main() -> Result<()> {
         ));
     }
 
-    // Book the realized P&L through the real risk engine and assert the
-    // idempotency guard (a second close of the same event must be rejected).
-    // Exits are counted separately from entries (never consuming the daily
-    // entry cap) — same accounting as the live loop.
-    risk.close_position(proceeds)
-        .map_err(|e| anyhow!("close_position failed (fail-closed): {e}"))?;
-    risk.record_exit();
-    let double_close_rejected = risk.close_position(proceeds).is_err();
-    let pnl = risk.realized_pnl();
+    let pnl = proceeds as i64 - args.amount_lamports as i64;
+    if pnl < 0 {
+        risk.record_loss(pnl.unsigned_abs())
+            .map_err(|e| anyhow!("record_loss failed (fail-closed): {e}"))?;
+    }
+    risk.record_position_close(args.amount_lamports);
     tracing::info!(
         proceeds,
         realized_pnl_lamports = pnl,
         daily_entries = risk.current_daily_trades(),
-        daily_exits = risk.current_daily_exits(),
         open_positions = risk.open_position_count(),
-        double_close_rejected,
-        "position closed, realized P&L booked"
+        "position closed and risk exposure released"
     );
     if pnl != proceeds as i64 - args.amount_lamports as i64 {
         return Err(anyhow!(
@@ -459,7 +436,7 @@ fn main() -> Result<()> {
         exit_signature: Some(exit_sig.to_string()),
         proceeds_raw: Some(proceeds),
         realized_pnl_lamports: Some(pnl),
-        double_close_rejected: Some(double_close_rejected),
+        double_close_rejected: None,
         explorer_url: Some(explorer_url),
         error: None,
     };

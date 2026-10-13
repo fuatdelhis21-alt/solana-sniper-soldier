@@ -114,6 +114,50 @@ impl RemoteHsmSigner {
     }
 }
 
+/// Fail-closed verification of an HSM-returned signature BEFORE it is ever
+/// attached to a transaction or sent. A compromised, misconfigured or
+/// erroring HSM (the scaffold server historically answered failures with an
+/// all-zero signature and HTTP 200) must never produce a "signed" tx:
+/// - the fee payer must be the expected signer,
+/// - the signature must not be the all-zero placeholder,
+/// - the Ed25519 signature must verify against the exact message bytes.
+pub fn verify_hsm_signature(
+    tx: &Transaction,
+    expected_signer: &Pubkey,
+    sig: &Signature,
+) -> Result<(), String> {
+    match tx.message.account_keys.first() {
+        Some(payer) if payer == expected_signer => {}
+        Some(payer) => {
+            return Err(format!(
+                "fee payer {payer} is not the HSM signer {expected_signer} (fail-closed)"
+            ))
+        }
+        None => return Err("transaction has no fee payer (fail-closed)".into()),
+    }
+    if *sig == Signature::default() {
+        return Err("remote hsm returned an all-zero signature (signing failed upstream)".into());
+    }
+    if !sig.verify(expected_signer.as_ref(), &tx.message.serialize()) {
+        return Err(format!(
+            "remote hsm signature does not verify for {expected_signer} (wrong key or tampered tx)"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that the key the HSM reports is the operator-pinned wallet.
+/// LIVE mode requires the pin so an HSM that silently fell back to an
+/// ephemeral/dev key can never be traded with.
+pub fn validate_hsm_pubkey(reported: &Pubkey, expected: Option<&Pubkey>) -> Result<(), String> {
+    match expected {
+        Some(exp) if exp != reported => Err(format!(
+            "HSM key mismatch: HSM reports {reported}, expected --expected-signer {exp} (fail-closed)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl SignerAdapter for RemoteHsmSigner {
     fn sign_transaction(&self, tx: &mut Transaction) -> Result<Signature, String> {
         // Serialize transaction (bincode) → base64.
@@ -137,6 +181,9 @@ impl SignerAdapter for RemoteHsmSigner {
             .map_err(|e| format!("remote hsm request failed: {e}"))?;
 
         let status = res.status();
+        if !status.is_success() {
+            return Err(format!("remote hsm signing rejected with HTTP {status}"));
+        }
         let j: serde_json::Value = res
             .json()
             .map_err(|e| format!("remote hsm invalid JSON response ({status}): {e}"))?;
@@ -162,7 +209,7 @@ impl SignerAdapter for RemoteHsmSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw_signer::SignerAdapter;
+
     use solana_sdk::signature::Signer;
 
     #[test]
@@ -192,6 +239,54 @@ mod tests {
     #[test]
     fn pubkey_rejects_invalid_base58() {
         assert!(Pubkey::from_str("not-a-valid-pubkey!!").is_err());
+    }
+
+    fn signed_pair() -> (solana_sdk::signature::Keypair, Transaction, Signature) {
+        let kp = solana_sdk::signature::Keypair::new();
+        let ix = solana_system_interface::instruction::transfer(&kp.pubkey(), &kp.pubkey(), 1);
+        let msg = solana_sdk::message::Message::new(&[ix], Some(&kp.pubkey()));
+        let tx = Transaction::new_unsigned(msg);
+        let sig = kp.sign_message(&tx.message.serialize());
+        (kp, tx, sig)
+    }
+
+    #[test]
+    fn verify_accepts_valid_signature() {
+        let (kp, tx, sig) = signed_pair();
+        assert!(verify_hsm_signature(&tx, &kp.pubkey(), &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_zero_signature() {
+        let (kp, tx, _) = signed_pair();
+        let err = verify_hsm_signature(&tx, &kp.pubkey(), &Signature::default()).unwrap_err();
+        assert!(err.contains("all-zero"));
+    }
+
+    #[test]
+    fn verify_rejects_signature_from_other_key() {
+        let (kp, tx, _) = signed_pair();
+        let other = solana_sdk::signature::Keypair::new();
+        let bad = other.sign_message(&tx.message.serialize());
+        assert!(verify_hsm_signature(&tx, &kp.pubkey(), &bad).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_fee_payer() {
+        let (_, tx, sig) = signed_pair();
+        let other = Pubkey::new_unique();
+        assert!(verify_hsm_signature(&tx, &other, &sig)
+            .unwrap_err()
+            .contains("fee payer"));
+    }
+
+    #[test]
+    fn pinned_pubkey_mismatch_is_rejected() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        assert!(validate_hsm_pubkey(&a, Some(&a)).is_ok());
+        assert!(validate_hsm_pubkey(&a, None).is_ok());
+        assert!(validate_hsm_pubkey(&a, Some(&b)).is_err());
     }
 
     #[test]
