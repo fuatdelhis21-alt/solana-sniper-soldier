@@ -98,6 +98,24 @@ pub enum ExitDecision {
     /// Exit because the position reached its maximum holding time
     /// (live only; set by the caller, never by the price checks).
     MaxHoldTime,
+    /// Exit because the SOL-side pool liquidity fell far below its level at
+    /// entry (liquidity being pulled — the classic new-pool rug). Set by the
+    /// caller via [`liquidity_dropped`], never by the price checks.
+    LiquidityDrop,
+}
+
+/// SOL-side liquidity drop (bps of the entry level) that forces an exit.
+pub const LIQUIDITY_DROP_EXIT_BPS: u64 = 5_000;
+
+/// True when `current` liquidity is at least [`LIQUIDITY_DROP_EXIT_BPS`]
+/// below `at_entry`. `at_entry == 0` (unknown, e.g. an older position
+/// record) never triggers.
+pub fn liquidity_dropped(at_entry: u64, current: u64) -> bool {
+    if at_entry == 0 {
+        return false;
+    }
+    let floor = at_entry as u128 * (10_000 - LIQUIDITY_DROP_EXIT_BPS) as u128 / 10_000;
+    (current as u128) <= floor
 }
 
 /// Pure strategy logic. Deterministic — no I/O, no randomness.
@@ -361,5 +379,18 @@ mod tests {
         // Equal sizes are allowed; only exceeding the risk cap is an error.
         assert!(validate_position_size_invariant(50_000_000, 50_000_000).is_ok());
         assert!(validate_position_size_invariant(10_000_000, 50_000_000).is_ok());
+    }
+
+    #[test]
+    fn liquidity_drop_threshold() {
+        assert!(
+            !liquidity_dropped(0, 0),
+            "unknown entry liquidity never triggers"
+        );
+        assert!(!liquidity_dropped(100, 51));
+        assert!(liquidity_dropped(100, 50));
+        assert!(liquidity_dropped(100, 0));
+        assert!(!liquidity_dropped(100, 500), "rising liquidity is fine");
+        assert!(liquidity_dropped(u64::MAX, 1));
     }
 }

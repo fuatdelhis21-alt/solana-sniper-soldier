@@ -62,6 +62,9 @@ use remote_hsm::RemoteHsmSigner;
 struct PaperPosition {
     entry_sqrt_price: u128,
     position_size_lamports: u64,
+    /// SOL-side liquidity at entry (liquidity-drop exit, as in live).
+    entry_liquidity_lamports: u64,
+    opened_at_ms: u64,
 }
 
 /// Outcome of one paper iteration against real market data.
@@ -71,6 +74,9 @@ enum PaperTick {
     ClosedStopLoss(i64),
     /// Simulated position closed at the simulated take-profit (realized pnl).
     ClosedTakeProfit(i64),
+    /// Simulated position closed by the max holding time or a SOL-side
+    /// liquidity drop — the same forced exits live applies.
+    ClosedForced(strategy::ExitDecision, i64),
     /// An open simulated position is held (no exit signal).
     Hold,
     /// No open position and the strategy produced no entry signal.
@@ -98,6 +104,13 @@ struct PaperSimulator {
     /// so with token0 as input a RISING price means the held token is
     /// worth LESS — exits and P&L must use the inverted ratio.
     input_is_token0: bool,
+    /// Wall clock for this tick (ms) — set by the caller; 0 in tests.
+    now_ms: u64,
+    /// Max holding time (ms) of a simulated position; 0 = no limit.
+    max_hold_ms: u64,
+    exits_forced: u64,
+    /// Liquidity seen by the last tick (recorded on confirm_entry).
+    last_liquidity_lamports: u64,
 }
 
 impl PaperSimulator {
@@ -117,6 +130,10 @@ impl PaperSimulator {
             no_entry_signals: 0,
             simulated_pnl_lamports: 0,
             input_is_token0: false,
+            now_ms: 0,
+            max_hold_ms: 0,
+            exits_forced: 0,
+            last_liquidity_lamports: 0,
         }
     }
 
@@ -141,6 +158,7 @@ impl PaperSimulator {
         candidate: &strategy::TokenCandidate,
         current_sqrt_price: u128,
     ) -> PaperTick {
+        self.last_liquidity_lamports = candidate.liquidity_lamports;
         if let Some(pos) = self.position {
             // Orient the ratio so "up" always means the held token gained
             // value in input units: (current/entry)^2 for token1 input,
@@ -150,11 +168,31 @@ impl PaperSimulator {
             } else {
                 (pos.entry_sqrt_price, current_sqrt_price)
             };
-            let exit = self.strategy.should_exit(from_sqrt, to_sqrt);
+            let mut exit = self.strategy.should_exit(from_sqrt, to_sqrt);
+            if exit == strategy::ExitDecision::Hold {
+                if strategy::liquidity_dropped(
+                    pos.entry_liquidity_lamports,
+                    candidate.liquidity_lamports,
+                ) {
+                    exit = strategy::ExitDecision::LiquidityDrop;
+                } else if self.max_hold_ms > 0
+                    && self.now_ms.saturating_sub(pos.opened_at_ms) >= self.max_hold_ms
+                {
+                    exit = strategy::ExitDecision::MaxHoldTime;
+                }
+            }
             return match exit {
-                strategy::ExitDecision::Hold | strategy::ExitDecision::MaxHoldTime => {
+                strategy::ExitDecision::Hold => {
                     self.holds += 1;
                     PaperTick::Hold
+                }
+                strategy::ExitDecision::MaxHoldTime | strategy::ExitDecision::LiquidityDrop => {
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
+                    self.simulated_pnl_lamports += pnl;
+                    self.exits_forced += 1;
+                    self.position = None;
+                    PaperTick::ClosedForced(exit, pnl)
                 }
                 strategy::ExitDecision::StopLoss => {
                     let pnl =
@@ -189,6 +227,8 @@ impl PaperSimulator {
         self.position = Some(PaperPosition {
             entry_sqrt_price,
             position_size_lamports: sig.position_size_lamports,
+            entry_liquidity_lamports: self.last_liquidity_lamports,
+            opened_at_ms: self.now_ms,
         });
         self.entries += 1;
     }
@@ -1165,6 +1205,7 @@ async fn manage_open_position(
         Err(e) => return ExitOutcome::Failed(format!("exit account resolution failed: {e}")),
     };
     let held_ata = accounts.input_token_account;
+    let adapter_output_vault = accounts.output_vault;
     let held = match position::fetch_token_balance(rpc_client, &held_ata) {
         Ok(v) => v,
         Err(e) => return ExitOutcome::Failed(e),
@@ -1197,6 +1238,26 @@ async fn manage_open_position(
         pos.position_size_lamports
     };
     let mut decision = strategy.should_exit_value(swapped_in, quote.expected_output);
+    // Liquidity being pulled (rug): both vaults shrink while the price may
+    // barely move, so the price exits never fire. The exit swap's output
+    // vault is the entry-mint (SOL) side.
+    let sol_liquidity = if pos.entry_liquidity_lamports > 0 {
+        match onchain_risk::fetch_vault_liquidity(rpc_client, &adapter_output_vault) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(target: "live", error = %e, "liquidity read failed — liquidity-drop exit skipped this iteration");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if decision == strategy::ExitDecision::Hold
+        && sol_liquidity
+            .is_some_and(|now| strategy::liquidity_dropped(pos.entry_liquidity_lamports, now))
+    {
+        decision = strategy::ExitDecision::LiquidityDrop;
+    }
     if decision == strategy::ExitDecision::Hold
         && max_hold_reached(
             pos.opened_at_ms,
@@ -1213,6 +1274,8 @@ async fn manage_open_position(
         swapped_in,
         cost = pos.cost_input_units,
         current_value = quote.expected_output,
+        sol_liquidity,
+        entry_liquidity = pos.entry_liquidity_lamports,
         decision = ?decision,
         "open position valued on real pool state"
     );
@@ -1522,6 +1585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // plus data-error counts. A paper iteration with a data error is neither a
     // trade nor a success — it is rejected with its real reason.
     let mut paper_sim = PaperSimulator::with_config(strategy_config(&args));
+    paper_sim.max_hold_ms = args.max_hold_secs.saturating_mul(1000);
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -1844,6 +1908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
             paper_sim.input_is_token0 = snapshot.input_is_token0;
+            paper_sim.now_ms = marketdata::now_ms() as u64;
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
 
@@ -1865,11 +1930,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "paper position HELD (no exit signal, real price)"
                     );
                 }
-                PaperTick::ClosedStopLoss(pnl) | PaperTick::ClosedTakeProfit(pnl) => {
-                    let action = if matches!(tick, PaperTick::ClosedStopLoss(_)) {
-                        "exit_stop_loss"
-                    } else {
-                        "exit_take_profit"
+                PaperTick::ClosedStopLoss(pnl)
+                | PaperTick::ClosedTakeProfit(pnl)
+                | PaperTick::ClosedForced(_, pnl) => {
+                    let action = match &tick {
+                        PaperTick::ClosedStopLoss(_) => "exit_stop_loss",
+                        PaperTick::ClosedTakeProfit(_) => "exit_take_profit",
+                        PaperTick::ClosedForced(strategy::ExitDecision::LiquidityDrop, _) => {
+                            "exit_liquidity_drop"
+                        }
+                        _ => "exit_max_hold",
                     };
                     rec.context = serde_json::json!({
                         "action": action,
@@ -2717,6 +2787,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 token_amount: tokens,
                                 entry_signature: sig.to_string(),
                                 opened_at_ms: marketdata::now_ms() as u64,
+                                entry_liquidity_lamports: live_liquidity.unwrap_or(0),
                             };
                             // Persist the position BEFORE the counters so a
                             // crash in between is recoverable on restart.
@@ -2858,6 +2929,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Simulated entries:     {}", paper_sim.entries);
         println!("  Exits stop-loss:       {}", paper_sim.exits_stop_loss);
         println!("  Exits take-profit:     {}", paper_sim.exits_take_profit);
+        println!(
+            "  Exits forced:          {} (max hold / liquidity drop)",
+            paper_sim.exits_forced
+        );
         println!("  Holds:                 {}", paper_sim.holds);
         println!("  No entry signal:       {}", paper_sim.no_entry_signals);
         println!("  Market-data errors:    {}", paper_data_errors);
@@ -3510,5 +3585,38 @@ mod tests {
         assert!(!entry_window_expired(59, 60, false));
         assert!(entry_window_expired(60, 60, false));
         assert!(!entry_window_expired(10_000, 60, true));
+    }
+
+    #[test]
+    fn paper_forced_exits_match_live() {
+        let mut cand = rejected_candidate();
+        cand.liquidity_lamports = 100_000_000_000;
+
+        // Liquidity pulled while the price is flat: forced exit.
+        let mut sim = PaperSimulator::new();
+        sim.tick(&cand, 1_000_000_000); // records liquidity seen at entry
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        let mut drained = cand.clone();
+        drained.liquidity_lamports = 40_000_000_000;
+        assert!(matches!(
+            sim.tick(&drained, 1_000_000_000),
+            PaperTick::ClosedForced(strategy::ExitDecision::LiquidityDrop, _)
+        ));
+        assert!(!sim.has_open_position());
+
+        // Max holding time.
+        let mut sim = PaperSimulator::new();
+        sim.max_hold_ms = 60_000;
+        sim.now_ms = 1_000;
+        sim.tick(&cand, 1_000_000_000);
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        sim.now_ms = 60_999;
+        assert!(matches!(sim.tick(&cand, 1_000_000_000), PaperTick::Hold));
+        sim.now_ms = 61_000;
+        assert!(matches!(
+            sim.tick(&cand, 1_000_000_000),
+            PaperTick::ClosedForced(strategy::ExitDecision::MaxHoldTime, 0)
+        ));
+        assert_eq!(sim.exits_forced, 1);
     }
 }

@@ -104,6 +104,17 @@ systemctl start solana-hft-sniper      # varsayılan: SNIPER_DISCOVERY_MODE=pape
 journalctl -u solana-hft-sniper -f
 ```
 
+Tüm havuzların toplu sonucu (her havuz ayrı süreçte çalıştığı için):
+
+```bash
+python3 /opt/solana-hft/sniper_report.py /var/lib/solana-hft --hours 24
+```
+
+Açık pozisyon için zorunlu çıkışlar (live ve paper aynı): stop-loss (-%5),
+take-profit (+%10), `SNIPER_DISCOVERY_MAX_HOLD_SECS` süresi doldu, ya da SOL
+tarafı likidite girişteki seviyenin **yarısına** düştü (likidite çekiliyor /
+rug).
+
 Kademeler aynıdır: `paper` → `dry-run` → `live`
 (`SNIPER_DISCOVERY_MODE=live` + `SNIPER_DISCOVERY_CONFIRM_LIVE=true` + HSM).
 Kalıcı geçiş için: `systemctl disable solana-hft; systemctl enable solana-hft-sniper`.

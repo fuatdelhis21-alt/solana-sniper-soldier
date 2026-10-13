@@ -25,6 +25,7 @@ cp deploy/systemd/*.service "$STAGE/systemd/"
 cp deploy/install_release.sh deploy/rollback.sh deploy/hsm.env.example "$STAGE/"
 cp .env.example "$STAGE/solana-hft.env.example"
 cp tools/hsm_server/certs/generate_certs.sh README_DEPLOY.md "$STAGE/"
+cp scripts/sniper_report.py scripts/screen_candidates.py "$STAGE/"
 git rev-parse HEAD > "$STAGE/REVISION" 2>/dev/null || true
 (cd "$STAGE" && find . -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum > SHA256SUMS)
 

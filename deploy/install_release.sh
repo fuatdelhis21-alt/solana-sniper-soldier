@@ -61,10 +61,11 @@ if [ -n "$(ls -A "$BIN_DIR" 2>/dev/null)" ]; then
   cp -a "$BIN_DIR" "$RELEASE_DIR/bin.prev"
 fi
 install -m 0755 "$TMPDIR"/bin/* "$BIN_DIR"/
-for f in README_DEPLOY.md solana-hft.env.example hsm.env.example generate_certs.sh rollback.sh; do
+for f in README_DEPLOY.md solana-hft.env.example hsm.env.example generate_certs.sh rollback.sh \
+  sniper_report.py screen_candidates.py; do
   [ -f "$TMPDIR/$f" ] && install -m 0644 "$TMPDIR/$f" "$RELEASE_DIR/$f"
 done
-chmod 0755 "$RELEASE_DIR"/*.sh 2>/dev/null || true
+chmod 0755 "$RELEASE_DIR"/*.sh "$RELEASE_DIR"/*.py 2>/dev/null || true
 
 install -m 0644 "$TMPDIR"/systemd/*.service /etc/systemd/system/
 

@@ -41,6 +41,10 @@ pub struct LivePosition {
     pub token_amount: u64,
     pub entry_signature: String,
     pub opened_at_ms: u64,
+    /// SOL-side (input vault) pool liquidity at entry, for the
+    /// liquidity-drop exit. 0 = unknown (records written before it existed).
+    #[serde(default)]
+    pub entry_liquidity_lamports: u64,
 }
 
 impl LivePosition {
@@ -160,7 +164,20 @@ mod tests {
             token_amount: 42,
             entry_signature: "sig".into(),
             opened_at_ms: 1,
+            entry_liquidity_lamports: 50_000_000_000,
         }
+    }
+
+    #[test]
+    fn old_record_without_entry_liquidity_still_loads() {
+        let d = tmp_dir();
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .remove("entry_liquidity_lamports");
+        std::fs::write(d.join(POSITION_FILE), v.to_string()).unwrap();
+        let p = LivePosition::load(&d).unwrap().unwrap();
+        assert_eq!(p.entry_liquidity_lamports, 0);
     }
 
     #[test]
