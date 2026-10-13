@@ -287,6 +287,16 @@ pub fn fetch_mint_authority_risk(
     let account = rpc
         .get_account(mint)
         .map_err(|e| format!("failed to fetch mint account {mint}: {e}"))?;
+    // The swap path derives classic SPL Token ATAs and passes the classic
+    // token program: a Token-2022 mint (transfer fees, hooks, ...) cannot be
+    // traded safely here — reject it explicitly (fail-closed).
+    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    if account.owner != spl_token {
+        return Err(format!(
+            "mint {mint} is owned by {} — only classic SPL Token mints are supported (Token-2022 rejected)",
+            account.owner
+        ));
+    }
     // SPL Token Mint account is exactly 82 bytes (Token-2022 mints are
     // longer due to extensions, but the base Mint layout is a fixed prefix
     // in both, so this parse is valid for both program versions).

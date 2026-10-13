@@ -54,10 +54,12 @@ impl BlockhashManager {
 
 /// Send a transaction with up to `max_retries` retries and exponential backoff.
 ///
-/// After a successful `send_transaction`, the transaction is confirmed via
-/// `getSignatureStatuses` (confirmed commitment). If the transaction is not
-/// confirmed within `confirm_retries`, an error is returned so the caller does
-/// not report a false "confirmed" for a transaction that was only sent.
+/// After a successful `send_transaction` (which runs preflight simulation),
+/// the transaction is confirmed via `getSignatureStatuses` (confirmed
+/// commitment) for as long as its blockhash can still land — see
+/// `confirm_transaction`. An `Err` therefore means either "rejected/failed"
+/// or "outcome unknown"; callers that move funds must reconcile from real
+/// balances before concluding nothing happened.
 pub fn send_with_retry(
     rpc: &RpcClient,
     tx: &Transaction,
@@ -68,8 +70,7 @@ pub fn send_with_retry(
         match rpc.send_transaction(tx) {
             Ok(sig) => {
                 info!("transaction sent: {sig}");
-                // Confirm the transaction actually landed before reporting success.
-                match confirm_transaction(rpc, &sig) {
+                match confirm_transaction(rpc, &sig, &tx.message.recent_blockhash) {
                     Ok(()) => return Ok(sig),
                     Err(e) => {
                         error!("transaction {sig} not confirmed: {e:#}");
@@ -91,29 +92,70 @@ pub fn send_with_retry(
     }
 }
 
+/// Upper bound on how long a confirmation is awaited. A blockhash stays
+/// usable for ~150 slots (~60-90 s); after it expires the transaction can
+/// never land, which is checked explicitly below.
+const CONFIRM_DEADLINE: Duration = Duration::from_secs(90);
+const CONFIRM_POLL: Duration = Duration::from_millis(500);
+
 /// Poll `getSignatureStatuses` until the transaction reaches `confirmed`
-/// commitment, or the retry budget is exhausted.
+/// commitment. Waits while `blockhash` can still land (it used to give up
+/// after 3 s, so a slow-but-successful swap was reported as failed and the
+/// bought tokens went unmanaged). Returns `Err` when the transaction failed
+/// on-chain, when its blockhash expired without it landing, or — rarely —
+/// when the deadline passed with the outcome still unknown.
 pub fn confirm_transaction(
     rpc: &RpcClient,
     sig: &Signature,
+    blockhash: &Hash,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let max_confirm_retries: u32 = 10;
-    for attempt in 0..max_confirm_retries {
-        let statuses = rpc.get_signature_statuses(&[*sig])?;
-        if let Some(Some(status)) = statuses.value.first() {
-            if let Some(err) = &status.err {
-                return Err(format!("transaction {sig} failed on-chain: {err:?}").into());
-            }
-            if status.confirmation_status
-                == Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
-                || status.confirmation_status
-                    == Some(solana_transaction_status::TransactionConfirmationStatus::Finalized)
-            {
-                info!("transaction {sig} confirmed (slot {})", status.slot);
-                return Ok(());
+    let started = Instant::now();
+    let mut polls: u32 = 0;
+    loop {
+        if let Ok(statuses) = rpc.get_signature_statuses(&[*sig]) {
+            if let Some(Some(status)) = statuses.value.first() {
+                if let Some(err) = &status.err {
+                    return Err(format!("transaction {sig} failed on-chain: {err:?}").into());
+                }
+                if status.confirmation_status
+                    == Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed)
+                    || status.confirmation_status
+                        == Some(solana_transaction_status::TransactionConfirmationStatus::Finalized)
+                {
+                    info!("transaction {sig} confirmed (slot {})", status.slot);
+                    return Ok(());
+                }
             }
         }
-        std::thread::sleep(Duration::from_millis(300));
+        polls += 1;
+        if polls % 10 == 0 {
+            let valid = rpc.is_blockhash_valid(
+                blockhash,
+                solana_commitment_config::CommitmentConfig::processed(),
+            );
+            if let Ok(false) = valid {
+                // Final look: it may have landed in the last slot.
+                if let Ok(st) = rpc.get_signature_statuses(&[*sig]) {
+                    if let Some(Some(status)) = st.value.first() {
+                        if status.err.is_none() {
+                            info!("transaction {sig} landed (slot {})", status.slot);
+                            return Ok(());
+                        }
+                    }
+                }
+                return Err(format!(
+                    "transaction {sig} expired (blockhash no longer valid) — never landed"
+                )
+                .into());
+            }
+        }
+        if started.elapsed() > CONFIRM_DEADLINE {
+            return Err(format!(
+                "transaction {sig} not confirmed within {}s — outcome unknown",
+                CONFIRM_DEADLINE.as_secs()
+            )
+            .into());
+        }
+        std::thread::sleep(CONFIRM_POLL);
     }
-    Err(format!("transaction {sig} not confirmed after {max_confirm_retries} polls").into())
 }

@@ -491,6 +491,13 @@ struct Args {
     #[arg(long, env = "SNIPER_EXPECTED_SIGNER")]
     expected_signer: Option<String>,
 
+    /// DRY-RUN only: build the swap with this funded address as fee payer and
+    /// simulate it on-chain WITHOUT signing (sigVerify off). Validates the
+    /// complete swap on mainnet before your own wallet is funded. Nothing is
+    /// signed or sent.
+    #[arg(long, env = "SNIPER_SIMULATE_PAYER")]
+    simulate_payer: Option<String>,
+
     /// Address for the Prometheus `/metrics` + `/health` HTTP server
     /// (e.g. 127.0.0.1:9090). Disabled when unset.
     #[arg(long, env = "SNIPER_METRICS_ADDR")]
@@ -618,6 +625,7 @@ impl Args {
         p(&mut self.hsm_ca);
         p(&mut self.hsm_client_identity);
         s(&mut self.expected_signer);
+        s(&mut self.simulate_payer);
         s(&mut self.metrics_addr);
         s(&mut self.jito_endpoint);
         s(&mut self.pool_id);
@@ -832,6 +840,51 @@ fn validate_live_args(
     Ok(pinned)
 }
 
+/// SOL kept in the wallet on top of the trade size: rent for a new token
+/// account (~0.00204) and the temporary wSOL account (~0.00204, refunded in
+/// the same tx), plus network/priority fees for the entry and the exit.
+const SOL_RESERVE_LAMPORTS: u64 = 6_000_000;
+
+fn native_mint() -> Pubkey {
+    Pubkey::from_str(amm::raydium_v4::NATIVE_MINT).expect("valid native mint")
+}
+
+/// Minimum input-side balance required before an entry is sent.
+fn entry_required_balance(position_size: u64, input_is_native: bool) -> u64 {
+    if input_is_native {
+        position_size.saturating_add(SOL_RESERVE_LAMPORTS)
+    } else {
+        position_size
+    }
+}
+
+/// Result of an RPC `simulateTransaction`.
+struct SimulationResult {
+    err: Option<String>,
+    units: Option<u64>,
+    logs: Vec<String>,
+}
+
+/// Simulate a (possibly unsigned) transaction against the current chain
+/// state with signature verification off and a fresh blockhash. Read-only:
+/// nothing is sent.
+fn simulate_on_chain(rpc: &RpcClient, tx: &Transaction) -> Result<SimulationResult, String> {
+    let cfg = solana_rpc_client_api::config::RpcSimulateTransactionConfig {
+        sig_verify: false,
+        replace_recent_blockhash: true,
+        commitment: Some(CommitmentConfig::processed()),
+        ..Default::default()
+    };
+    let resp = tokio::task::block_in_place(|| rpc.simulate_transaction_with_config(tx, cfg))
+        .map_err(|e| format!("simulateTransaction failed: {e}"))?;
+    let v = resp.value;
+    Ok(SimulationResult {
+        err: v.err.map(|e| format!("{e:?}")),
+        units: v.units_consumed,
+        logs: v.logs.unwrap_or_default(),
+    })
+}
+
 /// Raydium CLMM program id for the cluster the RPC points at.
 fn clmm_program_id(rpc: &str) -> Pubkey {
     if rpc.contains("devnet") {
@@ -906,7 +959,7 @@ async fn submit_live_tx(
         Ok(bundle_id) => {
             tracing::info!(bundle_id = %bundle_id, "jito bundle accepted — confirming on-chain");
             let sig = tx.signatures[0];
-            match retry::confirm_transaction(rpc_client, &sig) {
+            match retry::confirm_transaction(rpc_client, &sig, &tx.message.recent_blockhash) {
                 Ok(()) => Ok(sig),
                 Err(e) => {
                     tracing::warn!(error = %e, "jito bundle not confirmed — falling back to RPC");
@@ -983,7 +1036,8 @@ async fn manage_open_position(
         Ok(v) => v,
         Err(e) => return ExitOutcome::Failed(format!("exit account resolution failed: {e}")),
     };
-    let held = match position::fetch_token_balance(rpc_client, &accounts.input_token_account) {
+    let held_ata = accounts.input_token_account;
+    let held = match position::fetch_token_balance(rpc_client, &held_ata) {
         Ok(v) => v,
         Err(e) => return ExitOutcome::Failed(e),
     };
@@ -1057,7 +1111,20 @@ async fn manage_open_position(
         Ok(v) => v,
         Err(e) => return ExitOutcome::Failed(e),
     };
-    match submit_live_tx(args, rpc_client, &tx).await {
+    // As with entries, an Err may mean "outcome unknown": if the held token
+    // balance dropped, the sell landed — book it with its real proceeds
+    // instead of retrying and later mis-reporting it as an external close.
+    let submitted = match submit_live_tx(args, rpc_client, &tx).await {
+        Ok(sig) => Ok(sig),
+        Err(e) => match position::fetch_token_balance(rpc_client, &held_ata) {
+            Ok(now_held) if now_held < held => {
+                tracing::warn!(target: "live", error = %e, "exit submission reported an error but the sell LANDED");
+                Ok(tx.signatures[0])
+            }
+            _ => Err(e),
+        },
+    };
+    match submitted {
         Ok(sig) => {
             let proceeds = position::fetch_mint_balance(rpc_client, from, &back_mint)
                 .map(|after| after.saturating_sub(before))
@@ -1228,6 +1295,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.expected_signer.as_deref(),
     )?;
 
+    let simulate_payer: Option<Pubkey> = match &args.simulate_payer {
+        Some(_) if !args.dry_run => {
+            return Err("--simulate-payer is only allowed with --dry-run".into());
+        }
+        Some(pk) => {
+            Some(Pubkey::from_str(pk).map_err(|e| format!("invalid --simulate-payer: {e}"))?)
+        }
+        None => None,
+    };
+
     let hsm_configured = args.hsm_endpoint.is_some();
 
     // Restart-safe open position (LIVE only). The record must agree with the
@@ -1273,7 +1350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The local keyfile is used ONLY for dry-run without a remote HSM. In live
     // mode the remote HSM is mandatory, so the local keyfile is never loaded.
     // In paper mode no signer is loaded at all (no on-chain transaction).
-    let local_signer = if args.dry_run && !hsm_configured {
+    let local_signer = if args.dry_run && !hsm_configured && simulate_payer.is_none() {
         let kp = load_keypair(&args.wallet)?;
         tracing::info!(target: "main", pubkey = %kp.pubkey(), "local keypair loaded (dry-run only)");
         Some(kp)
@@ -1811,7 +1888,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let endpoint = args.hsm_endpoint.as_ref();
             let ca = args.hsm_ca.as_ref();
             let identity = args.hsm_client_identity.as_ref();
-            let from = if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
+            let from = if let Some(payer) = simulate_payer {
+                payer
+            } else if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
                 match hsm_pubkey(ep, ca, id).await.and_then(|pk| {
                     remote_hsm::validate_hsm_pubkey(&pk, expected_signer.as_ref())
                         .map(|_| pk)
@@ -2280,7 +2359,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Sign (HSM when configured; dry-run may use the local
                 // keypair) and VERIFY the signature against the expected
                 // signer before it is attached or sent.
-                if let Err(e) = sign_and_verify(
+                if simulate_payer.is_some() {
+                    // Unsigned simulation build: nothing to sign.
+                } else if let Err(e) = sign_and_verify(
                     &args,
                     local_signer.as_ref(),
                     &from,
@@ -2308,6 +2389,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hex::encode(&tx_bytes)
                     );
                     println!("[DRY-RUN] iter {}: signature = {}", i + 1, tx.signatures[0]);
+                    // Real swap => simulate it on-chain (never sent). This is
+                    // the end-to-end check of program id, accounts, ATAs,
+                    // wSOL wrap, tick arrays and slippage against mainnet.
+                    if swap_adapter.is_some() {
+                        match simulate_on_chain(&rpc_client, &tx) {
+                            Ok(sim) => {
+                                let ok = sim.err.is_none();
+                                println!(
+                                    "[DRY-RUN] iter {}: on-chain simulation {} (compute units {:?}){}",
+                                    i + 1,
+                                    if ok { "OK" } else { "FAILED" },
+                                    sim.units,
+                                    sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                );
+                                for line in sim.logs.iter().rev().take(12).rev() {
+                                    println!("    {line}");
+                                }
+                                tracing::info!(
+                                    target: "dry_run",
+                                    simulation_ok = ok,
+                                    units = sim.units,
+                                    error = sim.err.as_deref().unwrap_or(""),
+                                    "on-chain simulation of the dry-run swap"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "dry_run", error = %e, "on-chain simulation unavailable")
+                            }
+                        }
+                    }
                     tracing::info!(
                         target: "dry_run",
                         signature = %tx.signatures[0],
@@ -2338,7 +2449,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
-                    match submit_live_tx(&args, &rpc_client, &tx).await {
+                    // Funds check BEFORE sending: the trade size plus a SOL
+                    // reserve (ATA rent for a new token account, wSOL account,
+                    // network + priority fees, and the later exit's fees).
+                    // Without it an underfunded wallet would fail every
+                    // iteration and each failure was booked as a loss.
+                    let required = entry_required_balance(
+                        entry_signal.position_size_lamports,
+                        in_mint == native_mint(),
+                    );
+                    if before_in < required {
+                        tracing::warn!(
+                            mode = mode_target,
+                            balance = before_in,
+                            required,
+                            "insufficient balance for entry + SOL reserve — no trade (fund the wallet)"
+                        );
+                        metrics::record_trade_rejected(
+                            &metrics_registry,
+                            mode_label,
+                            "insufficient_balance",
+                        );
+                        sleep(loop_interval).await;
+                        continue;
+                    }
+                    let submitted = submit_live_tx(&args, &rpc_client, &tx).await;
+                    // An Err may mean "outcome unknown" (e.g. confirmation
+                    // timeout). Reconcile from the real token balance before
+                    // concluding nothing happened, so a swap that landed late
+                    // is never left unmanaged (and never bought twice).
+                    let outcome: Result<Signature, String> = match submitted {
+                        Ok(sig) => Ok(sig),
+                        Err(e) => {
+                            match position::fetch_mint_balance(&rpc_client, &from, &out_mint) {
+                                Ok(after) if after > before_out => {
+                                    tracing::warn!(mode = mode_target, error = %e, received = after - before_out, "submission reported an error but the swap LANDED — recording the position");
+                                    Ok(tx.signatures[0])
+                                }
+                                Ok(_) => Err(format!("{e}")),
+                                Err(be) => {
+                                    risk_manager.trigger_kill_switch(&format!(
+                                        "entry outcome unknown (send: {e}; balance check: {be}) — inspect the wallet before re-arming"
+                                    ));
+                                    Err(format!("{e} — outcome unknown, kill switch engaged"))
+                                }
+                            }
+                        }
+                    };
+                    match outcome {
                         Ok(sig) => {
                             successful_trades += 1;
                             let cost = position::fetch_mint_balance(&rpc_client, &from, &in_mint)
@@ -2684,6 +2842,15 @@ mod tests {
         assert!(validate_live_args(false, None, None, None, false, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn entry_requires_sol_reserve_on_top_of_size() {
+        assert_eq!(entry_required_balance(10_000_000, true), 16_000_000);
+        assert_eq!(entry_required_balance(10_000_000, false), 10_000_000);
+        // The wallet that failed the dry-run simulation (0.00203 SOL) is
+        // rejected up front instead of failing on-chain every iteration.
+        assert!(2_028_080 < entry_required_balance(10_000_000, true));
     }
 
     #[test]
