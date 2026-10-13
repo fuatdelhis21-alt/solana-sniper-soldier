@@ -1132,6 +1132,75 @@ async fn submit_live_tx(
     }
 }
 
+/// Book (or drop) an entry that was sent but whose outcome was never
+/// recorded — the process died while confirming it. Waits until the
+/// transaction is confirmed or its blockhash expired, then decides from the
+/// real balances. Fail-closed: if the outcome cannot be established, LIVE
+/// does not start.
+fn reconcile_pending_entry(
+    data_dir: &Path,
+    rpc: &RpcClient,
+    risk_manager: &risk::RiskManager,
+) -> Result<(), String> {
+    let Some(p) = position::PendingEntry::load(data_dir)
+        .map_err(|e| format!("pending entry record unreadable — refusing to arm LIVE: {e}"))?
+    else {
+        return Ok(());
+    };
+    if position::LivePosition::load(data_dir)?.is_some() {
+        // The position was booked; only the cleanup was interrupted.
+        return position::PendingEntry::clear(data_dir);
+    }
+    tracing::warn!(target: "main", signature = %p.signature, pool = %p.position.pool_id, "unfinished entry from a previous run — reconciling from the chain");
+    let sig = Signature::from_str(&p.signature).map_err(|e| format!("pending entry: {e}"))?;
+    let bh = solana_sdk::hash::Hash::from_str(&p.blockhash)
+        .map_err(|e| format!("pending entry blockhash: {e}"))?;
+    // Ok = landed; Err = failed / expired / unknown — the balances decide.
+    let confirm = retry::confirm_transaction(rpc, &sig, &bh);
+    let parse = |v: &str| Pubkey::from_str(v).map_err(|e| format!("pending entry mint: {e}"));
+    let owner_ata_mints = (
+        parse(&p.position.input_mint)?,
+        parse(&p.position.output_mint)?,
+    );
+    let owner = rpc
+        .get_transaction_with_config(
+            &sig,
+            solana_rpc_client_api::config::RpcTransactionConfig {
+                encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .ok()
+        .and_then(|t| t.transaction.transaction.decode())
+        .and_then(|t| t.message.static_account_keys().first().copied());
+    let Some(owner) = owner else {
+        if confirm.is_err() {
+            // Not on chain: the swap never happened.
+            tracing::warn!(target: "main", signature = %p.signature, "unfinished entry never landed — dropped");
+            return position::PendingEntry::clear(data_dir);
+        }
+        return Err(format!(
+            "unfinished entry {} confirmed but not readable — inspect the wallet before arming LIVE (fail-closed)",
+            p.signature
+        ));
+    };
+    let after_in = position::fetch_mint_balance(rpc, &owner, &owner_ata_mints.0)?;
+    let after_out = position::fetch_mint_balance(rpc, &owner, &owner_ata_mints.1)?;
+    match p.resolve(after_in, after_out) {
+        Some(pos) => {
+            pos.save(data_dir)?;
+            risk_manager.record_trade();
+            risk_manager.record_position_open(pos.position_size_lamports);
+            tracing::warn!(target: "main", signature = %p.signature, tokens = pos.token_amount, cost = pos.cost_input_units, "unfinished entry LANDED — position recorded and will be managed");
+        }
+        None => {
+            tracing::warn!(target: "main", signature = %p.signature, "unfinished entry did not deliver tokens — dropped");
+        }
+    }
+    position::PendingEntry::clear(data_dir)
+}
+
 /// Outcome of one exit-management iteration for the open live position.
 #[derive(Debug)]
 enum ExitOutcome {
@@ -1506,6 +1575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // position it cannot exit (fail-closed refuse) or forget one it holds.
     let mut live_position: Option<position::LivePosition> = None;
     if args.live {
+        reconcile_pending_entry(&args.data_dir, &rpc_client, &risk_manager)?;
         live_position = position::LivePosition::load(&args.data_dir)
             .map_err(|e| format!("live position record unreadable — refusing to arm LIVE: {e}"))?;
         match (&live_position, risk_manager.open_position_count()) {
@@ -2737,6 +2807,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sleep(loop_interval).await;
                         continue;
                     }
+                    // Crash safety: record the entry BEFORE it is sent. If the
+                    // process dies while waiting for the confirmation, the
+                    // next start books the position from the chain.
+                    let pending = position::PendingEntry {
+                        signature: tx.signatures[0].to_string(),
+                        blockhash: tx.message.recent_blockhash.to_string(),
+                        before_in,
+                        before_out,
+                        position: position::LivePosition {
+                            pool_id: args.pool_id.clone().unwrap_or_default(),
+                            input_mint: args.input_mint.clone().unwrap_or_default(),
+                            output_mint: args.output_mint.clone().unwrap_or_default(),
+                            entry_sqrt_price: entry_sqrt.to_string(),
+                            position_size_lamports: entry_signal.position_size_lamports,
+                            cost_input_units: 0,
+                            token_amount: 0,
+                            entry_signature: tx.signatures[0].to_string(),
+                            opened_at_ms: marketdata::now_ms() as u64,
+                            entry_liquidity_lamports: live_liquidity.unwrap_or(0),
+                        },
+                    };
+                    if let Err(e) = pending.save(&args.data_dir) {
+                        tracing::error!(mode = mode_target, error = %e, "cannot persist the pending entry — no trade (fail-closed)");
+                        sleep(loop_interval).await;
+                        continue;
+                    }
                     let submitted = submit_live_tx(&args, &rpc_client, &tx).await;
                     // An Err may mean "outcome unknown" (e.g. confirmation
                     // timeout). Reconcile from the real token balance before
@@ -2750,8 +2846,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     tracing::warn!(mode = mode_target, error = %e, received = after - before_out, "submission reported an error but the swap LANDED — recording the position");
                                     Ok(tx.signatures[0])
                                 }
-                                Ok(_) => Err(format!("{e}")),
+                                Ok(_) => {
+                                    // Definitely not landed (the confirmation
+                                    // waits for the blockhash to expire).
+                                    let _ = position::PendingEntry::clear(&args.data_dir);
+                                    Err(format!("{e}"))
+                                }
                                 Err(be) => {
+                                    // pending_entry.json stays: the next
+                                    // start reconciles it from the chain.
                                     risk_manager.trigger_kill_switch(&format!(
                                         "entry outcome unknown (send: {e}; balance check: {be}) — inspect the wallet before re-arming"
                                     ));
@@ -2792,6 +2895,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             risk_manager.record_trade();
                             risk_manager.record_position_open(entry_signal.position_size_lamports);
+                            if let Err(e) = position::PendingEntry::clear(&args.data_dir) {
+                                tracing::warn!(mode = mode_target, error = %e, "pending entry not cleared (harmless: the position record exists)");
+                            }
                             live_position = Some(pos);
                             metrics::record_trade_executed(&metrics_registry, mode_label);
                             metrics::record_trade(
@@ -3611,5 +3717,82 @@ mod tests {
             PaperTick::ClosedForced(strategy::ExitDecision::MaxHoldTime, 0)
         ));
         assert_eq!(sim.exits_forced, 1);
+    }
+
+    fn pending_fixture() -> (std::path::PathBuf, position::PendingEntry) {
+        let dir = std::env::temp_dir().join(format!(
+            "pending_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = position::PendingEntry {
+            signature: Signature::default().to_string(),
+            blockhash: solana_sdk::hash::Hash::default().to_string(),
+            before_in: 100,
+            before_out: 0,
+            position: position::LivePosition {
+                pool_id: Pubkey::new_unique().to_string(),
+                input_mint: amm::raydium_v4::NATIVE_MINT.into(),
+                output_mint: Pubkey::new_unique().to_string(),
+                entry_sqrt_price: "1".into(),
+                position_size_lamports: 10_000_000,
+                cost_input_units: 0,
+                token_amount: 0,
+                entry_signature: Signature::default().to_string(),
+                opened_at_ms: 1,
+                entry_liquidity_lamports: 0,
+            },
+        };
+        p.save(&dir).unwrap();
+        (dir, p)
+    }
+
+    fn mock_rpc_blockhash_expired() -> RpcClient {
+        let mut m = solana_rpc_client::mock_sender::MocksMap::default();
+        for _ in 0..4 {
+            m.insert(
+                solana_rpc_client_api::request::RpcRequest::IsBlockhashValid,
+                serde_json::json!({"context": {"slot": 1}, "value": false}),
+            );
+        }
+        RpcClient::new_mock_with_mocks_map("sig_not_found", m)
+    }
+
+    #[test]
+    fn unfinished_entry_that_never_landed_is_dropped() {
+        let (dir, _) = pending_fixture();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).unwrap();
+        assert_eq!(position::PendingEntry::load(&dir).unwrap(), None);
+        assert_eq!(position::LivePosition::load(&dir).unwrap(), None);
+        assert_eq!(rm.open_position_count(), 0);
+    }
+
+    #[test]
+    fn unfinished_entry_with_booked_position_only_needs_cleanup() {
+        let (dir, p) = pending_fixture();
+        let mut pos = p.position.clone();
+        pos.token_amount = 5;
+        pos.save(&dir).unwrap();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        // No RPC call is needed: the mock would fail any balance read.
+        reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).unwrap();
+        assert_eq!(position::PendingEntry::load(&dir).unwrap(), None);
+        assert_eq!(position::LivePosition::load(&dir).unwrap(), Some(pos));
+    }
+
+    #[test]
+    fn corrupt_pending_entry_refuses_live() {
+        let (dir, _) = pending_fixture();
+        std::fs::write(dir.join("pending_entry.json"), "{not json").unwrap();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        assert!(reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).is_err());
     }
 }

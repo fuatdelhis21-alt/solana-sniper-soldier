@@ -26,7 +26,7 @@ RestartSec=10s
 # SIGTERM reaches the supervisor and the running trading process; an open
 # live position stays persisted and is resumed on the next start.
 KillSignal=SIGTERM
-TimeoutStopSec=150
+TimeoutStopSec=300
 LimitNOFILE=65536
 
 # Hardening
@@ -34,6 +34,22 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
 ReadWritePaths=/var/lib/solana-hft
 ReadOnlyPaths=/etc/solana-hft
 

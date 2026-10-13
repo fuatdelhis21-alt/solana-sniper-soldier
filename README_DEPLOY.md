@@ -36,7 +36,7 @@ ARTIFACT_PATH=./solana-hft-release-<ts>.tar.gz BOT_ENV_FILE=./prod.env \
 | `/etc/solana-hft/hsm.env` | `HSM_KEY_B64`, 0600 `solana-hsm` |
 | `/etc/solana-hft/hsm-certs/` | `server.pem server.key ca.pem` |
 | `/etc/solana-hft/client-certs/` | `ca.pem client_all.pem` |
-| `/var/lib/solana-hft/` | `risk_state.json`, `live_position.json`, `logs/`, `audit/` |
+| `/var/lib/solana-hft/` | `risk_state.json`, `live_position.json`, `pending_entry.json` (gönderilmiş ama sonucu kaydedilmemiş giriş — açılışta zincirden uzlaştırılır), `decisions/`, `logs/`, `audit/` |
 
 ## 3. HSM + mTLS
 

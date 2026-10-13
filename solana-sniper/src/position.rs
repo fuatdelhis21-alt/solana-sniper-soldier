@@ -96,6 +96,72 @@ impl LivePosition {
     }
 }
 
+const PENDING_FILE: &str = "pending_entry.json";
+
+/// A live entry that was signed and is about to be (or was) submitted, but
+/// whose outcome is not booked yet. Written BEFORE the transaction is sent
+/// and removed once the outcome is known, so a crash, OOM kill or a systemd
+/// SIGKILL during the confirmation wait can never leave bought tokens
+/// unmanaged: the next start reconciles it from the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEntry {
+    pub signature: String,
+    pub blockhash: String,
+    /// Input / output mint balances right before the entry.
+    pub before_in: u64,
+    pub before_out: u64,
+    /// The position to book if the swap landed (cost / amount filled in by
+    /// [`PendingEntry::resolve`]).
+    pub position: LivePosition,
+}
+
+impl PendingEntry {
+    fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join(PENDING_FILE)
+    }
+
+    pub fn load(data_dir: &Path) -> Result<Option<Self>, String> {
+        let path = Self::path(data_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|e| format!("corrupt {}: {e}", path.display()))
+    }
+
+    pub fn save(&self, data_dir: &Path) -> Result<(), String> {
+        let path = Self::path(data_dir);
+        let tmp = data_dir.join(format!("{PENDING_FILE}.tmp"));
+        let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("cannot rename to {}: {e}", path.display()))
+    }
+
+    pub fn clear(data_dir: &Path) -> Result<(), String> {
+        match std::fs::remove_file(Self::path(data_dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot remove pending entry: {e}")),
+        }
+    }
+
+    /// The position to book from the balances after the entry settled:
+    /// `Some` when output tokens arrived, `None` when the swap never landed.
+    pub fn resolve(&self, after_in: u64, after_out: u64) -> Option<LivePosition> {
+        if after_out <= self.before_out {
+            return None;
+        }
+        let mut pos = self.position.clone();
+        pos.token_amount = after_out - self.before_out;
+        pos.cost_input_units = self.before_in.saturating_sub(after_in).max(1);
+        Some(pos)
+    }
+}
+
 /// Realized P&L in input units: what the exit returned minus what the entry
 /// cost. Negative = loss.
 pub fn realized_pnl(cost_input_units: u64, proceeds_input_units: u64) -> i64 {
@@ -166,6 +232,31 @@ mod tests {
             opened_at_ms: 1,
             entry_liquidity_lamports: 50_000_000_000,
         }
+    }
+
+    #[test]
+    fn pending_entry_roundtrip_and_resolution() {
+        let d = tmp_dir();
+        assert_eq!(PendingEntry::load(&d).unwrap(), None);
+        let p = PendingEntry {
+            signature: "sig".into(),
+            blockhash: "bh".into(),
+            before_in: 100_000_000,
+            before_out: 5,
+            position: sample(),
+        };
+        p.save(&d).unwrap();
+        assert_eq!(PendingEntry::load(&d).unwrap(), Some(p.clone()));
+        // Landed: tokens arrived, cost from the input balance drop.
+        let pos = p.resolve(89_000_000, 47).unwrap();
+        assert_eq!(pos.token_amount, 42);
+        assert_eq!(pos.cost_input_units, 11_000_000);
+        assert_eq!(pos.pool_id, "pool");
+        // Never landed: no position.
+        assert_eq!(p.resolve(100_000_000, 5), None);
+        PendingEntry::clear(&d).unwrap();
+        PendingEntry::clear(&d).unwrap();
+        assert_eq!(PendingEntry::load(&d).unwrap(), None);
     }
 
     #[test]

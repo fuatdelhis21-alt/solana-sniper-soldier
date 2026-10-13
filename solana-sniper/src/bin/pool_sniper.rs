@@ -34,7 +34,7 @@ use solana_sniper::pool_discovery::{
     find_create_pools, logs_contain_create_pool, resolve_indexes, token_side, Candidate,
     CheckOutcome, DailyCap, NewPool, PendingSignatures, RawInstruction, WatchList,
 };
-use solana_sniper::position::LivePosition;
+use solana_sniper::position::{LivePosition, PendingEntry};
 use solana_sniper::redact::RedactingMakeWriter;
 use solana_sniper::risk;
 use solana_transaction_status::{option_serializer::OptionSerializer, UiInstruction};
@@ -704,8 +704,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 3) Start a trading process when idle.
         if running.is_none() {
-            // An open live position always comes first (shared data dir).
-            match LivePosition::load(&args.data_dir) {
+            // An open live position always comes first (shared data dir) —
+            // also one whose entry is still unreconciled (pending_entry.json:
+            // the trading process died while confirming it).
+            let open = LivePosition::load(&args.data_dir).and_then(|p| match p {
+                Some(p) => Ok(Some(p)),
+                None => PendingEntry::load(&args.data_dir).map(|e| e.map(|e| e.position)),
+            });
+            match open {
                 Ok(Some(pos)) if args.mode == Mode::Live => {
                     tracing::warn!(target: "discovery", pool = %pos.pool_id, "open live position — resuming its management");
                     if let Ok(pk) = Pubkey::from_str(&pos.pool_id) {

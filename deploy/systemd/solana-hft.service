@@ -25,9 +25,12 @@ ExecStart=/opt/solana-hft/bin/solana-sniper
 Restart=on-failure
 RestartSec=10s
 # SIGTERM lets the bot finish the current iteration; an open position stays
-# persisted in live_position.json and is resumed on the next start.
+# persisted in live_position.json and is resumed on the next start. One
+# iteration can wait up to 180 s for a swap confirmation: the stop timeout
+# must cover it (an entry interrupted anyway is reconciled from
+# pending_entry.json on the next start).
 KillSignal=SIGTERM
-TimeoutStopSec=60
+TimeoutStopSec=240
 LimitNOFILE=65536
 
 # Hardening
@@ -35,6 +38,22 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
 ReadWritePaths=/var/lib/solana-hft
 ReadOnlyPaths=/etc/solana-hft
 

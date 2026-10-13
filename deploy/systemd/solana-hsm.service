@@ -21,6 +21,25 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The signing key lives in memory: no core dumps.
+LimitCORE=0
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+UMask=0077
 ReadWritePaths=/var/lib/solana-hsm
 ReadOnlyPaths=/etc/solana-hft
 
