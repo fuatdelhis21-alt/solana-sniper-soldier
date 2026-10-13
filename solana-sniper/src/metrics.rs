@@ -9,7 +9,6 @@
 //! if the metrics registry is unavailable, `/health` still reports the process
 //! liveness but `/metrics` returns 503.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use prometheus::{

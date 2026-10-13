@@ -249,10 +249,56 @@ pub fn resolve_user_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 /// Fetch and parse a pool state account from the RPC.
-pub fn fetch_pool_state(rpc: &RpcClient, pool_id: &Pubkey) -> Result<ResolvedPool, String> {
+/// Anchor account discriminator: sha256("account:<Name>")[..8].
+pub fn anchor_account_discriminator(name: &str) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(format!("account:{name}").as_bytes());
+    let mut d = [0u8; 8];
+    d.copy_from_slice(&h[..8]);
+    d
+}
+
+/// Fail-closed identity check of a CLMM program account: it must be owned
+/// by `program_id` and carry the Anchor discriminator of `kind` (e.g.
+/// "PoolState", "AmmConfig"). Without it any account with a matching byte
+/// layout (another program's, or a wrong cluster's) would be parsed and fed
+/// into the price / liquidity / fee data the risk gates rely on.
+pub fn verify_clmm_account(
+    kind: &str,
+    key: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+    program_id: &Pubkey,
+) -> Result<(), String> {
+    if owner != program_id {
+        return Err(format!(
+            "{kind} {key} is owned by {owner}, not the CLMM program {program_id} (fail-closed)"
+        ));
+    }
+    if data.get(..8) != Some(&anchor_account_discriminator(kind)[..]) {
+        return Err(format!(
+            "{key} is not a CLMM {kind} account (discriminator mismatch, fail-closed)"
+        ));
+    }
+    Ok(())
+}
+
+/// Fetch, verify (owner + discriminator) and parse a CLMM pool state.
+pub fn fetch_pool_state(
+    rpc: &RpcClient,
+    pool_id: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<ResolvedPool, String> {
     let account = rpc
         .get_account(pool_id)
         .map_err(|e| format!("failed to fetch pool state {pool_id}: {e}"))?;
+    verify_clmm_account(
+        "PoolState",
+        pool_id,
+        &account.owner,
+        &account.data,
+        program_id,
+    )?;
     parse_pool_state(pool_id, &account.data)
 }
 
@@ -268,7 +314,7 @@ pub fn resolve_swap_accounts(
     output_mint: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<(SwapAccounts, ResolvedPool), String> {
-    let mut pool = fetch_pool_state(rpc, pool_id)?;
+    let mut pool = fetch_pool_state(rpc, pool_id, program_id)?;
 
     // Determine which vault is the input/output based on the requested mints.
     let (input_vault, output_vault) = if input_mint == &pool.token_mint_0 {
@@ -304,6 +350,13 @@ pub fn resolve_swap_accounts(
         .first()
         .and_then(|a| a.as_ref())
         .ok_or_else(|| format!("amm config {} not found", pool.amm_config))?;
+    verify_clmm_account(
+        "AmmConfig",
+        &pool.amm_config,
+        &amm_config.owner,
+        &amm_config.data,
+        program_id,
+    )?;
     pool.trade_fee_rate = Some(parse_trade_fee_rate(&amm_config.data)?);
     let bitmap_extension = if ext_needed {
         match fetched.get(1 + candidates.len()).and_then(|a| a.as_ref()) {
@@ -348,7 +401,38 @@ pub fn resolve_swap_accounts(
 mod tests {
     use super::*;
 
+    #[test]
+    fn clmm_account_discriminators_match_anchor() {
+        // sha256("account:PoolState")[..8] / sha256("account:AmmConfig")[..8]
+        // as published in the Raydium CLMM IDL.
+        assert_eq!(
+            anchor_account_discriminator("PoolState"),
+            [247, 237, 227, 245, 215, 195, 222, 70]
+        );
+        assert_eq!(
+            anchor_account_discriminator("AmmConfig"),
+            [218, 244, 33, 104, 203, 203, 43, 111]
+        );
+    }
+
+    #[test]
+    fn verify_clmm_account_is_fail_closed() {
+        let program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
+        let key = Pubkey::new_unique();
+        let mut data = anchor_account_discriminator("PoolState").to_vec();
+        data.extend_from_slice(&[0u8; 300]);
+        assert!(verify_clmm_account("PoolState", &key, &program, &data, &program).is_ok());
+        // Wrong owner (e.g. a look-alike account of another program).
+        let other = Pubkey::new_unique();
+        assert!(verify_clmm_account("PoolState", &key, &other, &data, &program).is_err());
+        // Right owner, wrong account type.
+        assert!(verify_clmm_account("AmmConfig", &key, &program, &data, &program).is_err());
+        // Too short.
+        assert!(verify_clmm_account("PoolState", &key, &program, &data[..4], &program).is_err());
+    }
+
     /// Build a synthetic 273-byte pool state buffer with known field values.
+    #[allow(clippy::too_many_arguments)]
     fn synthetic_pool_data(
         amm_config: &Pubkey,
         mint0: &Pubkey,
@@ -529,7 +613,7 @@ mod tests {
         let pool = parse_pool_state(&pool_id, &data).unwrap();
 
         // input = mint0 => input_vault = vault0, output_vault = vault1.
-        let (iv, ov) = if &mint0 == &pool.token_mint_0 {
+        let (iv, ov) = if mint0 == pool.token_mint_0 {
             (pool.token_vault_0, pool.token_vault_1)
         } else {
             (pool.token_vault_1, pool.token_vault_0)

@@ -110,7 +110,7 @@ fn load_or_create_signer() -> Keypair {
     if let Ok(key_b64) = std::env::var("HSM_KEY_B64") {
         if let Ok(bytes) = general_purpose::STANDARD.decode(key_b64) {
             if let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) {
-                if let Ok(kp) = Keypair::from_bytes(&arr) {
+                if let Ok(kp) = Keypair::try_from(&arr[..]) {
                     return kp;
                 }
             }
@@ -278,6 +278,7 @@ mod tests {
     fn valid_tx_b64(kp: &Keypair) -> String {
         let from = kp.pubkey();
         let to = solana_sdk::pubkey::Pubkey::new_from_array([0u8; 32]);
+        #[allow(deprecated)]
         let ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
         let msg = solana_sdk::message::Message::new(&[ix], Some(&from));
         let tx = solana_sdk::transaction::Transaction::new_unsigned(msg);

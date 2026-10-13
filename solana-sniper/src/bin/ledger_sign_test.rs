@@ -1,7 +1,6 @@
 use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signer;
-use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction;
 use solana_sniper::hw_signer::{HwSignerStub, LocalKeypairSigner, SignerAdapter};
 use solana_sniper::ledger_signer::HwLedgerSigner;
@@ -23,7 +22,7 @@ fn main() {
     // Build a dummy transfer tx message (1 lamport to a random address) for signing test
     let from = solana_sdk::signature::read_keypair_file(&keyfile).expect("read keypair");
     let to = Pubkey::new_unique();
-    let ix = system_instruction::transfer(&from.pubkey(), &to, 1);
+    let ix = solana_system_interface::instruction::transfer(&from.pubkey(), &to, 1);
     let msg = Message::new(&[ix], Some(&from.pubkey()));
     let mut tx = Transaction::new_unsigned(msg);
 

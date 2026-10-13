@@ -10,8 +10,6 @@
 //! - RiskManager guards (max trade size, slippage, daily loss) run before every trade.
 //! - BlockhashManager + send_with_retry provide 3-level exponential backoff.
 
-mod integration;
-
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,27 +26,15 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 
-// Local modules
-mod amm;
-mod config;
-mod decision;
-mod discovery;
-mod executor;
-mod hw_signer;
-mod jito;
-mod marketdata;
-mod metrics;
-mod onchain_risk;
-mod position;
-mod redact;
-mod remote_hsm;
-mod retry;
-mod risk;
-mod strategy;
-mod tx;
+// Library modules (solana_sniper crate): compiled once, shared with the
+// other binaries (pool-sniper, tools).
 use amm::AmmAdapter;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
+use solana_sniper::{
+    amm, decision, discovery, hw_signer, jito, marketdata, metrics, onchain_risk, position, redact,
+    remote_hsm, retry, risk, strategy,
+};
 
 // ============================================================================
 // AŞAMA 2/3/4 — Paper trading on REAL on-chain market data (no tx ever built)
@@ -260,7 +246,6 @@ fn simulated_pnl_lamports(
 /// real vault liquidity + holder concentration.
 struct PaperMarketSnapshot {
     current_sqrt_price: u128,
-    price_timestamp_ms: u128,
     liquidity_lamports: u64,
     market_cap_lamports: u64,
     holders: u64,
@@ -451,7 +436,6 @@ fn resolve_paper_market_data(
 
     Ok(PaperMarketSnapshot {
         current_sqrt_price,
-        price_timestamp_ms,
         liquidity_lamports,
         market_cap_lamports: args.pool_market_cap,
         holders,
@@ -738,7 +722,7 @@ fn load_keypair(path: &PathBuf) -> Result<Keypair, Box<dyn std::error::Error>> {
     let arr: [u8; 64] = bytes
         .try_into()
         .map_err(|_| "wallet.json must be exactly 64 bytes")?;
-    Keypair::from_bytes(&arr).map_err(|e| e.into())
+    Keypair::try_from(&arr[..]).map_err(|e| e.into())
 }
 
 /// Fail-closed signing configuration validation.
@@ -815,7 +799,7 @@ async fn hsm_sign(
     let endpoint = endpoint.to_string();
     let ca = ca.to_path_buf();
     let identity = identity.to_path_buf();
-    let mut tx = tx.clone();
+    let tx = tx.clone();
     tokio::task::spawn_blocking(move || -> Result<Signature, String> {
         let signer = RemoteHsmSigner::new(&endpoint, Some(&ca), Some(&identity))
             .map_err(|e| format!("{e}"))?;
@@ -911,6 +895,11 @@ fn validate_live_args(
 /// the same tx), plus network/priority fees for the entry and the exit.
 const SOL_RESERVE_LAMPORTS: u64 = 6_000_000;
 
+/// SOL → lamports (truncating, like the deprecated solana_sdk helper).
+fn sol_to_lamports(sol: f64) -> u64 {
+    (sol * 1_000_000_000f64) as u64
+}
+
 /// Lowest accepted --min-liquidity-sol: below it a pool is too thin to
 /// exit a position at a sane price.
 const MIN_LIQUIDITY_FLOOR_SOL: f64 = 20.0;
@@ -919,7 +908,7 @@ const MIN_LIQUIDITY_FLOOR_SOL: f64 = 20.0;
 /// operator's liquidity floor.
 fn strategy_config(args: &Args) -> strategy::StrategyConfig {
     strategy::StrategyConfig {
-        min_liquidity_lamports: solana_sdk::native_token::sol_to_lamports(args.min_liquidity_sol),
+        min_liquidity_lamports: sol_to_lamports(args.min_liquidity_sol),
         ..strategy::StrategyConfig::default()
     }
 }
@@ -1042,8 +1031,10 @@ fn simulate_on_chain(rpc: &RpcClient, tx: &Transaction) -> Result<SimulationResu
         commitment: Some(CommitmentConfig::processed()),
         ..Default::default()
     };
-    let resp = tokio::task::block_in_place(|| rpc.simulate_transaction_with_config(tx, cfg))
-        .map_err(|e| format!("simulateTransaction failed: {e}"))?;
+    let resp = tokio::task::block_in_place(|| {
+        rpc.simulate_transaction_with_config(tx, cfg)
+            .map_err(|e| format!("simulateTransaction failed: {e}"))
+    })?;
     let v = resp.value;
     Ok(SimulationResult {
         err: v.err.map(|e| format!("{e:?}")),
@@ -1136,7 +1127,7 @@ async fn submit_live_tx(
         }
         Err(e) => {
             tracing::warn!(error = %e, "jito bundle failed — falling back to RPC");
-            jito::send_with_rpc_fallback(rpc_client, &[tx.clone()]).await
+            jito::send_with_rpc_fallback(rpc_client, std::slice::from_ref(tx)).await
         }
     }
 }
@@ -1788,9 +1779,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         metrics::record_trade_attempt(&metrics_registry, mode_label);
-        if let Err(e) =
-            risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
-        {
+        if let Err(e) = risk_manager.pre_trade_check(sol_to_lamports(0.01), 50) {
             metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
             *rejected_by_reason.entry(e.code()).or_insert(0) += 1;
             tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
@@ -1983,8 +1972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PaperTick::EntryPending(signal) => {
                     // Real risk gates BEFORE the entry is simulated (same
                     // order as live): max-spend cap, then pre_trade_check.
-                    let max_spend_lamports =
-                        solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+                    let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
                     let mut accepted = true;
                     if signal.position_size_lamports > max_spend_lamports {
                         accepted = false;
@@ -2153,7 +2141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sleep(loop_interval).await;
                 continue;
             };
-            let mut to = from; // self-transfer fallback when no pool is configured
+            let to = from; // self-transfer fallback when no pool is configured
 
             // When --pool-id is set, resolve the pool on-chain and feed the
             // real price into the strategy (market data hook). Fail-closed:
@@ -2189,8 +2177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .filter(|p| p.is_connected())
                     .and_then(|p| p.get_pool_state(pool_id_str));
-                let mut price_timestamp_ms: Option<u128> = None;
-                let (pool, used_ws) = if let Some(state) = ws_state {
+                let price_timestamp_ms: Option<u128>;
+                let (_pool, used_ws) = if let Some(state) = ws_state {
                     entry_sqrt = state.sqrt_price;
                     price_timestamp_ms = Some(state.timestamp_ms);
                     (None, true)
@@ -2473,7 +2461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.save(&args.data_dir)?;
 
             // Security: max spend (SOL) cap enforced before any trade.
-            let max_spend_lamports = solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+            let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
             if entry_signal.position_size_lamports > max_spend_lamports {
                 tracing::warn!(
                     mode = mode_target,
@@ -2571,7 +2559,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
                             cu_limit,
                         );
-                    let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
+                    let transfer_ix =
+                        solana_system_interface::instruction::transfer(&from, &to, 1_000);
                     let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
                     let mut t = Transaction::new_unsigned(msg);
                     t.message.recent_blockhash = blockhash;

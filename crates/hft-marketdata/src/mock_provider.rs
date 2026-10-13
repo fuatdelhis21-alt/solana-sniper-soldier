@@ -7,6 +7,12 @@ pub struct MockMarketProvider {
     prices: Arc<RwLock<HashMap<String, PriceQuote>>>,
 }
 
+impl Default for MockMarketProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockMarketProvider {
     pub fn new() -> Self {
         Self {

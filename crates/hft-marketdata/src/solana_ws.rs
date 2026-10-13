@@ -11,7 +11,6 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;

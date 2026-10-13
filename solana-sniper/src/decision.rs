@@ -1,7 +1,7 @@
 //! Decision record — deterministic snapshot of every trade decision for replay/audit.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Snapshot of all inputs that went into a trade decision.
@@ -60,7 +60,7 @@ impl DecisionRecord {
     }
 
     /// Save to a JSONL file.
-    pub fn save(&self, base_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self, base_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let dir = base_dir.join("decisions");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("decisions.jsonl");

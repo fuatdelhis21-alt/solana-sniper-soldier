@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn writer_redacts() {
-        let mw = RedactingMakeWriter::new(|| Vec::<u8>::new());
+        let mw = RedactingMakeWriter::new(Vec::<u8>::new);
         let mut w = mw.make_writer();
         w.write_all(b"x https://h/?api-key=S y").unwrap();
         assert_eq!(

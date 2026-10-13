@@ -36,7 +36,9 @@ impl BlockhashManager {
                 return Ok(*hash);
             }
         }
-        let hash = tokio::task::block_in_place(|| self.rpc.get_latest_blockhash())?;
+        let hash = tokio::task::block_in_place(|| {
+            self.rpc.get_latest_blockhash().map_err(|e| e.to_string())
+        })?;
         self.cached_blockhash = Some((hash, now));
         info!("blockhash refreshed: {hash}");
         Ok(hash)
@@ -45,7 +47,9 @@ impl BlockhashManager {
     /// Force fetch a fresh blockhash, bypassing cache.
     /// Prevents replay attacks by ensuring unique blockhash per iteration.
     pub fn force_refresh(&mut self) -> Result<Hash, Box<dyn std::error::Error>> {
-        let hash = tokio::task::block_in_place(|| self.rpc.get_latest_blockhash())?;
+        let hash = tokio::task::block_in_place(|| {
+            self.rpc.get_latest_blockhash().map_err(|e| e.to_string())
+        })?;
         self.cached_blockhash = Some((hash, Instant::now()));
         info!("blockhash force-refreshed: {hash}");
         Ok(hash)

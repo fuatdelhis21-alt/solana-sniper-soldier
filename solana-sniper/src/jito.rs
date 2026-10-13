@@ -13,6 +13,7 @@
 //!   live mode. Dry-run never touches the network.
 //! - Every submission attempt (or dry-run validation) is logged for audit.
 
+use base64::Engine;
 use solana_sdk::transaction::Transaction;
 use tracing::{error, info, warn};
 
@@ -91,7 +92,7 @@ impl JitoClient {
             .iter()
             .map(|tx| {
                 bincode::serialize(tx)
-                    .map(|bytes| base64::encode(&bytes))
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
                     .map_err(|e| format!("failed to serialize transaction: {e}"))
             })
             .collect()
@@ -243,11 +244,10 @@ mod tests {
     use solana_sdk::hash::Hash;
     use solana_sdk::message::Message;
     use solana_sdk::signature::{Keypair, Signer};
-    use solana_sdk::system_instruction;
 
     fn sample_tx() -> Transaction {
         let kp = Keypair::new();
-        let ix = system_instruction::transfer(&kp.pubkey(), &kp.pubkey(), 1_000);
+        let ix = solana_system_interface::instruction::transfer(&kp.pubkey(), &kp.pubkey(), 1_000);
         let msg = Message::new(&[ix], Some(&kp.pubkey()));
         let mut tx = Transaction::new_unsigned(msg);
         tx.sign(&[&kp], Hash::default());
@@ -276,7 +276,9 @@ mod tests {
         let txs = client.serialize_bundle(&bundle).unwrap();
         assert_eq!(txs.len(), 1);
         // base64 decode should succeed and yield non-empty bytes.
-        let decoded = base64::decode(&txs[0]).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&txs[0])
+            .unwrap();
         assert!(!decoded.is_empty());
     }
 

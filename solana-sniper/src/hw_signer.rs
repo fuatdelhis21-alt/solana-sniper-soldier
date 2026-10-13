@@ -38,6 +38,12 @@ impl SignerAdapter for LocalKeypairSigner {
 /// Implement actual Ledger/Trezor/HSM adapter that implements SignerAdapter.
 pub struct HwSignerStub {}
 
+impl Default for HwSignerStub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HwSignerStub {
     pub fn new() -> Self {
         Self {}

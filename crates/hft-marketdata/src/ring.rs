@@ -60,11 +60,6 @@ impl SlotRingBuffer {
         }
     }
 
-    /// Varsayılan kapasite (64) ile yeni bir ring buffer oluşturur.
-    pub fn default() -> Self {
-        SlotRingBuffer::new(DEFAULT_RING_CAPACITY)
-    }
-
     /// Tampona bir olay ekler.
     ///
     /// Eğer olayın slot'u tampon kapasitesinin gerisindeyse,
@@ -169,6 +164,13 @@ impl SlotRingBuffer {
         }
         self.next_expected_slot = 0;
         self.released_count = 0;
+    }
+}
+
+impl Default for SlotRingBuffer {
+    /// Varsayılan kapasite (64) ile yeni bir ring buffer oluşturur.
+    fn default() -> Self {
+        SlotRingBuffer::new(DEFAULT_RING_CAPACITY)
     }
 }
 

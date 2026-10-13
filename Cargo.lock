@@ -5475,6 +5475,7 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-sdk",
  "solana-signature",
+ "solana-system-interface",
  "solana-transaction-status",
  "spl-associated-token-account",
  "spl-token",

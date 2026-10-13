@@ -299,7 +299,7 @@ impl RiskManager {
     /// - No file: fresh start, state is trivially verified (all-zero).
     /// - File present and parses: verified, counters restored.
     /// - File present but corrupt/unreadable: NOT verified (fail-closed).
-    fn load_state(data_dir: &PathBuf) -> (PersistedRiskState, bool) {
+    fn load_state(data_dir: &std::path::Path) -> (PersistedRiskState, bool) {
         let path = data_dir.join("risk_state.json");
         if !path.exists() {
             return (PersistedRiskState::default(), true);

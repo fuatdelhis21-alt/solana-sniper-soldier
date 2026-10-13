@@ -209,7 +209,7 @@ impl SignerAdapter for RemoteHsmSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hw_signer::SignerAdapter;
+
     use solana_sdk::signature::Signer;
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
 
     fn signed_pair() -> (solana_sdk::signature::Keypair, Transaction, Signature) {
         let kp = solana_sdk::signature::Keypair::new();
-        let ix = solana_sdk::system_instruction::transfer(&kp.pubkey(), &kp.pubkey(), 1);
+        let ix = solana_system_interface::instruction::transfer(&kp.pubkey(), &kp.pubkey(), 1);
         let msg = solana_sdk::message::Message::new(&[ix], Some(&kp.pubkey()));
         let tx = Transaction::new_unsigned(msg);
         let sig = kp.sign_message(&tx.message.serialize());

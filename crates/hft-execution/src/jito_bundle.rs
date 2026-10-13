@@ -2,6 +2,12 @@ use chrono::Utc;
 
 pub struct JitoBundleSender {}
 
+impl Default for JitoBundleSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitoBundleSender {
     pub fn new() -> Self {
         Self {}

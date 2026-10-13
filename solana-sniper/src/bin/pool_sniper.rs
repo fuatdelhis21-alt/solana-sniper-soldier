@@ -377,7 +377,12 @@ fn resolve_signature(
 }
 
 /// Pre-filter one watched pool (cheap; the child re-checks everything).
-fn check_candidate(rpc: &RpcClient, c: &mut Candidate, min_liq_lamports: u64) -> CheckOutcome {
+fn check_candidate(
+    rpc: &RpcClient,
+    program: &Pubkey,
+    c: &mut Candidate,
+    min_liq_lamports: u64,
+) -> CheckOutcome {
     if !c.mint_ok {
         match onchain_risk::fetch_mint_authority_risk(rpc, &c.token_mint) {
             Ok(r) if r.is_risky() => {
@@ -391,7 +396,7 @@ fn check_candidate(rpc: &RpcClient, c: &mut Candidate, min_liq_lamports: u64) ->
             Err(e) => return CheckOutcome::Retry(e),
         }
     }
-    let pool = match account_resolver::fetch_pool_state(rpc, &c.pool.pool_id) {
+    let pool = match account_resolver::fetch_pool_state(rpc, &c.pool.pool_id, program) {
         Ok(p) => p,
         Err(e) => return CheckOutcome::Retry(e),
     };
@@ -638,7 +643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let Some(mut c) = watch.take_due(now_ms()) else {
                                 break;
                             };
-                            match check_candidate(&rpc, &mut c, min_liq) {
+                            match check_candidate(&rpc, &program, &mut c, min_liq) {
                                 CheckOutcome::Ready => {
                                     let pool = c.pool.pool_id.to_string();
                                     tracing::info!(target: "discovery", pool = %pool, token = %c.token_mint, checks = c.checks, "pool qualifies — starting trading process");

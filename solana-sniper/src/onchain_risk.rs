@@ -394,7 +394,7 @@ mod tests {
         // Build a synthetic 82-byte SPL Mint account: COption<Pubkey> tag is
         // a little-endian u32 (0 = None, 1 = Some) at offset 0 (mint_authority)
         // and offset 46 (freeze_authority).
-        let mut data = vec![0u8; 82];
+        let mut data = [0u8; 82];
         data[0..4].copy_from_slice(&1u32.to_le_bytes()); // mint_authority = Some
         data[46..50].copy_from_slice(&0u32.to_le_bytes()); // freeze_authority = None
         let mint_authority_tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
@@ -418,6 +418,7 @@ mod tests {
 
 // ── Holder-concentration gate (operator-approved design) ──
 
+#[cfg(test)]
 fn entry(addr: u8, amount: u64) -> (String, u64) {
     // Deterministic pseudo-pubkey from a single byte.
     let mut pk = [0u8; 32];

@@ -271,7 +271,7 @@ impl RaydiumV4ClmmAdapter {
         )?);
 
         if opts.input_mint == native_mint {
-            ixs.push(solana_sdk::system_instruction::transfer(
+            ixs.push(solana_system_interface::instruction::transfer(
                 signer,
                 &accounts.input_token_account,
                 intent.quote.input_amount,
@@ -288,7 +288,7 @@ impl RaydiumV4ClmmAdapter {
             ixs.push(close_account_ix(&accounts.output_token_account, signer)?);
         }
         if let Some((tip_account, lamports)) = opts.jito_tip {
-            ixs.push(solana_sdk::system_instruction::transfer(
+            ixs.push(solana_system_interface::instruction::transfer(
                 signer,
                 &tip_account,
                 lamports,
