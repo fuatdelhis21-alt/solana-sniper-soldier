@@ -147,7 +147,7 @@ impl PaperSimulator {
             };
             let exit = self.strategy.should_exit(from_sqrt, to_sqrt);
             return match exit {
-                strategy::ExitDecision::Hold => {
+                strategy::ExitDecision::Hold | strategy::ExitDecision::MaxHoldTime => {
                     self.holds += 1;
                     PaperTick::Hold
                 }
@@ -490,6 +490,11 @@ struct Args {
     /// ephemeral dev key) the bot refuses to trade (fail-closed).
     #[arg(long, env = "SNIPER_EXPECTED_SIGNER")]
     expected_signer: Option<String>,
+
+    /// Maximum time (seconds) a live position is held. When reached the
+    /// position is sold regardless of price. 0 disables the limit.
+    #[arg(long, env = "SNIPER_MAX_HOLD_SECS", default_value_t = 86_400)]
+    max_hold_secs: u64,
 
     /// DRY-RUN only: build the swap with this funded address as fee payer and
     /// simulate it on-chain WITHOUT signing (sigVerify off). Validates the
@@ -849,6 +854,26 @@ fn native_mint() -> Pubkey {
     Pubkey::from_str(amm::raydium_v4::NATIVE_MINT).expect("valid native mint")
 }
 
+/// Upper bound for the escalated exit slippage (5%).
+const EXIT_MAX_SLIPPAGE_BPS: u64 = 500;
+
+/// Slippage for an exit attempt: the configured slippage, widened by one
+/// configured step per consecutive failed exit, capped at 5%. In a fast
+/// falling market a stop-loss sell at the normal 1% tolerance can fail
+/// (preflight rejects it, no fee is paid) iteration after iteration while
+/// the loss grows; widening guarantees the position is eventually closed.
+fn exit_slippage_bps(base_bps: u64, consecutive_failures: u32) -> u64 {
+    base_bps
+        .saturating_mul(1 + u64::from(consecutive_failures))
+        .min(EXIT_MAX_SLIPPAGE_BPS.max(base_bps))
+}
+
+/// True when a position opened at `opened_at_ms` has reached `max_hold_secs`
+/// (0 = no limit).
+fn max_hold_reached(opened_at_ms: u64, now_ms: u64, max_hold_secs: u64) -> bool {
+    max_hold_secs > 0 && now_ms.saturating_sub(opened_at_ms) >= max_hold_secs.saturating_mul(1000)
+}
+
 /// Minimum input-side balance required before an entry is sent.
 fn entry_required_balance(position_size: u64, input_is_native: bool) -> u64 {
     if input_is_native {
@@ -1061,6 +1086,7 @@ async fn manage_open_position(
     from: &Pubkey,
     pos: &position::LivePosition,
     jito_tip: Option<(Pubkey, u64)>,
+    exit_failures: u32,
 ) -> ExitOutcome {
     let parse = |label: &str, v: &str| {
         Pubkey::from_str(v).map_err(|e| format!("invalid {label} in live position: {e}"))
@@ -1104,7 +1130,8 @@ async fn manage_open_position(
         .with_program_id(program_id.to_string())
         .with_swap_accounts(accounts)
         .with_resolved_pool(pool);
-    let quote = match adapter.quote(amount, args.max_slippage_bps) {
+    let slippage = exit_slippage_bps(args.max_slippage_bps, exit_failures);
+    let quote = match adapter.quote(amount, slippage) {
         Ok(q) => q,
         Err(e) => return ExitOutcome::Failed(format!("exit quote failed: {e}")),
     };
@@ -1120,10 +1147,20 @@ async fn manage_open_position(
     } else {
         pos.position_size_lamports
     };
-    let decision = strategy.should_exit_value(swapped_in, quote.expected_output);
+    let mut decision = strategy.should_exit_value(swapped_in, quote.expected_output);
+    if decision == strategy::ExitDecision::Hold
+        && max_hold_reached(
+            pos.opened_at_ms,
+            marketdata::now_ms() as u64,
+            args.max_hold_secs,
+        )
+    {
+        decision = strategy::ExitDecision::MaxHoldTime;
+    }
     tracing::info!(
         target: "live",
         pool_id = %pos.pool_id,
+        exit_slippage_bps = slippage,
         swapped_in,
         cost = pos.cost_input_units,
         current_value = quote.expected_output,
@@ -1505,6 +1542,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // Consecutive failed exit attempts for the open position (widens the
+    // exit slippage, see exit_slippage_bps).
+    let mut exit_failures: u32 = 0;
     let max_iterations: u64 = if args.iterations == 0 {
         u64::MAX
     } else {
@@ -1559,8 +1599,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &from,
                     &pos,
                     jito_tip,
+                    exit_failures,
                 )
                 .await;
+                exit_failures = match &outcome {
+                    ExitOutcome::Failed(_) => exit_failures.saturating_add(1),
+                    _ => 0,
+                };
                 let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
                 rec.mode = "live".to_string();
                 rec.pool_id = pos.pool_id.clone();
@@ -2930,6 +2975,25 @@ mod tests {
         assert!(validate_live_args(false, None, None, None, false, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn exit_slippage_widens_per_failure_and_caps_at_5pct() {
+        assert_eq!(exit_slippage_bps(100, 0), 100);
+        assert_eq!(exit_slippage_bps(100, 1), 200);
+        assert_eq!(exit_slippage_bps(100, 3), 400);
+        assert_eq!(exit_slippage_bps(100, 10), 500);
+        assert_eq!(exit_slippage_bps(100, u32::MAX), 500);
+        // A configured slippage above the cap is never reduced.
+        assert_eq!(exit_slippage_bps(800, 2), 800);
+    }
+
+    #[test]
+    fn max_hold_time_triggers_only_when_enabled_and_elapsed() {
+        let opened = 1_000_000;
+        assert!(!max_hold_reached(opened, opened + 59_999, 60));
+        assert!(max_hold_reached(opened, opened + 60_000, 60));
+        assert!(!max_hold_reached(opened, opened + 10_000_000_000, 0));
     }
 
     #[test]

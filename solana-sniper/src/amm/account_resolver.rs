@@ -185,6 +185,26 @@ pub fn parse_trade_fee_rate(data: &[u8]) -> Result<u32, String> {
     Ok(rate)
 }
 
+/// Seed of the pool's TickArrayBitmapExtension PDA.
+pub const BITMAP_EXTENSION_SEED: &[u8] = b"pool_tick_array_bitmap_extension";
+/// The pool state's built-in bitmap tracks tick arrays whose start index is
+/// within ±512 arrays of tick 0; beyond that Raydium needs the extension.
+pub const DEFAULT_BITMAP_ARRAYS: i32 = 512;
+
+/// The pool's tick-array bitmap extension PDA.
+pub fn bitmap_extension_pda(pool_id: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[BITMAP_EXTENSION_SEED, pool_id.as_ref()], program_id).0
+}
+
+/// True when a swap scanning `scan` arrays from the current tick could
+/// leave the range of the pool's built-in bitmap (so the extension account
+/// must be supplied). Normal pools never get close to this.
+pub fn needs_bitmap_extension(tick_current: i32, tick_spacing: u16, scan: i32) -> bool {
+    let size = i64::from(TICK_ARRAY_SIZE) * i64::from(tick_spacing);
+    let limit = i64::from(DEFAULT_BITMAP_ARRAYS) * size;
+    i64::from(tick_current).abs() + i64::from(scan + 1) * size >= limit
+}
+
 /// Maximum tick arrays passed to a swap (the account in the instruction
 /// plus remaining accounts) and how far to scan for initialized ones.
 pub const MAX_SWAP_TICK_ARRAYS: usize = 3;
@@ -269,9 +289,14 @@ pub fn resolve_swap_accounts(
     // tick-array candidates in the swap direction.
     let zero_for_one = input_mint == &pool.token_mint_0;
     let candidates = pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN);
-    let mut keys = Vec::with_capacity(candidates.len() + 1);
+    let ext_needed = needs_bitmap_extension(pool.tick_current, pool.tick_spacing, TICK_ARRAY_SCAN);
+    let ext_pda = bitmap_extension_pda(pool_id, program_id);
+    let mut keys = Vec::with_capacity(candidates.len() + 2);
     keys.push(pool.amm_config);
     keys.extend_from_slice(&candidates);
+    if ext_needed {
+        keys.push(ext_pda);
+    }
     let fetched = rpc
         .get_multiple_accounts(&keys)
         .map_err(|e| format!("failed to fetch amm config / tick arrays for {pool_id}: {e}"))?;
@@ -280,7 +305,19 @@ pub fn resolve_swap_accounts(
         .and_then(|a| a.as_ref())
         .ok_or_else(|| format!("amm config {} not found", pool.amm_config))?;
     pool.trade_fee_rate = Some(parse_trade_fee_rate(&amm_config.data)?);
-    let owners: Vec<Option<Pubkey>> = fetched[1..]
+    let bitmap_extension = if ext_needed {
+        match fetched.get(1 + candidates.len()).and_then(|a| a.as_ref()) {
+            Some(acc) if &acc.owner == program_id => Some(ext_pda),
+            _ => {
+                return Err(format!(
+                    "pool {pool_id} trades near the edge of its tick bitmap but has no bitmap extension account (fail-closed)"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let owners: Vec<Option<Pubkey>> = fetched[1..1 + candidates.len()]
         .iter()
         .map(|a| a.as_ref().map(|acc| acc.owner))
         .collect();
@@ -301,6 +338,7 @@ pub fn resolve_swap_accounts(
         observation_state: pool.observation_key,
         tick_array,
         extra_tick_arrays: extra.to_vec(),
+        bitmap_extension,
     };
 
     Ok((accounts, pool))
@@ -551,6 +589,24 @@ mod tests {
         let sel = select_tick_arrays(&c, &owners, &program_id);
         assert_eq!(sel, vec![c[2], c[3], c[4]]);
         assert!(select_tick_arrays(&c, &[None; 6], &program_id).is_empty());
+    }
+
+    #[test]
+    fn bitmap_extension_only_needed_near_the_bitmap_edge() {
+        // spacing 60: built-in bitmap covers |tick| < 512*60*60 = 1_843_200,
+        // beyond Solana's max tick (443_636) — never needed.
+        assert!(!needs_bitmap_extension(443_636, 60, TICK_ARRAY_SCAN));
+        // spacing 1: covers |tick| < 30_720.
+        assert!(!needs_bitmap_extension(0, 1, TICK_ARRAY_SCAN));
+        assert!(!needs_bitmap_extension(-20_000, 1, TICK_ARRAY_SCAN));
+        assert!(needs_bitmap_extension(30_100, 1, TICK_ARRAY_SCAN));
+        assert!(needs_bitmap_extension(-40_000, 1, TICK_ARRAY_SCAN));
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        assert_eq!(
+            bitmap_extension_pda(&pool, &program),
+            bitmap_extension_pda(&pool, &program)
+        );
     }
 
     #[test]

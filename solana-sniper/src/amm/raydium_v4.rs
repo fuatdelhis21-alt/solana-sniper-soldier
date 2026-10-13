@@ -73,6 +73,10 @@ pub struct SwapAccounts {
     /// Further initialized tick arrays in the swap direction, passed as
     /// remaining accounts so a swap may cross array boundaries.
     pub extra_tick_arrays: Vec<Pubkey>,
+    /// The pool's tick-array bitmap extension, only when the price is near
+    /// the edge of the built-in bitmap (Raydium reads it as the FIRST
+    /// remaining account). `None` for normal pools.
+    pub bitmap_extension: Option<Pubkey>,
 }
 
 /// Adapter for Raydium V4 CLMM pools.
@@ -164,6 +168,9 @@ impl RaydiumV4ClmmAdapter {
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new(accounts.tick_array, false),
         ];
+        if let Some(ext) = accounts.bitmap_extension {
+            metas.push(AccountMeta::new_readonly(ext, false));
+        }
         metas.extend(
             accounts
                 .extra_tick_arrays
@@ -494,6 +501,7 @@ mod tests {
             observation_state: Pubkey::new_unique(),
             tick_array: Pubkey::new_unique(),
             extra_tick_arrays: vec![],
+            bitmap_extension: None,
         };
         RaydiumV4ClmmAdapter::new("pool_test".to_string()).with_swap_accounts(accounts)
     }
@@ -602,6 +610,16 @@ mod tests {
         assert_eq!(ix.accounts[10].pubkey, extra[0]);
         assert_eq!(ix.accounts[11].pubkey, extra[1]);
         assert!(ix.accounts[10].is_writable && !ix.accounts[10].is_signer);
+
+        // With a bitmap extension it comes first among remaining accounts.
+        let ext = Pubkey::new_unique();
+        adapter.accounts.as_mut().unwrap().bitmap_extension = Some(ext);
+        let ix = adapter
+            .build_swap_instruction(&intent, &Pubkey::new_unique())
+            .unwrap();
+        assert_eq!(ix.accounts.len(), 13);
+        assert_eq!(ix.accounts[10].pubkey, ext);
+        assert_eq!(ix.accounts[11].pubkey, extra[0]);
     }
 
     #[test]

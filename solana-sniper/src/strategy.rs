@@ -95,6 +95,9 @@ pub enum ExitDecision {
     StopLoss,
     /// Exit because price reached the take-profit threshold.
     TakeProfit,
+    /// Exit because the position reached its maximum holding time
+    /// (live only; set by the caller, never by the price checks).
+    MaxHoldTime,
 }
 
 /// Pure strategy logic. Deterministic — no I/O, no randomness.

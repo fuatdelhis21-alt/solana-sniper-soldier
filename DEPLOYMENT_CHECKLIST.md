@@ -33,6 +33,15 @@ listesi: [`docs/mainnet_checklist.md`](docs/mainnet_checklist.md).
       bahşiş transferi imzadan önce işleme ekleniyor; bahşişsiz Jito live'da reddediliyor.
 - [x] `getTokenLargestAccounts` her turda çağrılıyordu → 60 sn önbellek.
 
+- [x] Onay 3 sn sonra bırakılıyordu → blockhash geçerli olduğu sürece beklenir; belirsiz
+      sonuç gerçek bakiyeden uzlaştırılır. Girişten önce boyut + 0.006 SOL rezerv kontrolü.
+- [x] Stop-loss satışı hızlı düşüşte %1 kaymaya takılabiliyordu → her başarısız çıkışta
+      tolerans bir adım artar (en fazla %5).
+- [x] Pozisyon süresiz açık kalabiliyordu → `SNIPER_MAX_HOLD_SECS` (varsayılan 24 saat).
+- [x] Uç fiyat aralığındaki havuzlar için tick-array bitmap extension desteği.
+- [x] Dry-run giriş ve çıkış swap'ını zincirde simüle eder (`SNIPER_SIMULATE_PAYER` ile
+      fonsuz doğrulama).
+
 ## Operatörün yapması gerekenler (kodla çözülemez)
 
 - [ ] Ücretli mainnet RPC (Helius/Triton/QuickNode) → `SNIPER_RPC`, `SNIPER_WS`
