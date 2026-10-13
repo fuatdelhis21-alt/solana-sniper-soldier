@@ -74,6 +74,9 @@ pub struct ResolvedPool {
     /// Pool trade fee from its AmmConfig, in parts per million (2500 =
     /// 0.25%). `None` until `resolve_swap_accounts` reads the AmmConfig.
     pub trade_fee_rate: Option<u32>,
+    /// `PoolState.tick_array_bitmap` (1024 bits: initialized tick arrays
+    /// with start index in [-512, 511] arrays). `None` for a short buffer.
+    pub tick_array_bitmap: Option<[u64; 16]>,
 }
 
 impl ResolvedPool {
@@ -165,7 +168,52 @@ pub fn parse_pool_state(pool_id: &Pubkey, data: &[u8]) -> Result<ResolvedPool, S
         sqrt_price_x64,
         tick_current,
         trade_fee_rate: None,
+        tick_array_bitmap: parse_tick_array_bitmap(data),
     })
+}
+
+/// Byte offset of `PoolState.tick_array_bitmap` ([u64; 16]) in the packed
+/// account: 8 discriminator + bump + 7 pubkeys + decimals/tick spacing +
+/// liquidity/sqrt price/tick + paddings + fee growth / protocol fees / swap
+/// amounts + status + padding (= 397) + 3 RewardInfo of 169 bytes.
+pub const TICK_ARRAY_BITMAP_OFFSET: usize = 904;
+
+fn parse_tick_array_bitmap(data: &[u8]) -> Option<[u64; 16]> {
+    let raw = data.get(TICK_ARRAY_BITMAP_OFFSET..TICK_ARRAY_BITMAP_OFFSET + 128)?;
+    let mut words = [0u64; 16];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().ok()?);
+    }
+    Some(words)
+}
+
+/// Start indexes of the initialized tick arrays in the swap direction,
+/// beginning with the array that holds the current tick (inclusive), read
+/// from the pool's own bitmap — how Raydium itself finds the "first
+/// initialized tick array". Needed for new pools whose liquidity sits in a
+/// wide range: the next initialized array can be hundreds of arrays away,
+/// far beyond a fixed scan. Only the default bitmap range (±512 arrays) is
+/// covered; beyond it the caller falls back to a PDA scan.
+pub fn bitmap_initialized_starts(
+    bitmap: &[u64; 16],
+    tick_spacing: u16,
+    current_start: i32,
+    zero_for_one: bool,
+    max: usize,
+) -> Vec<i32> {
+    let size = TICK_ARRAY_SIZE * i32::from(tick_spacing.max(1));
+    let bit_of = |start: i32| start.div_euclid(size) + DEFAULT_BITMAP_ARRAYS;
+    let is_set = |bit: i32| (bitmap[(bit / 64) as usize] >> (bit % 64)) & 1 == 1;
+    let mut out = Vec::new();
+    let mut bit = bit_of(current_start);
+    let step = if zero_for_one { -1 } else { 1 };
+    while (0..2 * DEFAULT_BITMAP_ARRAYS).contains(&bit) && out.len() < max {
+        if is_set(bit) {
+            out.push((bit - DEFAULT_BITMAP_ARRAYS) * size);
+        }
+        bit += step;
+    }
+    out
 }
 
 /// `AmmConfig.trade_fee_rate` (u32 LE, parts per million) — layout:
@@ -334,7 +382,29 @@ pub fn resolve_swap_accounts(
     // One RPC round trip for the AmmConfig (real fee tier) and the
     // tick-array candidates in the swap direction.
     let zero_for_one = input_mint == &pool.token_mint_0;
-    let candidates = pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN);
+    // The pool's bitmap names the initialized arrays in the swap direction;
+    // a fixed scan around the current tick is the fallback (bitmap missing,
+    // or liquidity only beyond the default bitmap range).
+    let from_bitmap: Vec<Pubkey> = pool
+        .tick_array_bitmap
+        .map(|b| {
+            bitmap_initialized_starts(
+                &b,
+                pool.tick_spacing,
+                pool.tick_array_start_index(),
+                zero_for_one,
+                MAX_SWAP_TICK_ARRAYS,
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|start| pool.tick_array_pda_at(program_id, start))
+        .collect();
+    let candidates = if from_bitmap.is_empty() {
+        pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN)
+    } else {
+        from_bitmap
+    };
     let ext_needed = needs_bitmap_extension(pool.tick_current, pool.tick_spacing, TICK_ARRAY_SCAN);
     let ext_pda = bitmap_extension_pda(pool_id, program_id);
     let mut keys = Vec::with_capacity(candidates.len() + 2);
@@ -377,7 +447,10 @@ pub fn resolve_swap_accounts(
     let arrays = select_tick_arrays(&candidates, &owners, program_id);
     let Some((&tick_array, extra)) = arrays.split_first() else {
         return Err(format!(
-            "no initialized tick array within {TICK_ARRAY_SCAN} arrays of the current tick in pool {pool_id} (fail-closed)"
+            "no initialized tick array in the swap direction for pool {pool_id} (tick {}, spacing {}, bitmap {}) (fail-closed)",
+            pool.tick_current,
+            pool.tick_spacing,
+            if pool.tick_array_bitmap.is_some() { "read" } else { "missing" }
         ));
     };
 
@@ -400,6 +473,67 @@ pub fn resolve_swap_accounts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitmap_with(starts: &[i32], size: i32) -> [u64; 16] {
+        let mut b = [0u64; 16];
+        for s in starts {
+            let bit = s.div_euclid(size) + DEFAULT_BITMAP_ARRAYS;
+            b[(bit / 64) as usize] |= 1 << (bit % 64);
+        }
+        b
+    }
+
+    #[test]
+    fn bitmap_finds_far_initialized_arrays_in_swap_direction() {
+        let spacing = 60u16;
+        let size = 60 * 60;
+        // Launch-style pool: current tick deep negative, liquidity in a
+        // wide range whose arrays are far away on both sides.
+        let cur = -100 * size;
+        let b = bitmap_with(&[-300 * size, -100 * size, 250 * size, 400 * size], size);
+        // Price up (one_for_zero): current array first, then the far ones.
+        assert_eq!(
+            bitmap_initialized_starts(&b, spacing, cur, false, 3),
+            vec![-100 * size, 250 * size, 400 * size]
+        );
+        // Price down (zero_for_one).
+        assert_eq!(
+            bitmap_initialized_starts(&b, spacing, cur, true, 3),
+            vec![-100 * size, -300 * size]
+        );
+        // Current array empty: the first hit is 350 arrays away (beyond
+        // the old 10-array scan).
+        let b = bitmap_with(&[250 * size], size);
+        assert_eq!(
+            bitmap_initialized_starts(&b, spacing, cur, false, 3),
+            vec![250 * size]
+        );
+        assert!(bitmap_initialized_starts(&b, spacing, cur, true, 3).is_empty());
+        // Range edges and an empty bitmap.
+        let b = bitmap_with(&[-512 * size, 511 * size], size);
+        assert_eq!(
+            bitmap_initialized_starts(&b, spacing, 0, true, 3),
+            vec![-512 * size]
+        );
+        assert_eq!(
+            bitmap_initialized_starts(&b, spacing, 0, false, 3),
+            vec![511 * size]
+        );
+        assert!(bitmap_initialized_starts(&[0; 16], spacing, 0, false, 3).is_empty());
+    }
+
+    #[test]
+    fn tick_array_bitmap_is_read_at_its_packed_offset() {
+        let mut data = vec![0u8; 1544];
+        data[TICK_ARRAY_BITMAP_OFFSET] = 0b101; // word 0, bits 0 and 2
+        data[TICK_ARRAY_BITMAP_OFFSET + 15 * 8 + 7] = 0x80; // word 15, bit 63
+        let b = parse_tick_array_bitmap(&data).unwrap();
+        assert_eq!(b[0], 0b101);
+        assert_eq!(b[15], 1 << 63);
+        assert!(parse_tick_array_bitmap(&data[..1000]).is_none());
+        // Offset = 397 + 3 * RewardInfo(169).
+        assert_eq!(TICK_ARRAY_BITMAP_OFFSET, 397 + 3 * 169);
+    }
 
     #[test]
     fn clmm_account_discriminators_match_anchor() {
