@@ -64,3 +64,7 @@ path = "src/bin/ledger_sign_test.rs"
 [[bin]]
 name = "devnet_swap_test"
 path = "src/bin/devnet_swap_test.rs"
+
+[[bin]]
+name = "pool-sniper"
+path = "src/bin/pool_sniper.rs"

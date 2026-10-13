@@ -4,7 +4,7 @@
 #   sudo ./install_release.sh <solana-hft-release-*.tar.gz> [solana-hft.env]
 #
 # Layout after install:
-#   /opt/solana-hft/bin/{solana-sniper,hsm_server,send_transfer}
+#   /opt/solana-hft/bin/{solana-sniper,pool-sniper,hsm_server,send_transfer}
 #   /opt/solana-hft/bin.prev/            previous binaries (deploy/rollback.sh)
 #   /etc/systemd/system/solana-hft.service, solana-hsm.service
 #   /etc/solana-hft/solana-hft.env       bot config (SNIPER_*), 0600 solana
@@ -84,7 +84,15 @@ fi
 [ -f "$HSM_ENV" ] || install -m 0600 -o solana-hsm -g solana-hsm "$TMPDIR/hsm.env.example" "$HSM_ENV"
 
 systemctl daemon-reload
-systemctl enable solana-hsm.service solana-hft.service >/dev/null
+# The new-pool sniper (solana-hft-sniper) and the fixed-pool bot
+# (solana-hft) share wallet and state and conflict: keep whichever one the
+# operator chose. A fresh install enables the fixed-pool bot.
+BOT_UNIT=solana-hft.service
+if systemctl is-enabled --quiet solana-hft-sniper.service 2>/dev/null \
+  || systemctl is-active --quiet solana-hft-sniper.service 2>/dev/null; then
+  BOT_UNIT=solana-hft-sniper.service
+fi
+systemctl enable solana-hsm.service "$BOT_UNIT" >/dev/null
 
 HSM_READY=0
 if grep -Eq '^HSM_KEY_B64=.+' "$HSM_ENV" && [ -f "$CONFIG_DIR/hsm-certs/server.key" ]; then
@@ -93,8 +101,8 @@ if grep -Eq '^HSM_KEY_B64=.+' "$HSM_ENV" && [ -f "$CONFIG_DIR/hsm-certs/server.k
 fi
 
 if [ "$BOT_CONFIGURED" = 1 ]; then
-  systemctl restart solana-hft.service
-  echo "Install complete — solana-hft restarted. Logs: journalctl -u solana-hft -f"
+  systemctl restart "$BOT_UNIT"
+  echo "Install complete — ${BOT_UNIT%.service} restarted. Logs: journalctl -u ${BOT_UNIT%.service} -f"
 else
   cat <<MSG
 Install complete — services enabled but NOT started (not configured yet):

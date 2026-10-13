@@ -18,7 +18,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/bin" "$STAGE/systemd"
-for b in solana-sniper hsm_server send_transfer; do
+for b in solana-sniper pool-sniper hsm_server send_transfer; do
   install -m 0755 "target/release/$b" "$STAGE/bin/$b"
 done
 cp deploy/systemd/*.service "$STAGE/systemd/"

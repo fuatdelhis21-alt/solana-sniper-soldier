@@ -101,9 +101,14 @@ struct PaperSimulator {
 }
 
 impl PaperSimulator {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_config(strategy::StrategyConfig::default())
+    }
+
+    fn with_config(config: strategy::StrategyConfig) -> Self {
         Self {
-            strategy: strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default()),
+            strategy: strategy::SimpleSnipeStrategy::new(config),
             position: None,
             entries: 0,
             exits_stop_loss: 0,
@@ -609,6 +614,22 @@ struct Args {
     /// mode. Has no effect in --paper or --dry-run.
     #[arg(long, env = "SNIPER_CONFIRM_LIVE", default_value_t = false)]
     confirm_live: bool,
+
+    /// Minimum SOL-side (input vault) pool liquidity for an entry, in SOL.
+    /// Floor: MIN_LIQUIDITY_FLOOR_SOL (thin pools cannot be exited).
+    #[arg(long, env = "SNIPER_MIN_LIQUIDITY_SOL", default_value_t = 1000.0)]
+    min_liquidity_sol: f64,
+
+    /// Stop after the first completed trade: a closed position (paper /
+    /// live) or one built+simulated entry (dry-run). Used by the pool
+    /// discovery supervisor, which runs one process per new pool.
+    #[arg(long, env = "SNIPER_SINGLE_TRADE", default_value_t = false)]
+    single_trade: bool,
+
+    /// Stop when no entry happened within this many seconds of startup
+    /// (0 = no limit). An open position is always managed to its exit.
+    #[arg(long, env = "SNIPER_ENTRY_WINDOW_SECS", default_value_t = 0)]
+    entry_window_secs: u64,
 }
 
 impl Args {
@@ -849,6 +870,34 @@ fn validate_live_args(
 /// account (~0.00204) and the temporary wSOL account (~0.00204, refunded in
 /// the same tx), plus network/priority fees for the entry and the exit.
 const SOL_RESERVE_LAMPORTS: u64 = 6_000_000;
+
+/// Lowest accepted --min-liquidity-sol: below it a pool is too thin to
+/// exit a position at a sane price.
+const MIN_LIQUIDITY_FLOOR_SOL: f64 = 20.0;
+
+/// Strategy configuration for this run: the fail-closed defaults with the
+/// operator's liquidity floor.
+fn strategy_config(args: &Args) -> strategy::StrategyConfig {
+    strategy::StrategyConfig {
+        min_liquidity_lamports: solana_sdk::native_token::sol_to_lamports(args.min_liquidity_sol),
+        ..strategy::StrategyConfig::default()
+    }
+}
+
+fn validate_min_liquidity(min_liquidity_sol: f64) -> Result<(), String> {
+    if !min_liquidity_sol.is_finite() || min_liquidity_sol < MIN_LIQUIDITY_FLOOR_SOL {
+        return Err(format!(
+            "--min-liquidity-sol must be >= {MIN_LIQUIDITY_FLOOR_SOL} SOL (got {min_liquidity_sol})"
+        ));
+    }
+    Ok(())
+}
+
+/// True when the run should stop because no entry happened within the
+/// entry window (never while a position is open).
+fn entry_window_expired(elapsed_secs: u64, window_secs: u64, position_open: bool) -> bool {
+    window_secs > 0 && !position_open && elapsed_secs >= window_secs
+}
 
 fn native_mint() -> Pubkey {
     Pubkey::from_str(amm::raydium_v4::NATIVE_MINT).expect("valid native mint")
@@ -1140,7 +1189,7 @@ async fn manage_open_position(
     // contains the token-account rent, which is refunded on a full exit and
     // would otherwise fire a false stop-loss right after every entry. The
     // measured cost is still what realized P&L is computed from.
-    let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+    let strategy = strategy::SimpleSnipeStrategy::new(strategy_config(args));
     let swapped_in = if amount < pos.token_amount {
         // Partial balance (some tokens left the wallet): pro-rate.
         (pos.position_size_lamports as u128 * amount as u128 / pos.token_amount as u128) as u64
@@ -1261,6 +1310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 0.20 SOL daily loss kill-switch, 1 open position, 2% max slippage).
     // Applied to every mode (paper/dry-run/live) for consistency — if the
     // config itself cannot be validated, refuse to start at all.
+    validate_min_liquidity(args.min_liquidity_sol)?;
     let risk_cfg = risk::RiskConfig::production_defaults(args.data_dir.clone())?;
     // Fail-closed cross-module invariant: the strategy's per-trade position
     // size must never exceed the risk manager's max_trade_size_lamports,
@@ -1471,7 +1521,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paper-only accumulators (AŞAMA 3/4): real RPC-fetch and strategy timings
     // plus data-error counts. A paper iteration with a data error is neither a
     // trade nor a success — it is rejected with its real reason.
-    let mut paper_sim = PaperSimulator::new();
+    let mut paper_sim = PaperSimulator::with_config(strategy_config(&args));
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -1551,8 +1601,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.iterations as u64
     };
     let mut completed_iterations: u64 = 0;
+    // --single-trade / --entry-window-secs (pool discovery supervisor).
+    let run_start = std::time::Instant::now();
+    let mut single_trade_done = false;
     'main_loop: for i in 0..max_iterations {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        if args.single_trade && single_trade_done {
+            tracing::info!(target: "main", "single trade completed — stopping");
+            break;
+        }
+        if entry_window_expired(
+            run_start.elapsed().as_secs(),
+            args.entry_window_secs,
+            live_position.is_some() || paper_sim.has_open_position(),
+        ) {
+            tracing::info!(target: "main", window_secs = args.entry_window_secs, "entry window elapsed without an entry — stopping");
             break;
         }
         completed_iterations = i + 1;
@@ -1619,6 +1684,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tracing::error!(target: "live", error = %e, "failed to clear live position record");
                         }
                         live_position = None;
+                        single_trade_done = true;
                         if let ExitOutcome::Closed { decision, pnl } = &outcome {
                             successful_trades += 1;
                             metrics::record_trade_executed(&metrics_registry, mode_label);
@@ -1819,6 +1885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &metrics_registry,
                         paper_sim.simulated_pnl_lamports,
                     );
+                    single_trade_done = true;
                     tracing::info!(
                         target: "paper",
                         iteration = i + 1,
@@ -2258,7 +2325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Strategy gate: evaluate the token candidate. If the strategy
             // rejects it (fail-closed), no trade is built or sent this
             // iteration. This wires SimpleSnipeStrategy into the live path.
-            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            let strategy = strategy::SimpleSnipeStrategy::new(strategy_config(&args));
             let candidate = strategy::TokenCandidate {
                 liquidity_lamports: live_liquidity.unwrap_or(args.pool_liquidity),
                 market_cap_lamports: args.pool_market_cap,
@@ -2558,6 +2625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "dry-run transaction built and signed (never sent)"
                     );
                     successful_trades += 1;
+                    single_trade_done = true;
                     // NOTE: dry-run does NOT call risk_manager.record_trade()
                     // or record_position_open() — those represent real
                     // on-chain position/trade accounting. Dry-run only
@@ -3412,5 +3480,35 @@ mod tests {
             ),
             pnl
         );
+    }
+
+    #[test]
+    fn min_liquidity_floor_and_strategy_config() {
+        assert!(validate_min_liquidity(1000.0).is_ok());
+        assert!(validate_min_liquidity(MIN_LIQUIDITY_FLOOR_SOL).is_ok());
+        assert!(validate_min_liquidity(5.0).is_err());
+        assert!(validate_min_liquidity(f64::NAN).is_err());
+        let args = Args::try_parse_from(["solana-sniper", "--min-liquidity-sol", "50"]).unwrap();
+        let cfg = strategy_config(&args);
+        assert_eq!(cfg.min_liquidity_lamports, 50_000_000_000);
+        assert_eq!(
+            cfg.max_trade_size_lamports,
+            strategy::StrategyConfig::default().max_trade_size_lamports
+        );
+        let defaults = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert_eq!(
+            strategy_config(&defaults).min_liquidity_lamports,
+            strategy::StrategyConfig::default().min_liquidity_lamports
+        );
+        assert!(!defaults.single_trade);
+        assert_eq!(defaults.entry_window_secs, 0);
+    }
+
+    #[test]
+    fn entry_window_never_abandons_an_open_position() {
+        assert!(!entry_window_expired(10_000, 0, false), "0 = unlimited");
+        assert!(!entry_window_expired(59, 60, false));
+        assert!(entry_window_expired(60, 60, false));
+        assert!(!entry_window_expired(10_000, 60, true));
     }
 }

@@ -10,6 +10,7 @@ pub mod ledger_signer;
 pub mod marketdata;
 pub mod metrics;
 pub mod onchain_risk;
+pub mod pool_discovery;
 pub mod position;
 pub mod redact;
 pub mod remote_hsm;

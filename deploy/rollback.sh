@@ -8,10 +8,14 @@ if [ ! -d "$RELEASE_DIR/bin.prev" ]; then
   echo "no previous release in $RELEASE_DIR/bin.prev" >&2
   exit 1
 fi
-systemctl stop solana-hft.service
+BOT_UNIT=solana-hft.service
+if systemctl is-active --quiet solana-hft-sniper.service; then
+  BOT_UNIT=solana-hft-sniper.service
+fi
+systemctl stop "$BOT_UNIT"
 mv "$RELEASE_DIR/bin" "$RELEASE_DIR/bin.failed"
 mv "$RELEASE_DIR/bin.prev" "$RELEASE_DIR/bin"
 rm -rf "$RELEASE_DIR/bin.failed"
 systemctl restart solana-hsm.service || true
-systemctl start solana-hft.service
-echo "rolled back; journalctl -u solana-hft -f"
+systemctl start "$BOT_UNIT"
+echo "rolled back; journalctl -u ${BOT_UNIT%.service} -f"

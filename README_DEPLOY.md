@@ -13,7 +13,7 @@ cargo test --workspace
 ./scripts/build_and_publish.sh        # -> solana-hft-release-<ts>.tar.gz
 ```
 
-Paket içeriği: `bin/{solana-sniper,hsm_server,send_transfer}`, `systemd/*.service`,
+Paket içeriği: `bin/{solana-sniper,pool-sniper,hsm_server,send_transfer}`, `systemd/*.service`,
 `install_release.sh`, `rollback.sh`, `solana-hft.env.example`, `hsm.env.example`,
 `generate_certs.sh`, `SHA256SUMS`, `REVISION`.
 CI (`.github/workflows/ci-cd.yml`) `main`'e her push'ta aynı paketi üretir ve
@@ -77,7 +77,43 @@ stop-loss (-%5) / take-profit (+%10) sinyalinde ters swap ile **satılır**.
 Gerçekleşen P&L bakiye farkından hesaplanır, zarar günlük limite işlenir.
 Çıkışlar kill switch / circuit breaker tarafından engellenmez.
 
-## 5. Durdurma, kill switch, rollback
+## 5. Yeni havuz sniper'ı (pool-sniper)
+
+`solana-hft-sniper.service` sabit bir havuz yerine **yeni açılan** Raydium CLMM
+havuzlarını işler:
+
+1. `pool-sniper`, CLMM programının loglarını `logsSubscribe` ile dinler
+   (`SNIPER_WS`), `CreatePool` görünce işlemi çözer (v0/ALT ve CPI dahil).
+2. Yalnızca wSOL eşli havuzlar izleme listesine girer; liste
+   `SNIPER_DISCOVERY_RECHECK_SECS` aralıkla `SNIPER_DISCOVERY_WATCH_SECS`
+   boyunca kontrol edilir (havuz açıldığında likidite yoktur).
+3. Ön filtre: klasik SPL mint, mint + freeze authority kapalı, SOL tarafı
+   likidite ≥ `SNIPER_MIN_LIQUIDITY_SOL`.
+4. Geçen havuz için **tek seferde bir** `solana-sniper --single-trade` süreci
+   başlatılır (wSOL → token). Bu süreç tüm normal kapıları tekrar uygular
+   (holder yoğunluğu, blocklist, risk yöneticisi, slippage, bakiye) ve çıkışı
+   kendisi yönetir; `SNIPER_DISCOVERY_ENTRY_WINDOW_SECS` içinde giriş sinyali
+   yoksa kapanır.
+5. Tüm süreçler aynı `SNIPER_DATA_DIR`'i kullanır: günlük işlem/zarar
+   limitleri ve tek açık pozisyon **tüm havuzlar için ortaktır**. Açık bir
+   live pozisyon varsa yeni havuza geçilmez, önce o yönetilir.
+
+```bash
+systemctl stop solana-hft              # ikisi aynı anda çalışmaz (Conflicts=)
+systemctl start solana-hft-sniper      # varsayılan: SNIPER_DISCOVERY_MODE=paper
+journalctl -u solana-hft-sniper -f
+```
+
+Kademeler aynıdır: `paper` → `dry-run` → `live`
+(`SNIPER_DISCOVERY_MODE=live` + `SNIPER_DISCOVERY_CONFIRM_LIVE=true` + HSM).
+Kalıcı geçiş için: `systemctl disable solana-hft; systemctl enable solana-hft-sniper`.
+
+Sınırlar: bu, blok-0 hız yarışı değildir (onaylı log + RPC kontrolleri,
+saniyeler mertebesi). Yeni tokenların büyük kısmı authority / holder / likidite
+kapılarından geçemez; bu bilinçli. `logsSubscribe` CLMM'deki her işlemi
+yayınlar — ücretli RPC planı önerilir.
+
+## 6. Durdurma, kill switch, rollback
 
 - `systemctl stop solana-hft` → SIGTERM; mevcut iterasyon biter, açık pozisyon
   kaydı korunur ve bir sonraki başlatmada yönetilmeye devam eder.
