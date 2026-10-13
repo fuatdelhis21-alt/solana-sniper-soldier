@@ -8,9 +8,10 @@ StartLimitBurst=5
 Type=simple
 User=solana-hsm
 Group=solana-hsm
-# HSM_KEY_B64=<base64 64-byte key>, HSM_REQUIRE_KEY=1 (never an ephemeral key)
+# HSM_KEY_B64=<base64 64-byte key> is mandatory: hsm_server has no ephemeral
+# fallback (only the --dev-ephemeral-key test flag, never used here). Every
+# transaction is checked by the signing policy (HSM_MAX_* in hsm.env).
 EnvironmentFile=/etc/solana-hft/hsm.env
-Environment=HSM_REQUIRE_KEY=1
 StateDirectory=solana-hsm
 ExecStart=/opt/solana-hft/bin/hsm_server --certs /etc/solana-hft/hsm-certs --log-file /var/lib/solana-hsm/hsm_audit.log
 Restart=on-failure

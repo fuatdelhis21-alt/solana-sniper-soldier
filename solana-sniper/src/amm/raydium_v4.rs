@@ -812,4 +812,61 @@ mod tests {
             solana_sdk::signature::Signature::default()
         );
     }
+
+    #[test]
+    fn real_entry_and_exit_transactions_pass_the_hsm_signing_policy() {
+        // A builder change the HSM would refuse fails here, not live.
+        use crate::hsm_policy;
+        let signer = Pubkey::new_unique();
+        let native = Pubkey::from_str(NATIVE_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let pol = hsm_policy::Policy::default();
+        for (input, output, close, tip) in [
+            (native, token, false, None),
+            (
+                native,
+                token,
+                false,
+                Some((
+                    Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap(),
+                    10_000,
+                )),
+            ),
+            (token, native, false, None),
+            (token, native, true, None),
+        ] {
+            let mut accounts = sample_adapter().accounts.unwrap();
+            accounts.input_token_account =
+                crate::amm::account_resolver::resolve_user_ata(&signer, &input);
+            accounts.output_token_account =
+                crate::amm::account_resolver::resolve_user_ata(&signer, &output);
+            accounts.extra_tick_arrays = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+            accounts.bitmap_extension = Some(Pubkey::new_unique());
+            let adapter =
+                RaydiumV4ClmmAdapter::new("pool_test".to_string()).with_swap_accounts(accounts);
+            let intent = adapter
+                .build_intent(Quote {
+                    pool_id: "pool_test".into(),
+                    input_mint: input.to_string(),
+                    output_mint: output.to_string(),
+                    input_amount: 10_000_000, // 0.01 SOL: the strategy's size
+                    expected_output: 1,
+                    slippage_bps: 100,
+                })
+                .unwrap();
+            let opts = SwapTxOptions {
+                input_mint: input,
+                output_mint: output,
+                compute_unit_limit: 300_000,
+                priority_fee_micro_lamports: 10_000,
+                close_input_token_account: close,
+                jito_tip: tip,
+            };
+            let tx = adapter
+                .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
+                .unwrap();
+            hsm_policy::check(&tx.message, &signer, &pol)
+                .unwrap_or_else(|e| panic!("HSM would refuse {input}->{output}: {e}"));
+        }
+    }
 }

@@ -18,3 +18,10 @@ pub mod retry;
 pub mod risk;
 pub mod strategy;
 pub mod tx;
+
+/// The remote HSM's signing policy, compiled into the tests so the
+/// transactions the swap builder really produces are checked against it.
+#[cfg(test)]
+#[path = "../../tools/hsm_server/policy.rs"]
+#[allow(dead_code)]
+mod hsm_policy;

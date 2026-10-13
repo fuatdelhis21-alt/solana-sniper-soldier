@@ -51,8 +51,13 @@ vi /etc/solana-hft/hsm.env           # HSM_KEY_B64=..., HSM_REQUIRE_KEY=1
 systemctl start solana-hsm
 ```
 
-`HSM_REQUIRE_KEY=1` ile sunucu geçerli anahtar yoksa **başlamaz** (ephemeral
-anahtara düşmez). Bot, HSM'in bildirdiği pubkey'i `SNIPER_EXPECTED_SIGNER`
+Sunucu geçerli `HSM_KEY_B64` yoksa **başlamaz**; ephemeral anahtara düşme
+yolu yoktur (yalnızca test için açık `--dev-ephemeral-key` bayrağı, systemd
+kullanmaz). Her işlem imzalama politikasından geçer: yalnızca botun swap /
+wSOL wrap / Jito tip şekli imzalanır, fonlar cüzdanın kendi hesaplarında
+kalmak zorundadır, cüzdandan çıkan toplam ≤ `HSM_MAX_TRANSFER_LAMPORTS`
+(varsayılan 0.06 SOL). Token transferi, yabancı hesaba swap çıktısı, başka
+program → HTTP 400. Bot, HSM'in bildirdiği pubkey'i `SNIPER_EXPECTED_SIGNER`
 ile karşılaştırır ve her imzayı mesaj baytlarına karşı doğrular; uyuşmazlıkta
 işlem yapılmaz.
 
