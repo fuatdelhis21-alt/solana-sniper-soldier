@@ -71,6 +71,9 @@ pub struct ResolvedPool {
     pub liquidity: u128,
     pub sqrt_price_x64: u128,
     pub tick_current: i32,
+    /// Pool trade fee from its AmmConfig, in parts per million (2500 =
+    /// 0.25%). `None` until `resolve_swap_accounts` reads the AmmConfig.
+    pub trade_fee_rate: Option<u32>,
 }
 
 impl ResolvedPool {
@@ -91,7 +94,28 @@ impl ResolvedPool {
 
     /// Derive the tick-array PDA for the current tick.
     pub fn tick_array_pda(&self, program_id: &Pubkey) -> Pubkey {
+        self.tick_array_pda_at(program_id, self.tick_array_start_index())
+    }
+
+    /// Tick-array PDAs to try for a swap, starting with the array holding
+    /// the current tick and walking in the price direction of the swap
+    /// (`zero_for_one` = selling token0 => price and tick go DOWN).
+    pub fn tick_array_candidates(
+        &self,
+        program_id: &Pubkey,
+        zero_for_one: bool,
+        count: i32,
+    ) -> Vec<Pubkey> {
+        let size = TICK_ARRAY_SIZE * i32::from(self.tick_spacing);
         let start = self.tick_array_start_index();
+        let step = if zero_for_one { -size } else { size };
+        (0..count)
+            .map(|k| self.tick_array_pda_at(program_id, start + k * step))
+            .collect()
+    }
+
+    /// Tick-array PDA for an explicit start index.
+    pub fn tick_array_pda_at(&self, program_id: &Pubkey, start: i32) -> Pubkey {
         let (pda, _) = Pubkey::find_program_address(
             &[TICK_ARRAY_SEED, self.pool_id.as_ref(), &start.to_be_bytes()],
             program_id,
@@ -140,7 +164,49 @@ pub fn parse_pool_state(pool_id: &Pubkey, data: &[u8]) -> Result<ResolvedPool, S
         liquidity,
         sqrt_price_x64,
         tick_current,
+        trade_fee_rate: None,
     })
+}
+
+/// `AmmConfig.trade_fee_rate` (u32 LE, parts per million) — layout:
+/// 8 discriminator + bump u8 + index u16 + owner Pubkey + protocol_fee_rate
+/// u32, so the trade fee starts at byte 47.
+pub fn parse_trade_fee_rate(data: &[u8]) -> Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(47..51)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("AmmConfig data too short ({} bytes)", data.len()))?;
+    let rate = u32::from_le_bytes(bytes);
+    // Raydium fee tiers are 100..=10_000 ppm (0.01%..1%); anything outside
+    // a sane range means a wrong account/layout — fail closed.
+    if rate == 0 || rate > 100_000 {
+        return Err(format!("implausible AmmConfig trade_fee_rate {rate}"));
+    }
+    Ok(rate)
+}
+
+/// Maximum tick arrays passed to a swap (the account in the instruction
+/// plus remaining accounts) and how far to scan for initialized ones.
+pub const MAX_SWAP_TICK_ARRAYS: usize = 3;
+pub const TICK_ARRAY_SCAN: i32 = 10;
+
+/// Pick the tick arrays for a swap: the candidates (in swap direction) that
+/// exist on-chain and are owned by the CLMM program, first `MAX` of them.
+/// Raydium requires the first *initialized* array in the swap direction as
+/// the instruction's tick-array account; an uninitialized PDA (the array of
+/// the current tick can be empty) makes the swap fail on-chain.
+pub fn select_tick_arrays(
+    candidates: &[Pubkey],
+    owners: &[Option<Pubkey>],
+    program_id: &Pubkey,
+) -> Vec<Pubkey> {
+    candidates
+        .iter()
+        .zip(owners.iter())
+        .filter(|(_, owner)| owner.as_ref() == Some(program_id))
+        .map(|(pk, _)| *pk)
+        .take(MAX_SWAP_TICK_ARRAYS)
+        .collect()
 }
 
 fn read_pubkey(c: &mut Cursor<&[u8]>) -> Result<Pubkey, String> {
@@ -182,7 +248,7 @@ pub fn resolve_swap_accounts(
     output_mint: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<(SwapAccounts, ResolvedPool), String> {
-    let pool = fetch_pool_state(rpc, pool_id)?;
+    let mut pool = fetch_pool_state(rpc, pool_id)?;
 
     // Determine which vault is the input/output based on the requested mints.
     let (input_vault, output_vault) = if input_mint == &pool.token_mint_0 {
@@ -198,7 +264,32 @@ pub fn resolve_swap_accounts(
 
     let input_token_account = resolve_user_ata(user, input_mint);
     let output_token_account = resolve_user_ata(user, output_mint);
-    let tick_array = pool.tick_array_pda(program_id);
+
+    // One RPC round trip for the AmmConfig (real fee tier) and the
+    // tick-array candidates in the swap direction.
+    let zero_for_one = input_mint == &pool.token_mint_0;
+    let candidates = pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN);
+    let mut keys = Vec::with_capacity(candidates.len() + 1);
+    keys.push(pool.amm_config);
+    keys.extend_from_slice(&candidates);
+    let fetched = rpc
+        .get_multiple_accounts(&keys)
+        .map_err(|e| format!("failed to fetch amm config / tick arrays for {pool_id}: {e}"))?;
+    let amm_config = fetched
+        .first()
+        .and_then(|a| a.as_ref())
+        .ok_or_else(|| format!("amm config {} not found", pool.amm_config))?;
+    pool.trade_fee_rate = Some(parse_trade_fee_rate(&amm_config.data)?);
+    let owners: Vec<Option<Pubkey>> = fetched[1..]
+        .iter()
+        .map(|a| a.as_ref().map(|acc| acc.owner))
+        .collect();
+    let arrays = select_tick_arrays(&candidates, &owners, program_id);
+    let Some((&tick_array, extra)) = arrays.split_first() else {
+        return Err(format!(
+            "no initialized tick array within {TICK_ARRAY_SCAN} arrays of the current tick in pool {pool_id} (fail-closed)"
+        ));
+    };
 
     let accounts = SwapAccounts {
         amm_config: pool.amm_config,
@@ -209,6 +300,7 @@ pub fn resolve_swap_accounts(
         output_vault,
         observation_state: pool.observation_key,
         tick_array,
+        extra_tick_arrays: extra.to_vec(),
     };
 
     Ok((accounts, pool))
@@ -410,5 +502,64 @@ mod tests {
         // tick array PDA is deterministic and non-zero.
         let ta = pool.tick_array_pda(&program_id);
         assert_ne!(ta, Pubkey::default());
+    }
+
+    #[test]
+    fn tick_array_candidates_walk_in_swap_direction() {
+        let program_id = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let data = synthetic_pool_data(
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            1u128 << 64,
+            0,
+            -130,
+            10,
+        );
+        let pool = parse_pool_state(&pool_id, &data).unwrap();
+        let size = TICK_ARRAY_SIZE * i32::from(pool.tick_spacing);
+        let start = pool.tick_array_start_index();
+        let down = pool.tick_array_candidates(&program_id, true, 3);
+        let up = pool.tick_array_candidates(&program_id, false, 3);
+        assert_eq!(down[0], up[0], "both start at the current tick's array");
+        assert_eq!(down[1], pool.tick_array_pda_at(&program_id, start - size));
+        assert_eq!(up[1], pool.tick_array_pda_at(&program_id, start + size));
+        assert_eq!(
+            down[2],
+            pool.tick_array_pda_at(&program_id, start - 2 * size)
+        );
+    }
+
+    #[test]
+    fn select_tick_arrays_skips_uninitialized_and_caps() {
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let c: Vec<Pubkey> = (0..6).map(|_| Pubkey::new_unique()).collect();
+        // current array missing, then a foreign-owned account, then 4 valid
+        let owners = vec![
+            None,
+            Some(other),
+            Some(program_id),
+            Some(program_id),
+            Some(program_id),
+            Some(program_id),
+        ];
+        let sel = select_tick_arrays(&c, &owners, &program_id);
+        assert_eq!(sel, vec![c[2], c[3], c[4]]);
+        assert!(select_tick_arrays(&c, &[None; 6], &program_id).is_empty());
+    }
+
+    #[test]
+    fn trade_fee_rate_parses_amm_config_layout() {
+        let mut data = vec![0u8; 117];
+        data[47..51].copy_from_slice(&2500u32.to_le_bytes());
+        assert_eq!(parse_trade_fee_rate(&data).unwrap(), 2500);
+        assert!(parse_trade_fee_rate(&data[..40]).is_err());
+        let zero = vec![0u8; 117];
+        assert!(parse_trade_fee_rate(&zero).is_err());
     }
 }

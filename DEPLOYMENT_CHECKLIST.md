@@ -26,6 +26,13 @@ listesi: [`docs/mainnet_checklist.md`](docs/mainnet_checklist.md).
       Ansible `remote_src` hatalıydı → hepsi yeniden yazıldı, HSM için ayrı unit, rollback.
 - [x] CI: deprecated `actions-rs/toolchain`, kırmızı `risk::tests::audit_log_written_on_kill_switch`.
 
+- [x] Swap ücreti %0.05 sabitti → havuzun gerçek ücret kademesi AmmConfig'ten okunuyor.
+- [x] Yalnızca mevcut tick'in dizisi veriliyordu → swap yönündeki ilk başlatılmış 3 tick
+      array seçiliyor (boş dizi / sınır geçişi zincirde hata vermez).
+- [x] Jito bahşişi hiç eklenmiyordu → tip hesapları Block Engine'den canlı okunuyor,
+      bahşiş transferi imzadan önce işleme ekleniyor; bahşişsiz Jito live'da reddediliyor.
+- [x] `getTokenLargestAccounts` her turda çağrılıyordu → 60 sn önbellek.
+
 ## Operatörün yapması gerekenler (kodla çözülemez)
 
 - [ ] Ücretli mainnet RPC (Helius/Triton/QuickNode) → `SNIPER_RPC`, `SNIPER_WS`

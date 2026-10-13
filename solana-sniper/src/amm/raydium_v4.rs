@@ -42,6 +42,10 @@ pub struct SwapTxOptions {
     /// Close the (non-native) input token account after the swap. Set on an
     /// exit that sells the whole balance, so the ATA rent comes back too.
     pub close_input_token_account: bool,
+    /// Jito tip `(tip account, lamports)` appended as the last instruction
+    /// when submitting through a Block Engine (bundles without a tip are
+    /// dropped). `None` for plain RPC submission.
+    pub jito_tip: Option<(Pubkey, u64)>,
 }
 
 /// Anchor discriminator for `global:swap` = sha256("global:swap")[0..8].
@@ -64,8 +68,11 @@ pub struct SwapAccounts {
     pub output_vault: Pubkey,
     /// Observation (oracle) state account.
     pub observation_state: Pubkey,
-    /// Tick array account for the current tick.
+    /// First initialized tick array in the swap direction.
     pub tick_array: Pubkey,
+    /// Further initialized tick arrays in the swap direction, passed as
+    /// remaining accounts so a swap may cross array boundaries.
+    pub extra_tick_arrays: Vec<Pubkey>,
 }
 
 /// Adapter for Raydium V4 CLMM pools.
@@ -145,7 +152,7 @@ impl RaydiumV4ClmmAdapter {
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)
             .map_err(|e| format!("invalid token program id: {e}"))?;
 
-        let metas = vec![
+        let mut metas = vec![
             AccountMeta::new(*signer, true), // payer (signer)
             AccountMeta::new_readonly(accounts.amm_config, false),
             AccountMeta::new(accounts.pool_state, false),
@@ -157,6 +164,12 @@ impl RaydiumV4ClmmAdapter {
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new(accounts.tick_array, false),
         ];
+        metas.extend(
+            accounts
+                .extra_tick_arrays
+                .iter()
+                .map(|pk| AccountMeta::new(*pk, false)),
+        );
 
         Ok(Instruction {
             program_id,
@@ -267,6 +280,13 @@ impl RaydiumV4ClmmAdapter {
         if opts.output_mint == native_mint {
             ixs.push(close_account_ix(&accounts.output_token_account, signer)?);
         }
+        if let Some((tip_account, lamports)) = opts.jito_tip {
+            ixs.push(solana_sdk::system_instruction::transfer(
+                signer,
+                &tip_account,
+                lamports,
+            ));
+        }
 
         let message = Message::new(&ixs, Some(signer));
         let mut tx = Transaction::new_unsigned(message);
@@ -350,8 +370,10 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
             .as_ref()
             .ok_or("no resolved pool attached — call with_resolved_pool before quote")?;
         let sqrt_price = pool.sqrt_price_x64;
-        // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
-        let fee_rate = 500u64;
+        // The pool's real fee tier (parts per million) read from its
+        // AmmConfig by resolve_swap_accounts; 500 (0.05%) only when no
+        // config was resolved (unit tests / offline).
+        let fee_rate = pool.trade_fee_rate.map(u64::from).unwrap_or(500);
         // Direction: the pool price is token1/token0. Selling token0 yields
         // `amount * price` token1; selling token1 yields `amount / price`
         // token0. The direction is taken from the resolved swap accounts
@@ -471,6 +493,7 @@ mod tests {
             output_vault: Pubkey::new_unique(),
             observation_state: Pubkey::new_unique(),
             tick_array: Pubkey::new_unique(),
+            extra_tick_arrays: vec![],
         };
         RaydiumV4ClmmAdapter::new("pool_test".to_string()).with_swap_accounts(accounts)
     }
@@ -559,6 +582,43 @@ mod tests {
     }
 
     #[test]
+    fn extra_tick_arrays_are_appended_as_writable_remaining_accounts() {
+        let mut adapter = sample_adapter();
+        let extra = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        adapter.accounts.as_mut().unwrap().extra_tick_arrays = extra.clone();
+        let quote = Quote {
+            pool_id: "pool_test".into(),
+            input_mint: "SOL".into(),
+            output_mint: "X".into(),
+            input_amount: 1_000,
+            expected_output: 999,
+            slippage_bps: 100,
+        };
+        let intent = adapter.build_intent(quote).unwrap();
+        let ix = adapter
+            .build_swap_instruction(&intent, &Pubkey::new_unique())
+            .unwrap();
+        assert_eq!(ix.accounts.len(), 12);
+        assert_eq!(ix.accounts[10].pubkey, extra[0]);
+        assert_eq!(ix.accounts[11].pubkey, extra[1]);
+        assert!(ix.accounts[10].is_writable && !ix.accounts[10].is_signer);
+    }
+
+    #[test]
+    fn quote_uses_pool_fee_tier_when_resolved() {
+        let mut data = vec![0u8; 273];
+        data[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        let mut pool =
+            RaydiumV4ClmmAdapter::parse_pool_state(&Pubkey::new_unique(), &data).unwrap();
+        pool.trade_fee_rate = Some(10_000); // 1% tier
+        let q = sample_adapter()
+            .with_resolved_pool(pool)
+            .quote(1_000_000, 100)
+            .unwrap();
+        assert_eq!(q.expected_output, 990_000);
+    }
+
+    #[test]
     fn swap_program_id_is_canonical_mainnet_clmm() {
         assert_eq!(
             RAYDIUM_CLMM_PROGRAM_ID,
@@ -625,6 +685,7 @@ mod tests {
             compute_unit_limit: 300_000,
             priority_fee_micro_lamports: 10_000,
             close_input_token_account: false,
+            jito_tip: None,
         };
         let tx = adapter
             .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
@@ -670,6 +731,7 @@ mod tests {
             compute_unit_limit: 0,
             priority_fee_micro_lamports: 0,
             close_input_token_account: false,
+            jito_tip: None,
         };
         let tx = adapter
             .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
@@ -678,6 +740,23 @@ mod tests {
         assert_eq!(tx.message.instructions.len(), 4);
         let last = tx.message.instructions.last().unwrap();
         assert_eq!(last.data, vec![9]);
+
+        // With a Jito tip the transfer to the tip account is the last ix.
+        let tip_account = Pubkey::new_unique();
+        let tipped = SwapTxOptions {
+            jito_tip: Some((tip_account, 10_000)),
+            ..opts.clone()
+        };
+        let tx = adapter
+            .build_swap_transaction(&intent, &signer, Hash::new_unique(), &tipped)
+            .unwrap();
+        let last = tx.message.instructions.last().unwrap();
+        let keys = &tx.message.account_keys;
+        assert_eq!(
+            keys[last.program_id_index as usize],
+            solana_sdk::system_program::id()
+        );
+        assert_eq!(keys[last.accounts[1] as usize], tip_account);
 
         // Full exit: the emptied token ATA is closed too (rent refunded).
         let full = SwapTxOptions {

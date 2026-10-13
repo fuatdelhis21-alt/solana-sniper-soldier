@@ -351,7 +351,7 @@ fn resolve_paper_market_data(
         // Holder risk is measured on the token being BOUGHT (output mint),
         // never on the pay-side mint (wSOL has no meaningful holder set).
         let vaults = [accounts.input_vault, accounts.output_vault];
-        let stats = onchain_risk::fetch_holder_stats(rpc_client, &output_mint, &vaults)
+        let stats = onchain_risk::fetch_holder_stats_cached(rpc_client, &output_mint, &vaults)
             .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
         // Holder-concentration gate (operator-approved design, fail-closed):
         // single holder >30% or combined top-20 >70% of supply rejects with
@@ -954,6 +954,7 @@ async fn manage_open_position(
     blockhash_mgr: &std::sync::Mutex<retry::BlockhashManager>,
     from: &Pubkey,
     pos: &position::LivePosition,
+    jito_tip: Option<(Pubkey, u64)>,
 ) -> ExitOutcome {
     let parse = |label: &str, v: &str| {
         Pubkey::from_str(v).map_err(|e| format!("invalid {label} in live position: {e}"))
@@ -1042,6 +1043,7 @@ async fn manage_open_position(
         // Selling the whole balance empties the ATA: close it so its rent
         // returns to the wallet and shows up in the realized P&L.
         close_input_token_account: amount == held,
+        jito_tip,
     };
     let mut tx = match adapter.build_swap_transaction(&intent, from, blockhash, &opts) {
         Ok(t) => t,
@@ -1340,6 +1342,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // iteration makes several RPC calls, so raise this on rate-limited RPC
     // plans (public mainnet RPC answers 429 at the 200 ms default).
     let loop_interval = Duration::from_millis(args.loop_interval_ms.max(50));
+    // Jito: a bundle only lands with a tip transfer to one of the Block
+    // Engine's tip accounts inside the transaction itself (signed with it).
+    // Read the accounts live at startup; refuse to run LIVE through Jito
+    // without a valid tip (the bundle would silently never land).
+    let jito_tip: Option<(Pubkey, u64)> = match &args.jito_endpoint {
+        Some(ep) if (args.live || args.dry_run) && !args.jito_dry_run => {
+            if args.jito_tip_lamports < jito::MIN_TIP_LAMPORTS {
+                return Err(format!(
+                    "--jito-endpoint requires --jito-tip-lamports >= {} (bundles without a tip never land)",
+                    jito::MIN_TIP_LAMPORTS
+                )
+                .into());
+            }
+            match jito::JitoClient::new(ep, false).tip_accounts().await {
+                Ok(accounts) => {
+                    let pick = accounts[(marketdata::now_ms() as usize) % accounts.len()];
+                    tracing::info!(target: "jito", tip_account = %pick, tip_lamports = args.jito_tip_lamports, "jito tip account resolved");
+                    Some((pick, args.jito_tip_lamports))
+                }
+                Err(e) if args.live => {
+                    return Err(
+                        format!("cannot resolve Jito tip accounts (fail-closed): {e}").into(),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(target: "jito", error = %e, "jito tip accounts unavailable — dry-run builds without tip");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let max_iterations: u64 = if args.iterations == 0 {
         u64::MAX
     } else {
@@ -1393,6 +1428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &blockhash_mgr,
                     &from,
                     &pos,
+                    jito_tip,
                 )
                 .await;
                 let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
@@ -1966,7 +2002,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     // Holder risk of the token being bought (never wSOL).
-                    let holder_stats = match onchain_risk::fetch_holder_stats(
+                    let holder_stats = match onchain_risk::fetch_holder_stats_cached(
                         &rpc_client,
                         &output_mint,
                         &[accounts.input_vault, accounts.output_vault],
@@ -2209,6 +2245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compute_unit_limit: args.compute_unit_limit,
                         priority_fee_micro_lamports: args.priority_fee_micro_lamports,
                         close_input_token_account: false,
+                        jito_tip,
                     };
                     adapter
                         .build_swap_transaction(&intent, &from, blockhash, &opts)

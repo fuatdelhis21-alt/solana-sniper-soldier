@@ -167,6 +167,41 @@ pub fn fetch_holder_stats(
     compute_holder_stats(total_supply, &entries, excludes, &program_owned)
 }
 
+/// How long a successful holder-concentration reading is reused. The
+/// distribution of a token's top holders does not move within seconds, and
+/// `getTokenLargestAccounts` is one of the heaviest RPC calls (providers
+/// answer "account index service overloaded" when it runs every iteration).
+pub const HOLDER_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type HolderCache =
+    std::sync::Mutex<std::collections::HashMap<Pubkey, (std::time::Instant, HolderStats)>>;
+
+fn holder_cache() -> &'static HolderCache {
+    static CACHE: std::sync::OnceLock<HolderCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `fetch_holder_stats` with a per-mint cache of successful readings for
+/// `HOLDER_STATS_TTL`. Errors are never cached (the next iteration retries,
+/// and the gate stays fail-closed meanwhile).
+pub fn fetch_holder_stats_cached(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    excludes: &[Pubkey],
+) -> Result<HolderStats, String> {
+    if let Some((at, stats)) = holder_cache().lock().unwrap().get(mint) {
+        if at.elapsed() < HOLDER_STATS_TTL {
+            return Ok(stats.clone());
+        }
+    }
+    let stats = fetch_holder_stats(rpc, mint, excludes)?;
+    holder_cache()
+        .lock()
+        .unwrap()
+        .insert(*mint, (std::time::Instant::now(), stats.clone()));
+    Ok(stats)
+}
+
 /// Owner field of an SPL token account (bytes 32..64), if the data is long
 /// enough to be one.
 fn token_account_owner(data: &[u8]) -> Option<Pubkey> {

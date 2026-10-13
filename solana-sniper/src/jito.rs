@@ -53,6 +53,36 @@ impl JitoClient {
         }
     }
 
+    /// Fetch the Block Engine's current tip accounts (`getTipAccounts`).
+    /// A bundle only lands if one of its transactions transfers a tip to
+    /// one of these accounts, so the bot reads them live instead of
+    /// hard-coding addresses (a wrong address would just burn the tip).
+    pub async fn tip_accounts(&self) -> Result<Vec<solana_sdk::pubkey::Pubkey>, String> {
+        let url = format!("{}/api/v1/bundles", self.endpoint.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTipAccounts",
+            "params": []
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("jito getTipAccounts failed: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("jito getTipAccounts read failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("jito getTipAccounts HTTP {status}: {text}"));
+        }
+        parse_tip_accounts(&text)
+    }
+
     /// Serialize the bundle transactions into the Jito `bundleTransactions`
     /// wire format (base64-encoded signed transaction bytes).
     fn serialize_bundle(&self, bundle: &JitoBundle) -> Result<Vec<String>, String> {
@@ -137,6 +167,35 @@ impl JitoClient {
     }
 }
 
+/// Minimum tip the Block Engine accepts for a bundle, in lamports.
+pub const MIN_TIP_LAMPORTS: u64 = 1_000;
+
+/// Parse a `getTipAccounts` JSON-RPC response (`{"result": ["<b58>", ...]}`).
+pub fn parse_tip_accounts(text: &str) -> Result<Vec<solana_sdk::pubkey::Pubkey>, String> {
+    use std::str::FromStr;
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("tip accounts parse failed: {e}"))?;
+    let arr = v
+        .get("result")
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| format!("tip accounts response missing result: {text}"))?;
+    let accounts = arr
+        .iter()
+        .map(|a| {
+            a.as_str()
+                .ok_or("non-string tip account".to_string())
+                .and_then(|s| {
+                    solana_sdk::pubkey::Pubkey::from_str(s)
+                        .map_err(|e| format!("invalid tip account {s}: {e}"))
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if accounts.is_empty() {
+        return Err("Block Engine returned no tip accounts".into());
+    }
+    Ok(accounts)
+}
+
 /// Send a bundle via Jito's BlockEngine relayer.
 ///
 /// This is a convenience wrapper around `JitoClient::send_bundle`. In dry-run
@@ -219,6 +278,17 @@ mod tests {
         // base64 decode should succeed and yield non-empty bytes.
         let decoded = base64::decode(&txs[0]).unwrap();
         assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn parse_tip_accounts_reads_result_array() {
+        let a = Keypair::new().pubkey();
+        let b = Keypair::new().pubkey();
+        let text = format!(r#"{{"jsonrpc":"2.0","result":["{a}","{b}"],"id":1}}"#);
+        assert_eq!(parse_tip_accounts(&text).unwrap(), vec![a, b]);
+        assert!(parse_tip_accounts(r#"{"result":[]}"#).is_err());
+        assert!(parse_tip_accounts(r#"{"error":"x"}"#).is_err());
+        assert!(parse_tip_accounts(r#"{"result":["not-a-key"]}"#).is_err());
     }
 
     #[test]
