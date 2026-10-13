@@ -3,21 +3,21 @@
 ## Monitoring Setup
 
 ### 1. Prometheus Metrics Endpoint
-```toml
-# config/production.example.toml
-[telemetry]
-json_logs = true
-log_level = "info"
-prometheus_port = 9090
-```
+Bot, `SNIPER_METRICS_ADDR` (systemd varsayılanı `127.0.0.1:9090`) üzerinde
+`GET /metrics` ve `GET /health` sunar. Adres bağlanamazsa bot başlamaz.
 
-### 2. Scraped Metrics (Expected)
+### 2. Metrikler (gerçek isimler — `solana-sniper/src/metrics.rs`)
 ```
-# Counter examples (from hft-core, hft-marketdata, etc.)
-hft_market_events_total{source="geyser"}
-hft_pipeline_dedup_dropped
-hft_geyser_reconnects_total
-hft_execution_orders_total{status="success|failed"}
+trade_attempt_total{mode}                 risk-gate değerlendirmeleri
+trade_rejected_total{mode,reason}         RejectReason kodlarıyla red
+trade_executed_total{mode}                gönderilip onaylanan (live) işlemler
+circuit_breaker_state                     1 = açık
+hft_kill_switch_active                    1 = aktif
+daily_realized_pnl                        günlük gerçekleşen zarar (lamports, negatif)
+open_position_count                       açık pozisyon sayısı
+hft_trades_total / hft_trades_success / hft_trades_failed
+hft_trade_latency_ms                      histogram
+hft_hsm_requests / hft_hsm_errors / hft_hsm_latency_ms
 ```
 
 ### 3. Health Check (HTTP)
@@ -44,20 +44,9 @@ tar -czf /tmp/solana-hft-backup-$(date +%Y%m%d-%H%M%S).tar.gz \
 
 ### Instant Rollback (< 30 seconds)
 ```bash
-# If issues detected post-deploy:
-systemctl stop solana-hft
-
-# Restore previous version:
-rm -rf /opt/solana-hft/*
-tar -xzf /tmp/solana-hft-backup-TIMESTAMP.tar.gz \
-  -C /opt/solana-hft
-
-# Restart:
-systemctl start solana-hft
-systemctl status solana-hft
-
-# Verify:
-curl http://localhost:9090/metrics | grep hft_uptime_seconds
+# install_release.sh önceki binary'leri /opt/solana-hft/bin.prev'e saklar:
+sudo /opt/solana-hft/rollback.sh
+curl -s http://localhost:9090/health
 ```
 
 ### Full Rollback (Config + Binaries)
@@ -73,10 +62,9 @@ systemctl restart solana-hft
 ## Canary Deployment (Optional)
 
 ### Shadow Mode (No Real Orders)
-```toml
-# config/production.example.toml
-[execution]
-mode = "shadow"  # → Log orders but don't execute
+```bash
+# /etc/solana-hft/solana-hft.env
+SNIPER_DRY_RUN=true   # gerçek swap tx kurulur + imzalanır, asla gönderilmez
 ```
 
 ### Gradual Rollout
@@ -97,20 +85,15 @@ groups:
       - alert: HFTPlatformDown
         expr: up{job="solana-hft"} == 0
         for: 2m
-        annotations:
-          summary: "Solana HFT Platform is down"
-
-      - alert: HFTHighErrorRate
-        expr: rate(hft_errors_total[5m]) > 0.001
+      - alert: HFTCircuitBreakerOpen
+        expr: circuit_breaker_state == 1
         for: 5m
-        annotations:
-          summary: "High error rate (> 0.1%)"
-
-      - alert: HFTHighLatency
-        expr: hft_execution_latency_p99_ms > 50
-        for: 5m
-        annotations:
-          summary: "P99 latency > 50ms"
+      - alert: HFTKillSwitchActive
+        expr: hft_kill_switch_active == 1
+      - alert: HFTHsmErrors
+        expr: increase(hft_hsm_errors[10m]) > 0
+      - alert: HFTTradeFailures
+        expr: increase(hft_trades_failed[15m]) > 2
 ```
 
 ---

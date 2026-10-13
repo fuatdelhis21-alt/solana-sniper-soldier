@@ -10,8 +10,6 @@
 //! - RiskManager guards (max trade size, slippage, daily loss) run before every trade.
 //! - BlockhashManager + send_with_retry provide 3-level exponential backoff.
 
-mod integration;
-
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -19,6 +17,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tokio::time::sleep;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use solana_commitment_config::CommitmentConfig;
@@ -27,25 +26,15 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
 
-// Local modules
-mod amm;
-mod config;
-mod decision;
-mod discovery;
-mod executor;
-mod hw_signer;
-mod jito;
-mod marketdata;
-mod metrics;
-mod onchain_risk;
-mod remote_hsm;
-mod retry;
-mod risk;
-mod strategy;
-mod tx;
+// Library modules (solana_sniper crate): compiled once, shared with the
+// other binaries (pool-sniper, tools).
 use amm::AmmAdapter;
 use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
+use solana_sniper::{
+    amm, decision, discovery, hw_signer, jito, marketdata, metrics, onchain_risk, position, redact,
+    remote_hsm, retry, risk, strategy,
+};
 
 // ============================================================================
 // AŞAMA 2/3/4 — Paper trading on REAL on-chain market data (no tx ever built)
@@ -59,6 +48,9 @@ use remote_hsm::RemoteHsmSigner;
 struct PaperPosition {
     entry_sqrt_price: u128,
     position_size_lamports: u64,
+    /// SOL-side liquidity at entry (liquidity-drop exit, as in live).
+    entry_liquidity_lamports: u64,
+    opened_at_ms: u64,
 }
 
 /// Outcome of one paper iteration against real market data.
@@ -68,6 +60,9 @@ enum PaperTick {
     ClosedStopLoss(i64),
     /// Simulated position closed at the simulated take-profit (realized pnl).
     ClosedTakeProfit(i64),
+    /// Simulated position closed by the max holding time or a SOL-side
+    /// liquidity drop — the same forced exits live applies.
+    ClosedForced(strategy::ExitDecision, i64),
     /// An open simulated position is held (no exit signal).
     Hold,
     /// No open position and the strategy produced no entry signal.
@@ -90,12 +85,29 @@ struct PaperSimulator {
     holds: u64,
     no_entry_signals: u64,
     simulated_pnl_lamports: i64,
+    /// Swap direction of the configured pool: true when the pay-side
+    /// (input) mint is the pool's token0. The pool price is token1/token0,
+    /// so with token0 as input a RISING price means the held token is
+    /// worth LESS — exits and P&L must use the inverted ratio.
+    input_is_token0: bool,
+    /// Wall clock for this tick (ms) — set by the caller; 0 in tests.
+    now_ms: u64,
+    /// Max holding time (ms) of a simulated position; 0 = no limit.
+    max_hold_ms: u64,
+    exits_forced: u64,
+    /// Liquidity seen by the last tick (recorded on confirm_entry).
+    last_liquidity_lamports: u64,
 }
 
 impl PaperSimulator {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_config(strategy::StrategyConfig::default())
+    }
+
+    fn with_config(config: strategy::StrategyConfig) -> Self {
         Self {
-            strategy: strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default()),
+            strategy: strategy::SimpleSnipeStrategy::new(config),
             position: None,
             entries: 0,
             exits_stop_loss: 0,
@@ -103,6 +115,11 @@ impl PaperSimulator {
             holds: 0,
             no_entry_signals: 0,
             simulated_pnl_lamports: 0,
+            input_is_token0: false,
+            now_ms: 0,
+            max_hold_ms: 0,
+            exits_forced: 0,
+            last_liquidity_lamports: 0,
         }
     }
 
@@ -127,32 +144,53 @@ impl PaperSimulator {
         candidate: &strategy::TokenCandidate,
         current_sqrt_price: u128,
     ) -> PaperTick {
+        self.last_liquidity_lamports = candidate.liquidity_lamports;
         if let Some(pos) = self.position {
-            let exit = self
-                .strategy
-                .should_exit(pos.entry_sqrt_price, current_sqrt_price);
+            // Orient the ratio so "up" always means the held token gained
+            // value in input units: (current/entry)^2 for token1 input,
+            // (entry/current)^2 for token0 input (args swapped).
+            let (from_sqrt, to_sqrt) = if self.input_is_token0 {
+                (current_sqrt_price, pos.entry_sqrt_price)
+            } else {
+                (pos.entry_sqrt_price, current_sqrt_price)
+            };
+            let mut exit = self.strategy.should_exit(from_sqrt, to_sqrt);
+            if exit == strategy::ExitDecision::Hold {
+                if strategy::liquidity_dropped(
+                    pos.entry_liquidity_lamports,
+                    candidate.liquidity_lamports,
+                ) {
+                    exit = strategy::ExitDecision::LiquidityDrop;
+                } else if self.max_hold_ms > 0
+                    && self.now_ms.saturating_sub(pos.opened_at_ms) >= self.max_hold_ms
+                {
+                    exit = strategy::ExitDecision::MaxHoldTime;
+                }
+            }
             return match exit {
                 strategy::ExitDecision::Hold => {
                     self.holds += 1;
                     PaperTick::Hold
                 }
+                strategy::ExitDecision::MaxHoldTime | strategy::ExitDecision::LiquidityDrop => {
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
+                    self.simulated_pnl_lamports += pnl;
+                    self.exits_forced += 1;
+                    self.position = None;
+                    PaperTick::ClosedForced(exit, pnl)
+                }
                 strategy::ExitDecision::StopLoss => {
-                    let pnl = simulated_pnl_lamports(
-                        pos.entry_sqrt_price,
-                        current_sqrt_price,
-                        pos.position_size_lamports,
-                    );
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
                     self.simulated_pnl_lamports += pnl;
                     self.exits_stop_loss += 1;
                     self.position = None;
                     PaperTick::ClosedStopLoss(pnl)
                 }
                 strategy::ExitDecision::TakeProfit => {
-                    let pnl = simulated_pnl_lamports(
-                        pos.entry_sqrt_price,
-                        current_sqrt_price,
-                        pos.position_size_lamports,
-                    );
+                    let pnl =
+                        simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
                     self.simulated_pnl_lamports += pnl;
                     self.exits_take_profit += 1;
                     self.position = None;
@@ -175,6 +213,8 @@ impl PaperSimulator {
         self.position = Some(PaperPosition {
             entry_sqrt_price,
             position_size_lamports: sig.position_size_lamports,
+            entry_liquidity_lamports: self.last_liquidity_lamports,
+            opened_at_ms: self.now_ms,
         });
         self.entries += 1;
     }
@@ -206,12 +246,13 @@ fn simulated_pnl_lamports(
 /// real vault liquidity + holder concentration.
 struct PaperMarketSnapshot {
     current_sqrt_price: u128,
-    price_timestamp_ms: u128,
     liquidity_lamports: u64,
     market_cap_lamports: u64,
     holders: u64,
     is_blocklisted: bool,
     source: &'static str,
+    /// True when the input (pay-side) mint is the pool's token0.
+    input_is_token0: bool,
 }
 
 /// Paper market-data failure. Data that could not be fetched at all is
@@ -297,7 +338,7 @@ fn resolve_paper_market_data(
     //    derives them deterministically (the dry-run path uses the same
     //    all-zero-owner pattern).
     let dummy_user = Pubkey::new_from_array([0u8; 32]);
-    let (accounts, _pool) = amm::account_resolver::resolve_swap_accounts(
+    let (accounts, pool) = amm::account_resolver::resolve_swap_accounts(
         rpc_client,
         &pool_id,
         &dummy_user,
@@ -337,8 +378,10 @@ fn resolve_paper_market_data(
             })?;
         // Exclude the pool's own vaults (infrastructure accounts resolved by
         // resolve_swap_accounts) so the pool never counts as a "holder".
+        // Holder risk is measured on the token being BOUGHT (output mint),
+        // never on the pay-side mint (wSOL has no meaningful holder set).
         let vaults = [accounts.input_vault, accounts.output_vault];
-        let stats = onchain_risk::fetch_holder_stats(rpc_client, &input_mint, &vaults)
+        let stats = onchain_risk::fetch_holder_stats_cached(rpc_client, &output_mint, &vaults)
             .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
         // Holder-concentration gate (operator-approved design, fail-closed):
         // single holder >30% or combined top-20 >70% of supply rejects with
@@ -349,8 +392,9 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     top_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
                     threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
                     "holder concentration gate: single holder exceeds threshold"
                 );
@@ -361,8 +405,9 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::TopHoldersConcentrated(pct) => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     top20_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
                     threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
                     "holder concentration gate: top-20 holders exceed threshold"
                 );
@@ -373,7 +418,7 @@ fn resolve_paper_market_data(
             onchain_risk::HolderVerdict::Unassessable => {
                 tracing::warn!(
                     target: "paper",
-                    mint = %input_mint,
+                    mint = %output_mint,
                     "holder concentration gate: no measurable holders (fail-closed reject)"
                 );
                 return Err(PaperDataError::Rejected(
@@ -391,12 +436,12 @@ fn resolve_paper_market_data(
 
     Ok(PaperMarketSnapshot {
         current_sqrt_price,
-        price_timestamp_ms,
         liquidity_lamports,
         market_cap_lamports: args.pool_market_cap,
         holders,
         is_blocklisted,
         source,
+        input_is_token0: accounts.input_vault == pool.token_vault_0,
     })
 }
 
@@ -408,33 +453,45 @@ fn resolve_paper_market_data(
 )]
 struct Args {
     /// RPC endpoint URL
-    #[arg(long, default_value = "https://api.devnet.solana.com")]
+    #[arg(
+        long,
+        env = "SNIPER_RPC",
+        default_value = "https://api.devnet.solana.com"
+    )]
     rpc: String,
 
     /// WebSocket endpoint URL
-    #[arg(long, default_value = "wss://api.devnet.solana.com")]
+    #[arg(long, env = "SNIPER_WS", default_value = "wss://api.devnet.solana.com")]
     ws: String,
 
     /// Path to wallet.json
-    #[arg(long, default_value = "./wallet.json")]
+    #[arg(long, env = "SNIPER_WALLET", default_value = "./wallet.json")]
     wallet: PathBuf,
 
     /// Dry-run: build + sign transactions, print them, never send
-    #[arg(long, default_value_t = false, conflicts_with = "live")]
+    #[arg(long, env = "SNIPER_DRY_RUN", default_value_t = false)]
     dry_run: bool,
 
     /// Live mode: actually submit transactions to the network
-    #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+    #[arg(long, env = "SNIPER_LIVE", default_value_t = false)]
     live: bool,
 
     /// Paper-trading mode: run the strategy on simulated market data, never
-    /// submit any on-chain transaction. Mutually exclusive with live/dry-run.
-    #[arg(long, default_value_t = false, conflicts_with_all = ["live", "dry_run"])]
+    /// submit any on-chain transaction. Mutually exclusive with live/dry-run
+    /// (enforced by `validate_signing_config`, which also covers values that
+    /// come from SNIPER_* env vars, e.g. SNIPER_LIVE=false).
+    #[arg(long, env = "SNIPER_PAPER", default_value_t = false)]
     paper: bool,
 
-    /// Number of iterations (simulation mode only)
-    #[arg(long, default_value_t = 30)]
+    /// Number of loop iterations. 0 = run until stopped (SIGTERM / Ctrl-C),
+    /// which is what the systemd service uses.
+    #[arg(long, env = "SNIPER_ITERATIONS", default_value_t = 30)]
     iterations: u32,
+
+    /// Pause between loop iterations in milliseconds (minimum 50). Raise it
+    /// on rate-limited RPC plans: every iteration makes several RPC calls.
+    #[arg(long, env = "SNIPER_LOOP_INTERVAL_MS", default_value_t = 200)]
+    loop_interval_ms: u64,
 
     /// Optional blockhash (base58) to use for dry-run. When set, dry-run does
     /// not contact the RPC for a blockhash (deterministic / offline smoke tests).
@@ -442,27 +499,62 @@ struct Args {
     blockhash: Option<String>,
 
     /// Data directory for decision records, logs, and metrics
-    #[arg(long, default_value = "./data")]
+    #[arg(long, env = "SNIPER_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
 
     /// Remote HSM endpoint (e.g. https://127.0.0.1:8443). When set, transactions are signed via the remote HSM using mTLS.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_HSM_ENDPOINT")]
     hsm_endpoint: Option<String>,
 
     /// CA certificate (PEM) used to verify the HSM server (mTLS)
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_HSM_CA")]
     hsm_ca: Option<PathBuf>,
 
     /// Combined client cert + key PEM presented to the HSM server (mTLS)
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_HSM_CLIENT_IDENTITY")]
     hsm_client_identity: Option<PathBuf>,
+
+    /// Pinned wallet public key (base58) the HSM must sign with. Required in
+    /// LIVE mode: if the HSM reports any other key (e.g. it fell back to an
+    /// ephemeral dev key) the bot refuses to trade (fail-closed).
+    #[arg(long, env = "SNIPER_EXPECTED_SIGNER")]
+    expected_signer: Option<String>,
+
+    /// Maximum time (seconds) a live position is held. When reached the
+    /// position is sold regardless of price. 0 disables the limit.
+    #[arg(long, env = "SNIPER_MAX_HOLD_SECS", default_value_t = 86_400)]
+    max_hold_secs: u64,
+
+    /// DRY-RUN only: build the swap with this funded address as fee payer and
+    /// simulate it on-chain WITHOUT signing (sigVerify off). Validates the
+    /// complete swap on mainnet before your own wallet is funded. Nothing is
+    /// signed or sent.
+    #[arg(long, env = "SNIPER_SIMULATE_PAYER")]
+    simulate_payer: Option<String>,
+
+    /// Address for the Prometheus `/metrics` + `/health` HTTP server
+    /// (e.g. 127.0.0.1:9090). Disabled when unset.
+    #[arg(long, env = "SNIPER_METRICS_ADDR")]
+    metrics_addr: Option<String>,
+
+    /// Priority fee (micro-lamports per compute unit) for swap transactions.
+    #[arg(
+        long,
+        env = "SNIPER_PRIORITY_FEE_MICRO_LAMPORTS",
+        default_value_t = 10_000
+    )]
+    priority_fee_micro_lamports: u64,
+
+    /// Compute unit limit for swap transactions.
+    #[arg(long, env = "SNIPER_COMPUTE_UNIT_LIMIT", default_value_t = 300_000)]
+    compute_unit_limit: u32,
 
     /// Token candidate: pool liquidity (lamports) for strategy evaluation
     #[arg(long, default_value_t = 0)]
     pool_liquidity: u64,
 
     /// Token candidate: market cap (lamports) for strategy evaluation
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "SNIPER_POOL_MARKET_CAP", default_value_t = 0)]
     pool_market_cap: u64,
 
     /// Token candidate: number of holders for strategy evaluation
@@ -475,11 +567,11 @@ struct Args {
 
     /// Jito Block Engine endpoint. When set, live submissions go through Jito
     /// bundles with RPC fallback.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_JITO_ENDPOINT")]
     jito_endpoint: Option<String>,
 
     /// Jito bundle tip (lamports). Only used when --jito-endpoint is set.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "SNIPER_JITO_TIP_LAMPORTS", default_value_t = 0)]
     jito_tip_lamports: u64,
 
     /// Jito dry-run: validate the bundle payload but never POST it.
@@ -490,42 +582,42 @@ struct Args {
     /// state on-chain, feeds the real price into the strategy, and builds a
     /// real AMM swap transaction. When unset, live mode keeps the safe
     /// self-transfer test path.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_POOL_ID")]
     pool_id: Option<String>,
 
     /// Input token mint (base58) for the swap. Required with --pool-id.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_INPUT_MINT")]
     input_mint: Option<String>,
 
     /// Output token mint (base58) for the swap. Required with --pool-id.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_OUTPUT_MINT")]
     output_mint: Option<String>,
 
     /// Max slippage in basis points (1/100 of a percent) for the swap.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, env = "SNIPER_MAX_SLIPPAGE_BPS", default_value_t = 100)]
     max_slippage_bps: u64,
 
     /// Max spend in SOL for a single trade (security cap).
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, env = "SNIPER_MAX_SPEND_SOL", default_value_t = 0.01)]
     max_spend_sol: f64,
 
     /// When set with --pool-id, replaces the static --pool-liquidity /
     /// --pool-holders CLI values with real on-chain data read via RPC
     /// (input vault balance + getTokenLargestAccounts/getTokenSupply).
     /// Fail-closed: an RPC error here halts the loop.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "SNIPER_LIVE_RISK_DATA", default_value_t = false)]
     live_risk_data: bool,
 
     /// Path to a local blocklist file (one base58 mint per line, `#`
     /// comments allowed). Only used with --live-risk-data. Missing file is
     /// treated as an empty blocklist, not an error.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_BLOCKLIST_FILE")]
     blocklist_file: Option<PathBuf>,
 
     /// Reject a candidate if the single largest holder (excluding the
     /// pool's own vault) holds more than this percent of supply. Only used
     /// with --live-risk-data.
-    #[arg(long, default_value_t = 50.0)]
+    #[arg(long, env = "SNIPER_MAX_TOP_HOLDER_PCT", default_value_t = 50.0)]
     max_top_holder_pct: f64,
 
     /// Optional DexScreener cross-check for logging only. Never used to
@@ -537,15 +629,62 @@ struct Args {
     /// updates (lower latency than RPC polling). Falls back to the
     /// existing RPC-polled market data hook when unset or not yet
     /// connected.
-    #[arg(long)]
+    #[arg(long, env = "SNIPER_WS_ENDPOINT")]
     ws_endpoint: Option<String>,
 
     /// Manual "arm" kill switch for LIVE mode. Fail-closed default: false.
     /// The live trading loop refuses to start unless this is explicitly
     /// passed — a human must opt in every time the process starts in live
     /// mode. Has no effect in --paper or --dry-run.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "SNIPER_CONFIRM_LIVE", default_value_t = false)]
     confirm_live: bool,
+
+    /// Minimum SOL-side (input vault) pool liquidity for an entry, in SOL.
+    /// Floor: MIN_LIQUIDITY_FLOOR_SOL (thin pools cannot be exited).
+    #[arg(long, env = "SNIPER_MIN_LIQUIDITY_SOL", default_value_t = 1000.0)]
+    min_liquidity_sol: f64,
+
+    /// Stop after the first completed trade: a closed position (paper /
+    /// live) or one built+simulated entry (dry-run). Used by the pool
+    /// discovery supervisor, which runs one process per new pool.
+    #[arg(long, env = "SNIPER_SINGLE_TRADE", default_value_t = false)]
+    single_trade: bool,
+
+    /// Stop when no entry happened within this many seconds of startup
+    /// (0 = no limit). An open position is always managed to its exit.
+    #[arg(long, env = "SNIPER_ENTRY_WINDOW_SECS", default_value_t = 0)]
+    entry_window_secs: u64,
+}
+
+impl Args {
+    /// Treat empty values as unset: `SNIPER_POOL_ID=` in an env file (as in
+    /// .env.example) must mean "not configured", not an empty pool id.
+    fn normalized(mut self) -> Self {
+        fn s(v: &mut Option<String>) {
+            if v.as_deref().is_some_and(|x| x.trim().is_empty()) {
+                *v = None;
+            }
+        }
+        fn p(v: &mut Option<PathBuf>) {
+            if v.as_ref().is_some_and(|x| x.as_os_str().is_empty()) {
+                *v = None;
+            }
+        }
+        s(&mut self.blockhash);
+        s(&mut self.hsm_endpoint);
+        p(&mut self.hsm_ca);
+        p(&mut self.hsm_client_identity);
+        s(&mut self.expected_signer);
+        s(&mut self.simulate_payer);
+        s(&mut self.metrics_addr);
+        s(&mut self.jito_endpoint);
+        s(&mut self.pool_id);
+        s(&mut self.input_mint);
+        s(&mut self.output_mint);
+        p(&mut self.blocklist_file);
+        s(&mut self.ws_endpoint);
+        self
+    }
 }
 
 /// Initialize tracing with JSON structured logging + file rotation.
@@ -565,7 +704,12 @@ fn init_tracing(data_dir: &std::path::Path) -> tracing_appender::non_blocking::W
         .with_file(true)
         .with_line_number(true)
         .json()
-        .with_writer(non_blocking)
+        // File (daily rotation) AND stdout, so `journalctl -u solana-hft`
+        // shows the same JSON lines under systemd. Every line is redacted:
+        // RPC URLs carry provider API keys (also inside RPC error messages).
+        .with_writer(redact::RedactingMakeWriter::new(
+            non_blocking.and(std::io::stdout),
+        ))
         .init();
 
     tracing::info!(target: "main", log_dir = %log_dir.display(), "logging initialized (JSON + daily rotation)");
@@ -578,7 +722,7 @@ fn load_keypair(path: &PathBuf) -> Result<Keypair, Box<dyn std::error::Error>> {
     let arr: [u8; 64] = bytes
         .try_into()
         .map_err(|_| "wallet.json must be exactly 64 bytes")?;
-    Keypair::from_bytes(&arr).map_err(|e| e.into())
+    Keypair::try_from(&arr[..]).map_err(|e| e.into())
 }
 
 /// Fail-closed signing configuration validation.
@@ -655,7 +799,7 @@ async fn hsm_sign(
     let endpoint = endpoint.to_string();
     let ca = ca.to_path_buf();
     let identity = identity.to_path_buf();
-    let mut tx = tx.clone();
+    let tx = tx.clone();
     tokio::task::spawn_blocking(move || -> Result<Signature, String> {
         let signer = RemoteHsmSigner::new(&endpoint, Some(&ca), Some(&identity))
             .map_err(|e| format!("{e}"))?;
@@ -679,7 +823,7 @@ fn resolve_blockhash(
                 .map_err(|e| format!("invalid --blockhash: {e}"))?,
         )
     } else {
-        blockhash_mgr.lock().unwrap().get_or_refresh()
+        blockhash_mgr.lock().unwrap().force_refresh()
     }
 }
 
@@ -704,9 +848,575 @@ fn validate_paper_args(
     }
 }
 
+/// LIVE trading prerequisites beyond signing (fail-closed): a real pool to
+/// trade (the self-transfer test path is dry-run only), real on-chain risk
+/// data (static CLI liquidity/holder values are never trusted with real
+/// funds), and a pinned HSM wallet key.
+fn validate_live_args(
+    live: bool,
+    pool_id: Option<&str>,
+    input_mint: Option<&str>,
+    output_mint: Option<&str>,
+    live_risk_data: bool,
+    expected_signer: Option<&str>,
+) -> Result<Option<Pubkey>, String> {
+    let pinned = match expected_signer {
+        Some(s) => {
+            Some(Pubkey::from_str(s).map_err(|e| format!("invalid --expected-signer: {e}"))?)
+        }
+        None => None,
+    };
+    if !live {
+        return Ok(pinned);
+    }
+    if pool_id.is_none() || input_mint.is_none() || output_mint.is_none() {
+        return Err(
+            "LIVE mode requires --pool-id, --input-mint and --output-mint (a real pool to trade)."
+                .to_string(),
+        );
+    }
+    if !live_risk_data {
+        return Err(
+            "LIVE mode requires --live-risk-data (real on-chain liquidity + holder data; static CLI values are never trusted with real funds)."
+                .to_string(),
+        );
+    }
+    if pinned.is_none() {
+        return Err(
+            "LIVE mode requires --expected-signer <wallet pubkey> so the HSM key is validated before any trade (fail-closed)."
+                .to_string(),
+        );
+    }
+    Ok(pinned)
+}
+
+/// SOL kept in the wallet on top of the trade size: rent for a new token
+/// account (~0.00204) and the temporary wSOL account (~0.00204, refunded in
+/// the same tx), plus network/priority fees for the entry and the exit.
+const SOL_RESERVE_LAMPORTS: u64 = 6_000_000;
+
+/// SOL → lamports (truncating, like the deprecated solana_sdk helper).
+fn sol_to_lamports(sol: f64) -> u64 {
+    (sol * 1_000_000_000f64) as u64
+}
+
+/// Lowest accepted --min-liquidity-sol: below it a pool is too thin to
+/// exit a position at a sane price.
+const MIN_LIQUIDITY_FLOOR_SOL: f64 = 20.0;
+
+/// Strategy configuration for this run: the fail-closed defaults with the
+/// operator's liquidity floor.
+fn strategy_config(args: &Args) -> strategy::StrategyConfig {
+    strategy::StrategyConfig {
+        min_liquidity_lamports: sol_to_lamports(args.min_liquidity_sol),
+        ..strategy::StrategyConfig::default()
+    }
+}
+
+fn validate_min_liquidity(min_liquidity_sol: f64) -> Result<(), String> {
+    if !min_liquidity_sol.is_finite() || min_liquidity_sol < MIN_LIQUIDITY_FLOOR_SOL {
+        return Err(format!(
+            "--min-liquidity-sol must be >= {MIN_LIQUIDITY_FLOOR_SOL} SOL (got {min_liquidity_sol})"
+        ));
+    }
+    Ok(())
+}
+
+/// True when the run should stop because no entry happened within the
+/// entry window (never while a position is open).
+fn entry_window_expired(elapsed_secs: u64, window_secs: u64, position_open: bool) -> bool {
+    window_secs > 0 && !position_open && elapsed_secs >= window_secs
+}
+
+fn native_mint() -> Pubkey {
+    Pubkey::from_str(amm::raydium_v4::NATIVE_MINT).expect("valid native mint")
+}
+
+/// Upper bound for the escalated exit slippage (5%).
+const EXIT_MAX_SLIPPAGE_BPS: u64 = 500;
+
+/// Slippage for an exit attempt: the configured slippage, widened by one
+/// configured step per consecutive failed exit, capped at 5%. In a fast
+/// falling market a stop-loss sell at the normal 1% tolerance can fail
+/// (preflight rejects it, no fee is paid) iteration after iteration while
+/// the loss grows; widening guarantees the position is eventually closed.
+fn exit_slippage_bps(base_bps: u64, consecutive_failures: u32) -> u64 {
+    base_bps
+        .saturating_mul(1 + u64::from(consecutive_failures))
+        .min(EXIT_MAX_SLIPPAGE_BPS.max(base_bps))
+}
+
+/// True when a position opened at `opened_at_ms` has reached `max_hold_secs`
+/// (0 = no limit).
+fn max_hold_reached(opened_at_ms: u64, now_ms: u64, max_hold_secs: u64) -> bool {
+    max_hold_secs > 0 && now_ms.saturating_sub(opened_at_ms) >= max_hold_secs.saturating_mul(1000)
+}
+
+/// Minimum input-side balance required before an entry is sent.
+fn entry_required_balance(position_size: u64, input_is_native: bool) -> u64 {
+    if input_is_native {
+        position_size.saturating_add(SOL_RESERVE_LAMPORTS)
+    } else {
+        position_size
+    }
+}
+
+/// Build the exit (sell) transaction for `amount` raw units of the output
+/// mint back into the input mint — the same primitives the live exit path
+/// (`manage_open_position`) uses: reversed account resolution, real pool
+/// fee and tick arrays, ATA setup, wSOL unwrap.
+fn build_exit_tx(
+    args: &Args,
+    rpc: &RpcClient,
+    from: &Pubkey,
+    amount: u64,
+    blockhash: solana_sdk::hash::Hash,
+    jito_tip: Option<(Pubkey, u64)>,
+) -> Result<Transaction, String> {
+    let parse = |label: &str, v: Option<&str>| {
+        Pubkey::from_str(v.unwrap_or_default()).map_err(|e| format!("invalid {label}: {e}"))
+    };
+    let pool_id = parse("--pool-id", args.pool_id.as_deref())?;
+    let back_mint = parse("--input-mint", args.input_mint.as_deref())?;
+    let held_mint = parse("--output-mint", args.output_mint.as_deref())?;
+    if amount == 0 {
+        return Err("entry quote produced no output to sell".into());
+    }
+    let program_id = clmm_program_id(&args.rpc);
+    let (accounts, pool) = amm::account_resolver::resolve_swap_accounts(
+        rpc,
+        &pool_id,
+        from,
+        &held_mint,
+        &back_mint,
+        &program_id,
+    )?;
+    let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id.to_string())
+        .with_program_id(program_id.to_string())
+        .with_swap_accounts(accounts)
+        .with_resolved_pool(pool);
+    let quote = adapter
+        .quote(amount, args.max_slippage_bps)
+        .map_err(|e| format!("exit quote failed: {e}"))?;
+    let intent = adapter
+        .build_intent(quote)
+        .map_err(|e| format!("exit build_intent failed: {e}"))?;
+    let opts = amm::raydium_v4::SwapTxOptions {
+        input_mint: held_mint,
+        output_mint: back_mint,
+        compute_unit_limit: args.compute_unit_limit,
+        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
+        close_input_token_account: false,
+        jito_tip,
+    };
+    adapter
+        .build_swap_transaction(&intent, from, blockhash, &opts)
+        .map_err(|e| format!("exit build_transaction failed: {e}"))
+}
+
+/// Result of an RPC `simulateTransaction`.
+struct SimulationResult {
+    err: Option<String>,
+    units: Option<u64>,
+    logs: Vec<String>,
+}
+
+/// Simulate a (possibly unsigned) transaction against the current chain
+/// state with signature verification off and a fresh blockhash. Read-only:
+/// nothing is sent.
+fn simulate_on_chain(rpc: &RpcClient, tx: &Transaction) -> Result<SimulationResult, String> {
+    let cfg = solana_rpc_client_api::config::RpcSimulateTransactionConfig {
+        sig_verify: false,
+        replace_recent_blockhash: true,
+        commitment: Some(CommitmentConfig::processed()),
+        ..Default::default()
+    };
+    let resp = tokio::task::block_in_place(|| {
+        rpc.simulate_transaction_with_config(tx, cfg)
+            .map_err(|e| format!("simulateTransaction failed: {e}"))
+    })?;
+    let v = resp.value;
+    Ok(SimulationResult {
+        err: v.err.map(|e| format!("{e:?}")),
+        units: v.units_consumed,
+        logs: v.logs.unwrap_or_default(),
+    })
+}
+
+/// Raydium CLMM program id for the cluster the RPC points at.
+fn clmm_program_id(rpc: &str) -> Pubkey {
+    if rpc.contains("devnet") {
+        Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET)
+            .expect("valid devnet program id")
+    } else {
+        Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
+            .expect("valid mainnet program id")
+    }
+}
+
+/// Sign `tx` (remote HSM when configured, else the dry-run local keypair) and
+/// verify the signature before it is attached. Never returns Ok for an
+/// unverifiable signature.
+async fn sign_and_verify(
+    args: &Args,
+    local_signer: Option<&Keypair>,
+    from: &Pubkey,
+    tx: &mut Transaction,
+    metrics_registry: &metrics::Metrics,
+) -> Result<(), String> {
+    let sig = if let (Some(ep), Some(ca), Some(id)) = (
+        args.hsm_endpoint.as_ref(),
+        args.hsm_ca.as_ref(),
+        args.hsm_client_identity.as_ref(),
+    ) {
+        let start = std::time::Instant::now();
+        let res = hsm_sign(ep, ca, id, tx).await.map_err(|e| format!("{e}"));
+        metrics::record_hsm(
+            metrics_registry,
+            res.is_ok(),
+            start.elapsed().as_secs_f64() * 1000.0,
+        );
+        res?
+    } else if let Some(kp) = local_signer {
+        tx.sign(&[kp], tx.message.recent_blockhash);
+        tx.signatures[0]
+    } else {
+        return Err("no signer available at signing time (fail-closed)".to_string());
+    };
+    remote_hsm::verify_hsm_signature(tx, from, &sig)?;
+    tx.signatures = vec![sig];
+    Ok(())
+}
+
+/// Submit a signed transaction in LIVE mode and wait for confirmation: via a
+/// Jito bundle (with RPC fallback) when configured, otherwise via RPC. A
+/// bundle that was merely accepted is NOT reported as success until the
+/// signature is confirmed on-chain.
+async fn submit_live_tx(
+    args: &Args,
+    rpc_client: &RpcClient,
+    tx: &Transaction,
+) -> Result<Signature, Box<dyn std::error::Error>> {
+    let Some(jito_ep) = &args.jito_endpoint else {
+        return retry::send_with_retry(rpc_client, tx);
+    };
+    let bundle = jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
+    let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
+    if args.jito_dry_run {
+        match client.send_bundle(&bundle).await {
+            Ok(bundle_id) => {
+                tracing::info!(bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "jito dry-run validation failed — submitting via RPC")
+            }
+        }
+        return retry::send_with_retry(rpc_client, tx);
+    }
+    match client.send_bundle(&bundle).await {
+        Ok(bundle_id) => {
+            tracing::info!(bundle_id = %bundle_id, "jito bundle accepted — confirming on-chain");
+            let sig = tx.signatures[0];
+            match retry::confirm_transaction(rpc_client, &sig, &tx.message.recent_blockhash) {
+                Ok(()) => Ok(sig),
+                Err(e) => {
+                    tracing::warn!(error = %e, "jito bundle not confirmed — falling back to RPC");
+                    retry::send_with_retry(rpc_client, tx)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "jito bundle failed — falling back to RPC");
+            jito::send_with_rpc_fallback(rpc_client, std::slice::from_ref(tx)).await
+        }
+    }
+}
+
+/// Book (or drop) an entry that was sent but whose outcome was never
+/// recorded — the process died while confirming it. Waits until the
+/// transaction is confirmed or its blockhash expired, then decides from the
+/// real balances. Fail-closed: if the outcome cannot be established, LIVE
+/// does not start.
+fn reconcile_pending_entry(
+    data_dir: &Path,
+    rpc: &RpcClient,
+    risk_manager: &risk::RiskManager,
+) -> Result<(), String> {
+    let Some(p) = position::PendingEntry::load(data_dir)
+        .map_err(|e| format!("pending entry record unreadable — refusing to arm LIVE: {e}"))?
+    else {
+        return Ok(());
+    };
+    if position::LivePosition::load(data_dir)?.is_some() {
+        // The position was booked; only the cleanup was interrupted.
+        return position::PendingEntry::clear(data_dir);
+    }
+    tracing::warn!(target: "main", signature = %p.signature, pool = %p.position.pool_id, "unfinished entry from a previous run — reconciling from the chain");
+    let sig = Signature::from_str(&p.signature).map_err(|e| format!("pending entry: {e}"))?;
+    let bh = solana_sdk::hash::Hash::from_str(&p.blockhash)
+        .map_err(|e| format!("pending entry blockhash: {e}"))?;
+    // Ok = landed; Err = failed / expired / unknown — the balances decide.
+    let confirm = retry::confirm_transaction(rpc, &sig, &bh);
+    let parse = |v: &str| Pubkey::from_str(v).map_err(|e| format!("pending entry mint: {e}"));
+    let owner_ata_mints = (
+        parse(&p.position.input_mint)?,
+        parse(&p.position.output_mint)?,
+    );
+    let owner = rpc
+        .get_transaction_with_config(
+            &sig,
+            solana_rpc_client_api::config::RpcTransactionConfig {
+                encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .ok()
+        .and_then(|t| t.transaction.transaction.decode())
+        .and_then(|t| t.message.static_account_keys().first().copied());
+    let Some(owner) = owner else {
+        if confirm.is_err() {
+            // Not on chain: the swap never happened.
+            tracing::warn!(target: "main", signature = %p.signature, "unfinished entry never landed — dropped");
+            return position::PendingEntry::clear(data_dir);
+        }
+        return Err(format!(
+            "unfinished entry {} confirmed but not readable — inspect the wallet before arming LIVE (fail-closed)",
+            p.signature
+        ));
+    };
+    let after_in = position::fetch_mint_balance(rpc, &owner, &owner_ata_mints.0)?;
+    let after_out = position::fetch_mint_balance(rpc, &owner, &owner_ata_mints.1)?;
+    match p.resolve(after_in, after_out) {
+        Some(pos) => {
+            pos.save(data_dir)?;
+            risk_manager.record_trade();
+            risk_manager.record_position_open(pos.position_size_lamports);
+            tracing::warn!(target: "main", signature = %p.signature, tokens = pos.token_amount, cost = pos.cost_input_units, "unfinished entry LANDED — position recorded and will be managed");
+        }
+        None => {
+            tracing::warn!(target: "main", signature = %p.signature, "unfinished entry did not deliver tokens — dropped");
+        }
+    }
+    position::PendingEntry::clear(data_dir)
+}
+
+/// Outcome of one exit-management iteration for the open live position.
+#[derive(Debug)]
+enum ExitOutcome {
+    /// Position held (no stop-loss / take-profit signal).
+    Hold,
+    /// Position sold on-chain; realized P&L in input units.
+    Closed {
+        decision: strategy::ExitDecision,
+        pnl: i64,
+    },
+    /// Position tokens are no longer in the wallet (sold/moved externally or a
+    /// previous exit landed before the record was cleared): bookkeeping closed.
+    ClosedExternally,
+    /// Exit could not be evaluated or executed this iteration; the position
+    /// stays open and is retried next iteration.
+    Failed(String),
+}
+
+/// Manage the open live position: read the real pool state, value the held
+/// tokens with a reverse-direction quote, and SELL them (reverse swap) on a
+/// stop-loss or take-profit signal. Exits intentionally bypass the entry
+/// risk gates (kill switch / circuit breaker / daily caps): closing a
+/// position only ever reduces risk, so a tripped breaker must never trap
+/// capital in an open position.
+#[allow(clippy::too_many_arguments)]
+async fn manage_open_position(
+    args: &Args,
+    rpc_client: &Arc<RpcClient>,
+    risk_manager: &risk::RiskManager,
+    metrics_registry: &metrics::Metrics,
+    blockhash_mgr: &std::sync::Mutex<retry::BlockhashManager>,
+    from: &Pubkey,
+    pos: &position::LivePosition,
+    jito_tip: Option<(Pubkey, u64)>,
+    exit_failures: u32,
+) -> ExitOutcome {
+    let parse = |label: &str, v: &str| {
+        Pubkey::from_str(v).map_err(|e| format!("invalid {label} in live position: {e}"))
+    };
+    let (pool_id, held_mint, back_mint) = match (
+        parse("pool_id", &pos.pool_id),
+        parse("output_mint", &pos.output_mint),
+        parse("input_mint", &pos.input_mint),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return ExitOutcome::Failed(e),
+    };
+    let program_id = clmm_program_id(&args.rpc);
+
+    // Reverse direction: sell the held token back into the entry mint. The
+    // pool state is fetched fresh from the RPC here (exit correctness over
+    // latency), so no staleness window applies.
+    let (accounts, pool) = match amm::account_resolver::resolve_swap_accounts(
+        rpc_client,
+        &pool_id,
+        from,
+        &held_mint,
+        &back_mint,
+        &program_id,
+    ) {
+        Ok(v) => v,
+        Err(e) => return ExitOutcome::Failed(format!("exit account resolution failed: {e}")),
+    };
+    let held_ata = accounts.input_token_account;
+    let adapter_output_vault = accounts.output_vault;
+    let held = match position::fetch_token_balance(rpc_client, &held_ata) {
+        Ok(v) => v,
+        Err(e) => return ExitOutcome::Failed(e),
+    };
+    if held == 0 {
+        return ExitOutcome::ClosedExternally;
+    }
+    // Never sell more than this position bought (other holdings untouched).
+    let amount = held.min(pos.token_amount.max(1));
+
+    let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pos.pool_id.clone())
+        .with_program_id(program_id.to_string())
+        .with_swap_accounts(accounts)
+        .with_resolved_pool(pool);
+    let slippage = exit_slippage_bps(args.max_slippage_bps, exit_failures);
+    let quote = match adapter.quote(amount, slippage) {
+        Ok(q) => q,
+        Err(e) => return ExitOutcome::Failed(format!("exit quote failed: {e}")),
+    };
+    // The exit signal compares against the amount actually swapped in (the
+    // entry is exact-input), not the measured cost: the measured cost also
+    // contains the token-account rent, which is refunded on a full exit and
+    // would otherwise fire a false stop-loss right after every entry. The
+    // measured cost is still what realized P&L is computed from.
+    let strategy = strategy::SimpleSnipeStrategy::new(strategy_config(args));
+    let swapped_in = if amount < pos.token_amount {
+        // Partial balance (some tokens left the wallet): pro-rate.
+        (pos.position_size_lamports as u128 * amount as u128 / pos.token_amount as u128) as u64
+    } else {
+        pos.position_size_lamports
+    };
+    let mut decision = strategy.should_exit_value(swapped_in, quote.expected_output);
+    // Liquidity being pulled (rug): both vaults shrink while the price may
+    // barely move, so the price exits never fire. The exit swap's output
+    // vault is the entry-mint (SOL) side.
+    let sol_liquidity = if pos.entry_liquidity_lamports > 0 {
+        match onchain_risk::fetch_vault_liquidity(rpc_client, &adapter_output_vault) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(target: "live", error = %e, "liquidity read failed — liquidity-drop exit skipped this iteration");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if decision == strategy::ExitDecision::Hold
+        && sol_liquidity
+            .is_some_and(|now| strategy::liquidity_dropped(pos.entry_liquidity_lamports, now))
+    {
+        decision = strategy::ExitDecision::LiquidityDrop;
+    }
+    if decision == strategy::ExitDecision::Hold
+        && max_hold_reached(
+            pos.opened_at_ms,
+            marketdata::now_ms() as u64,
+            args.max_hold_secs,
+        )
+    {
+        decision = strategy::ExitDecision::MaxHoldTime;
+    }
+    tracing::info!(
+        target: "live",
+        pool_id = %pos.pool_id,
+        exit_slippage_bps = slippage,
+        swapped_in,
+        cost = pos.cost_input_units,
+        current_value = quote.expected_output,
+        sol_liquidity,
+        entry_liquidity = pos.entry_liquidity_lamports,
+        decision = ?decision,
+        "open position valued on real pool state"
+    );
+    if decision == strategy::ExitDecision::Hold {
+        return ExitOutcome::Hold;
+    }
+
+    let intent = match adapter.build_intent(quote) {
+        Ok(i) => i,
+        Err(e) => return ExitOutcome::Failed(format!("exit build_intent failed: {e}")),
+    };
+    let blockhash = match blockhash_mgr.lock().unwrap().force_refresh() {
+        Ok(b) => b,
+        Err(e) => return ExitOutcome::Failed(format!("exit blockhash fetch failed: {e}")),
+    };
+    let opts = amm::raydium_v4::SwapTxOptions {
+        input_mint: held_mint,
+        output_mint: back_mint,
+        compute_unit_limit: args.compute_unit_limit,
+        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
+        // Selling the whole balance empties the ATA: close it so its rent
+        // returns to the wallet and shows up in the realized P&L.
+        close_input_token_account: amount == held,
+        jito_tip,
+    };
+    let mut tx = match adapter.build_swap_transaction(&intent, from, blockhash, &opts) {
+        Ok(t) => t,
+        Err(e) => return ExitOutcome::Failed(format!("exit build_transaction failed: {e}")),
+    };
+    if let Err(e) = sign_and_verify(args, None, from, &mut tx, metrics_registry).await {
+        return ExitOutcome::Failed(format!("exit signing failed: {e}"));
+    }
+
+    let before = match position::fetch_mint_balance(rpc_client, from, &back_mint) {
+        Ok(v) => v,
+        Err(e) => return ExitOutcome::Failed(e),
+    };
+    // As with entries, an Err may mean "outcome unknown": if the held token
+    // balance dropped, the sell landed — book it with its real proceeds
+    // instead of retrying and later mis-reporting it as an external close.
+    let submitted = match submit_live_tx(args, rpc_client, &tx).await {
+        Ok(sig) => Ok(sig),
+        Err(e) => match position::fetch_token_balance(rpc_client, &held_ata) {
+            Ok(now_held) if now_held < held => {
+                tracing::warn!(target: "live", error = %e, "exit submission reported an error but the sell LANDED");
+                Ok(tx.signatures[0])
+            }
+            _ => Err(e),
+        },
+    };
+    match submitted {
+        Ok(sig) => {
+            let proceeds = position::fetch_mint_balance(rpc_client, from, &back_mint)
+                .map(|after| after.saturating_sub(before))
+                .unwrap_or(intent.min_output);
+            let pnl = position::realized_pnl(pos.cost_input_units, proceeds);
+            tracing::info!(
+                target: "live",
+                signature = %sig,
+                decision = ?decision,
+                proceeds,
+                pnl,
+                "EXIT confirmed on-chain"
+            );
+            println!("[LIVE] EXIT {decision:?} confirmed: {sig} (realized pnl {pnl})");
+            if pnl < 0 {
+                let _ = risk_manager.record_loss(pnl.unsigned_abs());
+            }
+            ExitOutcome::Closed { decision, pnl }
+        }
+        Err(e) => ExitOutcome::Failed(format!("exit transaction failed: {e}")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    // Optional `.env` in the working directory: every CLI flag can also be
+    // set through its SNIPER_* environment variable (see .env.example). An
+    // explicit CLI flag always wins over the environment.
+    let _ = dotenvy::dotenv();
+    let args = Args::parse().normalized();
     std::fs::create_dir_all(&args.data_dir)?;
     let _guard = init_tracing(&args.data_dir);
 
@@ -723,6 +1433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 0.20 SOL daily loss kill-switch, 1 open position, 2% max slippage).
     // Applied to every mode (paper/dry-run/live) for consistency — if the
     // config itself cannot be validated, refuse to start at all.
+    validate_min_liquidity(args.min_liquidity_sol)?;
     let risk_cfg = risk::RiskConfig::production_defaults(args.data_dir.clone())?;
     // Fail-closed cross-module invariant: the strategy's per-trade position
     // size must never exceed the risk manager's max_trade_size_lamports,
@@ -766,6 +1477,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let metrics_registry = metrics::Metrics::new();
+    if let Some(addr) = &args.metrics_addr {
+        // Bind synchronously so a bad address fails startup instead of
+        // silently running without monitoring.
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| format!("metrics server bind failed on {addr}: {e}"))?;
+        drop(listener);
+        let addr = addr.clone();
+        let m = metrics_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::spawn_metrics_server(&addr, m).await {
+                tracing::error!(target: "metrics", error = %e, "metrics server stopped");
+            }
+        });
+    }
+
+    // Graceful shutdown: SIGTERM (systemd stop) or Ctrl-C finishes the
+    // current iteration and exits cleanly. An open position stays persisted
+    // in live_position.json and is resumed on the next start.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let flag = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            tracing::warn!(target: "main", "shutdown signal received — stopping after this iteration");
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
 
     // AŞAMA 2 — paper mode now trades on REAL on-chain market data, which
     // requires the same pool/mint arguments as live. Fail-closed: without
@@ -798,12 +1549,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.hsm_client_identity,
     )?;
 
+    let expected_signer = validate_live_args(
+        args.live,
+        args.pool_id.as_deref(),
+        args.input_mint.as_deref(),
+        args.output_mint.as_deref(),
+        args.live_risk_data,
+        args.expected_signer.as_deref(),
+    )?;
+
+    let simulate_payer: Option<Pubkey> = match &args.simulate_payer {
+        Some(_) if !args.dry_run => {
+            return Err("--simulate-payer is only allowed with --dry-run".into());
+        }
+        Some(pk) => {
+            Some(Pubkey::from_str(pk).map_err(|e| format!("invalid --simulate-payer: {e}"))?)
+        }
+        None => None,
+    };
+
     let hsm_configured = args.hsm_endpoint.is_some();
+
+    // Restart-safe open position (LIVE only). The record must agree with the
+    // risk manager's open-position counter, otherwise the bot could hold a
+    // position it cannot exit (fail-closed refuse) or forget one it holds.
+    let mut live_position: Option<position::LivePosition> = None;
+    if args.live {
+        reconcile_pending_entry(&args.data_dir, &rpc_client, &risk_manager)?;
+        live_position = position::LivePosition::load(&args.data_dir)
+            .map_err(|e| format!("live position record unreadable — refusing to arm LIVE: {e}"))?;
+        match (&live_position, risk_manager.open_position_count()) {
+            (Some(p), _) => {
+                if !p.matches(
+                    args.pool_id.as_deref().unwrap_or(""),
+                    args.input_mint.as_deref().unwrap_or(""),
+                    args.output_mint.as_deref().unwrap_or(""),
+                ) {
+                    return Err(format!(
+                        "an open live position exists for pool {} ({} -> {}); restart with that \
+                         --pool-id/--input-mint/--output-mint so it can be exited (fail-closed)",
+                        p.pool_id, p.input_mint, p.output_mint
+                    )
+                    .into());
+                }
+                if risk_manager.open_position_count() == 0 {
+                    // Crash between persisting the record and the counter.
+                    risk_manager.record_position_open(p.position_size_lamports);
+                }
+                tracing::warn!(target: "main", pool_id = %p.pool_id, "resuming management of open live position");
+            }
+            (None, n) if n > 0 => {
+                return Err(format!(
+                    "risk state reports {n} open position(s) but no {}/live_position.json record \
+                     exists — the position cannot be exited automatically. Close it manually and \
+                     clear risk_state.json before arming LIVE (fail-closed).",
+                    args.data_dir.display()
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
 
     // The local keyfile is used ONLY for dry-run without a remote HSM. In live
     // mode the remote HSM is mandatory, so the local keyfile is never loaded.
     // In paper mode no signer is loaded at all (no on-chain transaction).
-    let local_signer = if args.dry_run && !hsm_configured {
+    let local_signer = if args.dry_run && !hsm_configured && simulate_payer.is_none() {
         let kp = load_keypair(&args.wallet)?;
         tracing::info!(target: "main", pubkey = %kp.pubkey(), "local keypair loaded (dry-run only)");
         Some(kp)
@@ -834,7 +1645,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Paper-only accumulators (AŞAMA 3/4): real RPC-fetch and strategy timings
     // plus data-error counts. A paper iteration with a data error is neither a
     // trade nor a success — it is rejected with its real reason.
-    let mut paper_sim = PaperSimulator::new();
+    let mut paper_sim = PaperSimulator::with_config(strategy_config(&args));
+    paper_sim.max_hold_ms = args.max_hold_secs.saturating_mul(1000);
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -868,27 +1680,196 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    'main_loop: for i in 0..args.iterations {
+    // Pause between iterations (and after every rejected/failed one). Each
+    // iteration makes several RPC calls, so raise this on rate-limited RPC
+    // plans (public mainnet RPC answers 429 at the 200 ms default).
+    let loop_interval = Duration::from_millis(args.loop_interval_ms.max(50));
+    // Jito: a bundle only lands with a tip transfer to one of the Block
+    // Engine's tip accounts inside the transaction itself (signed with it).
+    // Read the accounts live at startup; refuse to run LIVE through Jito
+    // without a valid tip (the bundle would silently never land).
+    let jito_tip: Option<(Pubkey, u64)> = match &args.jito_endpoint {
+        Some(ep) if (args.live || args.dry_run) && !args.jito_dry_run => {
+            if args.jito_tip_lamports < jito::MIN_TIP_LAMPORTS {
+                return Err(format!(
+                    "--jito-endpoint requires --jito-tip-lamports >= {} (bundles without a tip never land)",
+                    jito::MIN_TIP_LAMPORTS
+                )
+                .into());
+            }
+            match jito::JitoClient::new(ep, false).tip_accounts().await {
+                Ok(accounts) => {
+                    let pick = accounts[(marketdata::now_ms() as usize) % accounts.len()];
+                    tracing::info!(target: "jito", tip_account = %pick, tip_lamports = args.jito_tip_lamports, "jito tip account resolved");
+                    Some((pick, args.jito_tip_lamports))
+                }
+                Err(e) if args.live => {
+                    return Err(
+                        format!("cannot resolve Jito tip accounts (fail-closed): {e}").into(),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(target: "jito", error = %e, "jito tip accounts unavailable — dry-run builds without tip");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Consecutive failed exit attempts for the open position (widens the
+    // exit slippage, see exit_slippage_bps).
+    let mut exit_failures: u32 = 0;
+    let max_iterations: u64 = if args.iterations == 0 {
+        u64::MAX
+    } else {
+        args.iterations as u64
+    };
+    let mut completed_iterations: u64 = 0;
+    // /health turns 503 when the loop stops iterating. Generous limit: one
+    // iteration may legitimately wait up to 180 s for a confirmation.
+    metrics_registry.set_health_max_age(240_000 + 10 * args.loop_interval_ms.max(50));
+    // --single-trade / --entry-window-secs (pool discovery supervisor).
+    let run_start = std::time::Instant::now();
+    let mut single_trade_done = false;
+    'main_loop: for i in 0..max_iterations {
+        metrics_registry.heartbeat();
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        if args.single_trade && single_trade_done {
+            tracing::info!(target: "main", "single trade completed — stopping");
+            break;
+        }
+        if entry_window_expired(
+            run_start.elapsed().as_secs(),
+            args.entry_window_secs,
+            live_position.is_some() || paper_sim.has_open_position(),
+        ) {
+            tracing::info!(target: "main", window_secs = args.entry_window_secs, "entry window elapsed without an entry — stopping");
+            break;
+        }
+        completed_iterations = i + 1;
         let iteration_start = std::time::Instant::now();
 
-        metrics::record_trade_attempt(&metrics_registry, mode_label);
         metrics::set_risk_gauges(
             &metrics_registry,
             risk_manager.is_circuit_breaker_active(),
             -(risk_manager.current_daily_loss() as i64),
             risk_manager.open_position_count(),
         );
-        if let Err(e) =
-            risk_manager.pre_trade_check(solana_sdk::native_token::sol_to_lamports(0.01), 50)
-        {
+        metrics::set_kill_switch(&metrics_registry, risk_manager.is_kill_switch_active());
+
+        // LIVE exit management: while a position is open, every iteration
+        // evaluates stop-loss / take-profit on the real pool state and sells
+        // on a signal. No new entry is attempted while a position is open
+        // (max_open_positions = 1), and exits are never blocked by the entry
+        // risk gates.
+        if args.live {
+            if let Some(pos) = live_position.clone() {
+                let from = match hsm_pubkey(
+                    args.hsm_endpoint.as_deref().unwrap_or_default(),
+                    args.hsm_ca.as_deref().unwrap_or(Path::new("")),
+                    args.hsm_client_identity.as_deref().unwrap_or(Path::new("")),
+                )
+                .await
+                .map_err(|e| format!("{e}"))
+                .and_then(|pk| {
+                    remote_hsm::validate_hsm_pubkey(&pk, expected_signer.as_ref()).map(|_| pk)
+                }) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        tracing::error!(target: "live", error = %e, "HSM unavailable while a position is open — retrying");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                let outcome = manage_open_position(
+                    &args,
+                    &rpc_client,
+                    &risk_manager,
+                    &metrics_registry,
+                    &blockhash_mgr,
+                    &from,
+                    &pos,
+                    jito_tip,
+                    exit_failures,
+                )
+                .await;
+                exit_failures = match &outcome {
+                    ExitOutcome::Failed(_) => exit_failures.saturating_add(1),
+                    _ => 0,
+                };
+                let mut rec = decision::DecisionRecord::new("simple_snipe", "live");
+                rec.mode = "live".to_string();
+                rec.pool_id = pos.pool_id.clone();
+                rec.token_in = pos.output_mint.clone();
+                rec.token_out = pos.input_mint.clone();
+                match &outcome {
+                    ExitOutcome::Hold => {}
+                    ExitOutcome::Closed { .. } | ExitOutcome::ClosedExternally => {
+                        risk_manager.record_position_close(pos.position_size_lamports);
+                        if let Err(e) = position::LivePosition::clear(&args.data_dir) {
+                            tracing::error!(target: "live", error = %e, "failed to clear live position record");
+                        }
+                        live_position = None;
+                        single_trade_done = true;
+                        if let ExitOutcome::Closed { decision, pnl } = &outcome {
+                            successful_trades += 1;
+                            metrics::record_trade_executed(&metrics_registry, mode_label);
+                            metrics::record_trade(
+                                &metrics_registry,
+                                true,
+                                iteration_start.elapsed().as_millis() as f64,
+                            );
+                            tracing::info!(target: "live", decision = ?decision, pnl, "position closed — entries re-enabled");
+                        } else {
+                            tracing::warn!(target: "live", "position tokens no longer in wallet — bookkeeping closed");
+                        }
+                    }
+                    ExitOutcome::Failed(e) => {
+                        metrics::record_trade(
+                            &metrics_registry,
+                            false,
+                            iteration_start.elapsed().as_millis() as f64,
+                        );
+                        tracing::error!(target: "live", error = %e, "exit iteration failed — position stays open, retrying");
+                    }
+                }
+                if !matches!(outcome, ExitOutcome::Hold) {
+                    rec.context = serde_json::json!({
+                        "action": "exit",
+                        "outcome": format!("{outcome:?}"),
+                        "cost_input_units": pos.cost_input_units,
+                        "token_amount": pos.token_amount,
+                    });
+                    rec.save(&args.data_dir)?;
+                }
+                total_latency_ms =
+                    total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                sleep(loop_interval).await;
+                continue;
+            }
+        }
+
+        metrics::record_trade_attempt(&metrics_registry, mode_label);
+        if let Err(e) = risk_manager.pre_trade_check(sol_to_lamports(0.01), 50) {
             metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
             *rejected_by_reason.entry(e.code()).or_insert(0) += 1;
             tracing::error!(target: "main", iteration = i, error = %e, "RISK CHECK FAILED — skipping trade");
             if args.live {
+                // A tripped circuit breaker is transient (it auto-resets
+                // after its cool-down): keep the service alive and retry.
+                // Kill switch / daily caps / unverifiable state are not:
+                // stop trading.
+                if matches!(e, risk::RejectReason::CircuitBreakerOpen) {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
                 break;
             }
-            sleep(Duration::from_millis(200)).await;
+            sleep(loop_interval).await;
             continue;
         }
 
@@ -945,7 +1926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Rejection is not a trade: counters stay untouched.
                     total_latency_ms =
                         total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
                 Err(PaperDataError::Unavailable(err)) => {
@@ -966,7 +1947,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     total_latency_ms =
                         total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
             };
@@ -989,6 +1970,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // entry/entry-price the P&L was computed from.
             let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
+            paper_sim.input_is_token0 = snapshot.input_is_token0;
+            paper_sim.now_ms = marketdata::now_ms() as u64;
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
 
@@ -1010,11 +1993,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "paper position HELD (no exit signal, real price)"
                     );
                 }
-                PaperTick::ClosedStopLoss(pnl) | PaperTick::ClosedTakeProfit(pnl) => {
-                    let action = if matches!(tick, PaperTick::ClosedStopLoss(_)) {
-                        "exit_stop_loss"
-                    } else {
-                        "exit_take_profit"
+                PaperTick::ClosedStopLoss(pnl)
+                | PaperTick::ClosedTakeProfit(pnl)
+                | PaperTick::ClosedForced(_, pnl) => {
+                    let action = match &tick {
+                        PaperTick::ClosedStopLoss(_) => "exit_stop_loss",
+                        PaperTick::ClosedTakeProfit(_) => "exit_take_profit",
+                        PaperTick::ClosedForced(strategy::ExitDecision::LiquidityDrop, _) => {
+                            "exit_liquidity_drop"
+                        }
+                        _ => "exit_max_hold",
                     };
                     rec.context = serde_json::json!({
                         "action": action,
@@ -1030,6 +2018,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &metrics_registry,
                         paper_sim.simulated_pnl_lamports,
                     );
+                    single_trade_done = true;
                     tracing::info!(
                         target: "paper",
                         iteration = i + 1,
@@ -1057,8 +2046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PaperTick::EntryPending(signal) => {
                     // Real risk gates BEFORE the entry is simulated (same
                     // order as live): max-spend cap, then pre_trade_check.
-                    let max_spend_lamports =
-                        solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+                    let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
                     let mut accepted = true;
                     if signal.position_size_lamports > max_spend_lamports {
                         accepted = false;
@@ -1106,7 +2094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rec.save(&args.data_dir)?;
                         total_latency_ms =
                             total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                     // Entry accepted: the ONLY place total_trades and
@@ -1134,6 +2122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         entry_sqrt = entry_sqrt,
                         size_lamports = signal.position_size_lamports,
                         source = snapshot.source,
+                        input_is_token0 = snapshot.input_is_token0,
                         "paper ENTRY simulated on real on-chain data (no on-chain tx — would execute)"
                     );
                 }
@@ -1166,7 +2155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            sleep(Duration::from_millis(200)).await;
+            sleep(loop_interval).await;
             continue;
         }
 
@@ -1184,9 +2173,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             if risk_manager.is_circuit_breaker_active() {
-                tracing::error!(target: "main", "CIRCUIT BREAKER ACTIVE — stopping live trading");
-                eprintln!("[CRITICAL] Circuit breaker active. Trading halted.");
-                break;
+                tracing::error!(target: "main", "CIRCUIT BREAKER ACTIVE — no new entries until it resets");
+                sleep(Duration::from_secs(1)).await;
+                continue;
             }
 
             // Signer resolution: LIVE is fail-closed and requires the remote
@@ -1196,14 +2185,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let endpoint = args.hsm_endpoint.as_ref();
             let ca = args.hsm_ca.as_ref();
             let identity = args.hsm_client_identity.as_ref();
-            let from = if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
-                match hsm_pubkey(ep, ca, id).await {
+            let from = if let Some(payer) = simulate_payer {
+                payer
+            } else if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
+                match hsm_pubkey(ep, ca, id).await.and_then(|pk| {
+                    remote_hsm::validate_hsm_pubkey(&pk, expected_signer.as_ref())
+                        .map(|_| pk)
+                        .map_err(|e| e.into())
+                }) {
                     Ok(pk) => pk,
                     Err(e) => {
                         risk_manager
                             .trip_circuit_breaker(&format!("HSM unavailable (fail-closed): {e}"));
                         tracing::error!(mode = mode_target, error = %e, "HSM pubkey fetch failed — circuit breaker tripped");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 }
@@ -1217,10 +2212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mode = mode_target,
                     "no signer available — circuit breaker tripped"
                 );
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             };
-            let mut to = from; // self-transfer fallback when no pool is configured
+            let to = from; // self-transfer fallback when no pool is configured
 
             // When --pool-id is set, resolve the pool on-chain and feed the
             // real price into the strategy (market data hook). Fail-closed:
@@ -1247,13 +2242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("invalid --output-mint: {e}"))?;
 
                 // Select the CLMM program id by cluster (devnet vs mainnet).
-                let program_id = if args.rpc.contains("devnet") {
-                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET)
-                        .expect("valid devnet program id")
-                } else {
-                    Pubkey::from_str(amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID)
-                        .expect("valid mainnet program id")
-                };
+                let program_id = clmm_program_id(&args.rpc);
 
                 // Market data hook: prefer a fresh WebSocket update (lower
                 // latency) when the feed is connected and has data for this
@@ -1262,8 +2251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_ref()
                     .filter(|p| p.is_connected())
                     .and_then(|p| p.get_pool_state(pool_id_str));
-                let mut price_timestamp_ms: Option<u128> = None;
-                let (pool, used_ws) = if let Some(state) = ws_state {
+                let price_timestamp_ms: Option<u128>;
+                let (_pool, used_ws) = if let Some(state) = ws_state {
                     entry_sqrt = state.sqrt_price;
                     price_timestamp_ms = Some(state.timestamp_ms);
                     (None, true)
@@ -1277,7 +2266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "pool state resolution failed (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "failed to resolve pool state — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -1303,7 +2292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         risk::check_price_staleness(ts, risk_cfg.price_staleness_ms)
                     {
                         tracing::warn!(mode = mode_target, iteration = i + 1, reason = %reason, "price staleness check failed — no trade this iteration (fail-closed)");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 } else {
@@ -1312,7 +2301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         iteration = i + 1,
                         "no price timestamp available — rejecting trade (fail-closed)"
                     );
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
 
@@ -1331,7 +2320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "swap account resolution failed (fail-closed): {e}"
                         ));
                         tracing::error!(mode = mode_target, error = %e, "failed to resolve swap accounts — circuit breaker tripped");
-                        sleep(Duration::from_millis(200)).await;
+                        sleep(loop_interval).await;
                         continue;
                     }
                 };
@@ -1353,7 +2342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 freeze_authority_present = risk.freeze_authority_present,
                                 "token authority risk detected — no trade this iteration (fail-closed)"
                             );
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue 'main_loop;
                         }
                         Ok(_) => {}
@@ -1362,7 +2351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "mint authority check failed (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, mint_role = label, "mint authority check failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue 'main_loop;
                         }
                     }
@@ -1384,13 +2373,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "live risk data (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "liquidity fetch failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
-                    let holder_stats = match onchain_risk::fetch_holder_stats(
+                    // Holder risk of the token being bought (never wSOL).
+                    let holder_stats = match onchain_risk::fetch_holder_stats_cached(
                         &rpc_client,
-                        &input_mint,
+                        &output_mint,
                         &[accounts.input_vault, accounts.output_vault],
                     ) {
                         Ok(v) => v,
@@ -1399,7 +2389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "live risk data (fail-closed): {e}"
                             ));
                             tracing::error!(mode = mode_target, error = %e, "holder stats fetch failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     };
@@ -1419,7 +2409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mode_label,
                                 risk::RejectReason::HolderConcentrationExceeded.code(),
                             );
-                            sleep(Duration::from_millis(200)).await;
+                            sleep(loop_interval).await;
                             continue;
                         }
                     }
@@ -1427,6 +2417,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mode = mode_target,
                         liquidity,
                         top_holder_pct = holder_stats.top_holder_pct,
+                        top20_holder_pct = holder_stats.top20_holder_pct,
+                        program_owned_pct = holder_stats.program_owned_pct,
                         sampled_holders = holder_stats.sampled_holders,
                         "fetched real on-chain liquidity + holder concentration"
                     );
@@ -1456,6 +2448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id_str.clone())
+                    .with_program_id(program_id.to_string())
                     .with_swap_accounts(accounts)
                     .with_resolved_pool(resolved);
                 swap_adapter = Some(adapter);
@@ -1464,7 +2457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Strategy gate: evaluate the token candidate. If the strategy
             // rejects it (fail-closed), no trade is built or sent this
             // iteration. This wires SimpleSnipeStrategy into the live path.
-            let strategy = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+            let strategy = strategy::SimpleSnipeStrategy::new(strategy_config(&args));
             let candidate = strategy::TokenCandidate {
                 liquidity_lamports: live_liquidity.unwrap_or(args.pool_liquidity),
                 market_cap_lamports: args.pool_market_cap,
@@ -1482,9 +2475,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut rec = decision::DecisionRecord::new("simple_snipe", mode_target);
             rec.mode = mode_target.to_string();
-            rec.pool_id = "live_pool".to_string();
-            rec.token_in = "SOL".to_string();
-            rec.token_out = "SOL".to_string();
+            rec.pool_id = args.pool_id.clone().unwrap_or_default();
+            rec.token_in = args.input_mint.clone().unwrap_or_default();
+            rec.token_out = args.output_mint.clone().unwrap_or_default();
             rec.liquidity = candidate.liquidity_lamports.to_string();
             rec.context = serde_json::json!({
                 "entry": entry_signal.is_some(),
@@ -1534,7 +2527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     rec.save(&args.data_dir)?;
                     total_trades += 1;
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
             };
@@ -1542,7 +2535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rec.save(&args.data_dir)?;
 
             // Security: max spend (SOL) cap enforced before any trade.
-            let max_spend_lamports = solana_sdk::native_token::sol_to_lamports(args.max_spend_sol);
+            let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
             if entry_signal.position_size_lamports > max_spend_lamports {
                 tracing::warn!(
                     mode = mode_target,
@@ -1558,7 +2551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 rec.save(&args.data_dir)?;
                 total_trades += 1;
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             }
 
@@ -1582,95 +2575,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 rec.save(&args.data_dir)?;
                 total_trades += 1;
-                sleep(Duration::from_millis(200)).await;
+                sleep(loop_interval).await;
                 continue;
             }
 
-            // Fresh blockhash per iteration to avoid replay
-            if let Ok(blockhash) = blockhash_mgr.lock().unwrap().force_refresh() {
+            // Fresh blockhash per iteration to avoid replay (dry-run may pin
+            // one with --blockhash for offline/deterministic smoke tests).
+            let blockhash = match &args.blockhash {
+                Some(_) if !is_live => resolve_blockhash(&args, &blockhash_mgr),
+                _ => blockhash_mgr.lock().unwrap().force_refresh(),
+            };
+            let blockhash = match blockhash {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(mode = mode_target, error = %e, "blockhash unavailable — no trade this iteration");
+                    sleep(loop_interval).await;
+                    continue;
+                }
+            };
+            {
                 // Build the transaction: a real AMM swap when a pool is
-                // configured, otherwise the safe self-transfer test path.
+                // configured, otherwise (dry-run only) the self-transfer
+                // HSM smoke path.
+                let mut swap_min_output: u64 = 0;
                 let mut tx = if let Some(adapter) = &swap_adapter {
                     // Real swap: quote from the resolved on-chain price, apply
-                    // slippage (min_amount_out), and build the CLMM swap tx.
+                    // slippage (min_amount_out), and build the full CLMM swap
+                    // tx (compute budget, ATAs, SOL wrap/unwrap).
                     let quote = adapter
                         .quote(entry_signal.position_size_lamports, args.max_slippage_bps)
                         .map_err(|e| format!("quote failed (fail-closed): {e}"))?;
                     let intent = adapter
                         .build_intent(quote)
                         .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
-                    let mut t = adapter
-                        .build_transaction(&intent, &from, blockhash)
-                        .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?;
-                    t.message.recent_blockhash = blockhash;
-                    t
+                    swap_min_output = intent.min_output;
+                    let opts = amm::raydium_v4::SwapTxOptions {
+                        input_mint: Pubkey::from_str(
+                            args.input_mint.as_deref().unwrap_or_default(),
+                        )
+                        .map_err(|e| format!("invalid --input-mint: {e}"))?,
+                        output_mint: Pubkey::from_str(
+                            args.output_mint.as_deref().unwrap_or_default(),
+                        )
+                        .map_err(|e| format!("invalid --output-mint: {e}"))?,
+                        compute_unit_limit: args.compute_unit_limit,
+                        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
+                        close_input_token_account: false,
+                        jito_tip,
+                    };
+                    adapter
+                        .build_swap_transaction(&intent, &from, blockhash, &opts)
+                        .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?
                 } else {
                     // Dynamic compute units per iteration for uniqueness
-                    let cu_limit = 400 + (i % 200);
+                    let cu_limit = 400 + (i % 200) as u32;
                     let cu_ix =
                         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
                             cu_limit,
                         );
-                    let transfer_ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
+                    let transfer_ix =
+                        solana_system_interface::instruction::transfer(&from, &to, 1_000);
                     let msg = solana_sdk::message::Message::new(&[cu_ix, transfer_ix], Some(&from));
                     let mut t = Transaction::new_unsigned(msg);
-                    // Apply the freshly-fetched blockhash before signing; otherwise the
-                    // transaction is submitted with a zero blockhash and the RPC rejects
-                    // it with "Blockhash not found" during simulation.
                     t.message.recent_blockhash = blockhash;
                     t
                 };
                 // Final pre-send recheck: re-validate kill switch, circuit
                 // breaker, daily limits, slippage, max-spend, and position
                 // caps immediately before signing — state may have changed
-                // (e.g. another iteration tripped the breaker) since the
-                // earlier check at the top of this iteration.
+                // since the earlier check at the top of this iteration.
                 if let Err(e) = risk_manager.pre_trade_check(
                     entry_signal.position_size_lamports,
                     entry_signal.slippage_bps,
                 ) {
                     metrics::record_trade_rejected(&metrics_registry, mode_label, e.code());
                     tracing::warn!(mode = mode_target, iteration = i + 1, error = %e, "final pre-send risk recheck failed — aborting send (fail-closed)");
-                    sleep(Duration::from_millis(200)).await;
+                    sleep(loop_interval).await;
                     continue;
                 }
 
-                // Sign the transaction: via the remote HSM when configured,
-                // otherwise (dry-run only) via the local keypair. LIVE always
-                // has the HSM (validated); the local keyfile is never a live
-                // fallback.
-                let sig = if let (Some(ep), Some(ca), Some(id)) = (endpoint, ca, identity) {
-                    match hsm_sign(ep, ca, id, &mut tx).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            risk_manager.trip_circuit_breaker(&format!(
-                                "HSM signing failed (fail-closed): {e}"
-                            ));
-                            tracing::error!(mode = mode_target, error = %e, "HSM signing failed — circuit breaker tripped");
-                            sleep(Duration::from_millis(200)).await;
-                            continue;
-                        }
-                    }
-                } else if let Some(ref kp) = local_signer {
-                    tx.sign(&[kp], tx.message.recent_blockhash);
-                    tx.signatures[0]
-                } else {
+                // Sign (HSM when configured; dry-run may use the local
+                // keypair) and VERIFY the signature against the expected
+                // signer before it is attached or sent.
+                if simulate_payer.is_some() {
+                    // Unsigned simulation build: nothing to sign.
+                } else if let Err(e) = sign_and_verify(
+                    &args,
+                    local_signer.as_ref(),
+                    &from,
+                    &mut tx,
+                    &metrics_registry,
+                )
+                .await
+                {
                     risk_manager
-                        .trip_circuit_breaker("no signer available at signing time (fail-closed)");
-                    tracing::error!(
-                        mode = mode_target,
-                        "no signer available at signing time — circuit breaker tripped"
-                    );
-                    sleep(Duration::from_millis(200)).await;
+                        .trip_circuit_breaker(&format!("signing failed (fail-closed): {e}"));
+                    tracing::error!(mode = mode_target, error = %e, "signing/verification failed — circuit breaker tripped");
+                    sleep(loop_interval).await;
                     continue;
-                };
-                tx.signatures = vec![sig];
+                }
 
-                // Submission: LIVE sends the signed transaction (via Jito
-                // bundle with RPC fallback when configured, otherwise directly
-                // via RPC). DRY-RUN never submits — it prints the built and
-                // signed transaction so an operator can inspect exactly what
-                // live would have sent.
+                // Submission: LIVE sends the signed transaction and waits for
+                // confirmation. DRY-RUN never submits — it prints the built
+                // and signed transaction so an operator can inspect exactly
+                // what live would have sent.
                 if !is_live {
                     let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
                     println!(
@@ -1679,85 +2687,245 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hex::encode(&tx_bytes)
                     );
                     println!("[DRY-RUN] iter {}: signature = {}", i + 1, tx.signatures[0]);
+                    // Real swap => simulate it on-chain (never sent). This is
+                    // the end-to-end check of program id, accounts, ATAs,
+                    // wSOL wrap, tick arrays and slippage against mainnet.
+                    if swap_adapter.is_some() {
+                        match simulate_on_chain(&rpc_client, &tx) {
+                            Ok(sim) => {
+                                let ok = sim.err.is_none();
+                                println!(
+                                    "[DRY-RUN] iter {}: on-chain simulation {} (compute units {:?}){}",
+                                    i + 1,
+                                    if ok { "OK" } else { "FAILED" },
+                                    sim.units,
+                                    sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                );
+                                for line in sim.logs.iter().rev().take(12).rev() {
+                                    println!("    {line}");
+                                }
+                                tracing::info!(
+                                    target: "dry_run",
+                                    simulation_ok = ok,
+                                    units = sim.units,
+                                    error = sim.err.as_deref().unwrap_or(""),
+                                    "on-chain simulation of the dry-run swap"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "dry_run", error = %e, "on-chain simulation unavailable")
+                            }
+                        }
+                        // Exit (stop-loss / take-profit sell) path: the same
+                        // builder the live exit uses, selling the amount this
+                        // entry would buy back into the input mint. The fee
+                        // payer must hold that token for the simulation to
+                        // pass (an "insufficient funds" result then only means
+                        // the payer holds none, not a broken exit).
+                        match build_exit_tx(
+                            &args,
+                            &rpc_client,
+                            &from,
+                            swap_min_output,
+                            blockhash,
+                            jito_tip,
+                        )
+                        .and_then(|exit_tx| simulate_on_chain(&rpc_client, &exit_tx))
+                        {
+                            Ok(sim) => {
+                                let ok = sim.err.is_none();
+                                println!(
+                                    "[DRY-RUN] iter {}: EXIT (sell {} raw units) on-chain simulation {} (compute units {:?}){}",
+                                    i + 1,
+                                    swap_min_output,
+                                    if ok { "OK" } else { "FAILED" },
+                                    sim.units,
+                                    sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                );
+                                for line in sim.logs.iter().rev().take(12).rev() {
+                                    println!("    {line}");
+                                }
+                            }
+                            Err(e) => println!(
+                                "[DRY-RUN] iter {}: EXIT simulation unavailable: {e}",
+                                i + 1
+                            ),
+                        }
+                    }
                     tracing::info!(
                         target: "dry_run",
                         signature = %tx.signatures[0],
                         "dry-run transaction built and signed (never sent)"
                     );
                     successful_trades += 1;
+                    single_trade_done = true;
                     // NOTE: dry-run does NOT call risk_manager.record_trade()
                     // or record_position_open() — those represent real
-                    // on-chain position/trade accounting. Inflating them here
-                    // would trip open_position_cap / daily_trade_cap after the
-                    // first built tx and reject every later iteration, which
-                    // defeats AŞAMA 1's purpose of repeatedly exercising the
-                    // risk gates. Dry-run only builds+sings; it never opens a
-                    // real position.
+                    // on-chain position/trade accounting. Dry-run only
+                    // builds + signs; it never opens a real position.
                     metrics::record_trade_executed(&metrics_registry, mode_label);
                 } else {
-                    let send_result = if let Some(jito_ep) = &args.jito_endpoint {
-                        let bundle =
-                            jito::JitoBundle::new(vec![tx.clone()], args.jito_tip_lamports);
-                        let client = jito::JitoClient::new(jito_ep, args.jito_dry_run);
-                        if args.jito_dry_run {
-                            // Dry-run: validate the bundle, then submit via RPC.
-                            match client.send_bundle(&bundle).await {
-                                Ok(bundle_id) => {
-                                    tracing::info!(mode = mode_target, bundle_id = %bundle_id, "jito bundle dry-run validated — submitting via RPC");
-                                    retry::send_with_retry(&*rpc_client, &tx)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(mode = mode_target, error = %e, "jito dry-run validation failed — submitting via RPC");
-                                    retry::send_with_retry(&*rpc_client, &tx)
-                                }
-                            }
-                        } else {
-                            // Live Jito: send the bundle; fall back to RPC on failure.
-                            match client.send_bundle(&bundle).await {
-                                Ok(bundle_id) => {
-                                    tracing::info!(mode = mode_target, bundle_id = %bundle_id, "jito bundle accepted");
+                    // Real balances before/after the entry give the true cost
+                    // (fees included) and the real token amount received —
+                    // the numbers the exit path values and sells.
+                    let in_mint = Pubkey::from_str(args.input_mint.as_deref().unwrap_or_default())
+                        .map_err(|e| format!("invalid --input-mint: {e}"))?;
+                    let out_mint =
+                        Pubkey::from_str(args.output_mint.as_deref().unwrap_or_default())
+                            .map_err(|e| format!("invalid --output-mint: {e}"))?;
+                    let before_in = position::fetch_mint_balance(&rpc_client, &from, &in_mint);
+                    let before_out = position::fetch_mint_balance(&rpc_client, &from, &out_mint);
+                    let (before_in, before_out) = match (before_in, before_out) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(mode = mode_target, error = %e, "pre-entry balance fetch failed — no trade (fail-closed)");
+                            sleep(loop_interval).await;
+                            continue;
+                        }
+                    };
+                    // Funds check BEFORE sending: the trade size plus a SOL
+                    // reserve (ATA rent for a new token account, wSOL account,
+                    // network + priority fees, and the later exit's fees).
+                    // Without it an underfunded wallet would fail every
+                    // iteration and each failure was booked as a loss.
+                    let required = entry_required_balance(
+                        entry_signal.position_size_lamports,
+                        in_mint == native_mint(),
+                    );
+                    if before_in < required {
+                        tracing::warn!(
+                            mode = mode_target,
+                            balance = before_in,
+                            required,
+                            "insufficient balance for entry + SOL reserve — no trade (fund the wallet)"
+                        );
+                        metrics::record_trade_rejected(
+                            &metrics_registry,
+                            mode_label,
+                            "insufficient_balance",
+                        );
+                        sleep(loop_interval).await;
+                        continue;
+                    }
+                    // Crash safety: record the entry BEFORE it is sent. If the
+                    // process dies while waiting for the confirmation, the
+                    // next start books the position from the chain.
+                    let pending = position::PendingEntry {
+                        signature: tx.signatures[0].to_string(),
+                        blockhash: tx.message.recent_blockhash.to_string(),
+                        before_in,
+                        before_out,
+                        position: position::LivePosition {
+                            pool_id: args.pool_id.clone().unwrap_or_default(),
+                            input_mint: args.input_mint.clone().unwrap_or_default(),
+                            output_mint: args.output_mint.clone().unwrap_or_default(),
+                            entry_sqrt_price: entry_sqrt.to_string(),
+                            position_size_lamports: entry_signal.position_size_lamports,
+                            cost_input_units: 0,
+                            token_amount: 0,
+                            entry_signature: tx.signatures[0].to_string(),
+                            opened_at_ms: marketdata::now_ms() as u64,
+                            entry_liquidity_lamports: live_liquidity.unwrap_or(0),
+                        },
+                    };
+                    if let Err(e) = pending.save(&args.data_dir) {
+                        tracing::error!(mode = mode_target, error = %e, "cannot persist the pending entry — no trade (fail-closed)");
+                        sleep(loop_interval).await;
+                        continue;
+                    }
+                    let submitted = submit_live_tx(&args, &rpc_client, &tx).await;
+                    // An Err may mean "outcome unknown" (e.g. confirmation
+                    // timeout). Reconcile from the real token balance before
+                    // concluding nothing happened, so a swap that landed late
+                    // is never left unmanaged (and never bought twice).
+                    let outcome: Result<Signature, String> = match submitted {
+                        Ok(sig) => Ok(sig),
+                        Err(e) => {
+                            match position::fetch_mint_balance(&rpc_client, &from, &out_mint) {
+                                Ok(after) if after > before_out => {
+                                    tracing::warn!(mode = mode_target, error = %e, received = after - before_out, "submission reported an error but the swap LANDED — recording the position");
                                     Ok(tx.signatures[0])
                                 }
-                                Err(e) => {
-                                    tracing::warn!(mode = mode_target, error = %e, "jito bundle failed — falling back to RPC");
-                                    jito::send_with_rpc_fallback(&*rpc_client, &[tx.clone()]).await
+                                Ok(_) => {
+                                    // Definitely not landed (the confirmation
+                                    // waits for the blockhash to expire).
+                                    let _ = position::PendingEntry::clear(&args.data_dir);
+                                    Err(format!("{e}"))
+                                }
+                                Err(be) => {
+                                    // pending_entry.json stays: the next
+                                    // start reconciles it from the chain.
+                                    risk_manager.trigger_kill_switch(&format!(
+                                        "entry outcome unknown (send: {e}; balance check: {be}) — inspect the wallet before re-arming"
+                                    ));
+                                    Err(format!("{e} — outcome unknown, kill switch engaged"))
                                 }
                             }
                         }
-                    } else {
-                        retry::send_with_retry(&*rpc_client, &tx)
                     };
-
-                    match send_result {
+                    match outcome {
                         Ok(sig) => {
                             successful_trades += 1;
-                            // Record the completed trade (daily trade counter)
-                            // and the newly opened position/exposure.
-                            //
-                            // KNOWN GAP: this codebase has no exit-execution
-                            // path (SimpleSnipeStrategy::should_exit() is
-                            // computed but never acted on in the live loop), so
-                            // record_position_close() is never called and
-                            // realized P&L is not tracked for wins. See final
-                            // report for details — not fabricated here.
+                            let cost = position::fetch_mint_balance(&rpc_client, &from, &in_mint)
+                                .map(|after| before_in.saturating_sub(after))
+                                .unwrap_or(entry_signal.position_size_lamports);
+                            let tokens =
+                                position::fetch_mint_balance(&rpc_client, &from, &out_mint)
+                                    .map(|after| after.saturating_sub(before_out))
+                                    .unwrap_or(swap_min_output);
+                            let pos = position::LivePosition {
+                                pool_id: args.pool_id.clone().unwrap_or_default(),
+                                input_mint: args.input_mint.clone().unwrap_or_default(),
+                                output_mint: args.output_mint.clone().unwrap_or_default(),
+                                entry_sqrt_price: entry_sqrt.to_string(),
+                                position_size_lamports: entry_signal.position_size_lamports,
+                                cost_input_units: cost.max(1),
+                                token_amount: tokens,
+                                entry_signature: sig.to_string(),
+                                opened_at_ms: marketdata::now_ms() as u64,
+                                entry_liquidity_lamports: live_liquidity.unwrap_or(0),
+                            };
+                            // Persist the position BEFORE the counters so a
+                            // crash in between is recoverable on restart.
+                            if let Err(e) = pos.save(&args.data_dir) {
+                                tracing::error!(mode = mode_target, error = %e, "failed to persist live position — halting new entries");
+                                risk_manager.trigger_kill_switch(&format!(
+                                    "live position persist failed: {e}"
+                                ));
+                            }
                             risk_manager.record_trade();
                             risk_manager.record_position_open(entry_signal.position_size_lamports);
+                            if let Err(e) = position::PendingEntry::clear(&args.data_dir) {
+                                tracing::warn!(mode = mode_target, error = %e, "pending entry not cleared (harmless: the position record exists)");
+                            }
+                            live_position = Some(pos);
                             metrics::record_trade_executed(&metrics_registry, mode_label);
-                            tracing::info!(mode = mode_target, signature = %sig, "transaction confirmed");
+                            metrics::record_trade(
+                                &metrics_registry,
+                                true,
+                                iteration_start.elapsed().as_millis() as f64,
+                            );
+                            tracing::info!(mode = mode_target, signature = %sig, cost, tokens, "ENTRY confirmed — position open, exit management active");
                             let cluster = if args.rpc.contains("devnet") {
                                 "devnet"
                             } else {
                                 "mainnet-beta"
                             };
                             println!(
-                            "[LIVE] iter {}: TX confirmed: https://explorer.solana.com/tx/{}?cluster={}",
-                            i + 1,
-                            sig,
-                            cluster
-                        );
+                                "[LIVE] iter {}: ENTRY confirmed: https://explorer.solana.com/tx/{}?cluster={}",
+                                i + 1,
+                                sig,
+                                cluster
+                            );
                         }
                         Err(e) => {
-                            let _ = risk_manager.record_loss(1_000);
+                            metrics::record_trade(
+                                &metrics_registry,
+                                false,
+                                iteration_start.elapsed().as_millis() as f64,
+                            );
+                            // A failed tx still burns its network fee.
+                            let _ = risk_manager.record_loss(5_000);
                             tracing::error!(mode = mode_target, error = %e, "transaction failed after retries");
                             eprintln!("[LIVE] iter {}: TX failed: {}", i + 1, e);
                         }
@@ -1810,7 +2978,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        sleep(Duration::from_millis(200)).await;
+        sleep(loop_interval).await;
     }
 
     // Paper iterations all accumulate latency (rejections included), while
@@ -1838,7 +3006,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("========================================");
     println!("  HFT Platform Summary");
     println!("========================================");
-    println!("  Total iterations: {}", args.iterations);
+    println!("  Total iterations: {}", completed_iterations);
     println!("  Total trades:     {}", total_trades);
     println!("  Successful:       {}", successful_trades);
     println!("  Avg latency:      {} ms", avg_latency);
@@ -1860,6 +3028,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Simulated entries:     {}", paper_sim.entries);
         println!("  Exits stop-loss:       {}", paper_sim.exits_stop_loss);
         println!("  Exits take-profit:     {}", paper_sim.exits_take_profit);
+        println!(
+            "  Exits forced:          {} (max hold / liquidity drop)",
+            paper_sim.exits_forced
+        );
         println!("  Holds:                 {}", paper_sim.holds);
         println!("  No entry signal:       {}", paper_sim.no_entry_signals);
         println!("  Market-data errors:    {}", paper_data_errors);
@@ -2007,6 +3179,131 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    // ── LIVE prerequisites (pool, real risk data, pinned HSM key) ──
+    const PK: &str = "4sirSH9isRCEqcu72TKDXhV1kn6sURKabM981u3ZTvUt";
+
+    #[test]
+    fn live_requires_pool_args() {
+        let err = validate_live_args(true, None, Some("a"), Some("b"), true, Some(PK)).unwrap_err();
+        assert!(err.contains("--pool-id"), "got: {err}");
+    }
+
+    #[test]
+    fn live_requires_live_risk_data() {
+        let err =
+            validate_live_args(true, Some("p"), Some("a"), Some("b"), false, Some(PK)).unwrap_err();
+        assert!(err.contains("--live-risk-data"), "got: {err}");
+    }
+
+    #[test]
+    fn live_requires_expected_signer() {
+        let err =
+            validate_live_args(true, Some("p"), Some("a"), Some("b"), true, None).unwrap_err();
+        assert!(err.contains("--expected-signer"), "got: {err}");
+    }
+
+    #[test]
+    fn live_with_all_prerequisites_ok() {
+        let pinned =
+            validate_live_args(true, Some("p"), Some("a"), Some("b"), true, Some(PK)).unwrap();
+        assert_eq!(pinned.unwrap().to_string(), PK);
+    }
+
+    #[test]
+    fn invalid_expected_signer_rejected_in_any_mode() {
+        assert!(validate_live_args(false, None, None, None, false, Some("nope")).is_err());
+        assert!(validate_live_args(false, None, None, None, false, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn exit_slippage_widens_per_failure_and_caps_at_5pct() {
+        assert_eq!(exit_slippage_bps(100, 0), 100);
+        assert_eq!(exit_slippage_bps(100, 1), 200);
+        assert_eq!(exit_slippage_bps(100, 3), 400);
+        assert_eq!(exit_slippage_bps(100, 10), 500);
+        assert_eq!(exit_slippage_bps(100, u32::MAX), 500);
+        // A configured slippage above the cap is never reduced.
+        assert_eq!(exit_slippage_bps(800, 2), 800);
+    }
+
+    #[test]
+    fn max_hold_time_triggers_only_when_enabled_and_elapsed() {
+        let opened = 1_000_000;
+        assert!(!max_hold_reached(opened, opened + 59_999, 60));
+        assert!(max_hold_reached(opened, opened + 60_000, 60));
+        assert!(!max_hold_reached(opened, opened + 10_000_000_000, 0));
+    }
+
+    #[test]
+    fn entry_requires_sol_reserve_on_top_of_size() {
+        assert_eq!(entry_required_balance(10_000_000, true), 16_000_000);
+        assert_eq!(entry_required_balance(10_000_000, false), 10_000_000);
+        // The wallet that failed the dry-run simulation (0.00203 SOL) is
+        // rejected up front instead of failing on-chain every iteration.
+        assert!(2_028_080 < entry_required_balance(10_000_000, true));
+    }
+
+    #[test]
+    fn clmm_program_id_by_cluster() {
+        assert_eq!(
+            clmm_program_id("https://api.devnet.solana.com").to_string(),
+            amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID_DEVNET
+        );
+        assert_eq!(
+            clmm_program_id("https://mainnet.helius-rpc.com").to_string(),
+            amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn args_can_be_supplied_via_env() {
+        // SNIPER_* env vars feed the same flags (systemd EnvironmentFile).
+        std::env::set_var("SNIPER_POOL_ID", "envpool");
+        let args = Args::try_parse_from(["solana-sniper"]).unwrap();
+        std::env::remove_var("SNIPER_POOL_ID");
+        assert_eq!(args.pool_id.as_deref(), Some("envpool"));
+        // An explicit flag wins over the environment.
+        std::env::set_var("SNIPER_ITERATIONS", "7");
+        let args = Args::try_parse_from(["solana-sniper", "--iterations", "3"]).unwrap();
+        std::env::remove_var("SNIPER_ITERATIONS");
+        assert_eq!(args.iterations, 3);
+        // Empty values (template lines like `SNIPER_EXPECTED_SIGNER=`) are unset.
+        let args = Args::try_parse_from(["solana-sniper", "--expected-signer", ""])
+            .unwrap()
+            .normalized();
+        assert!(args.expected_signer.is_none());
+    }
+
+    #[test]
+    fn paper_exit_direction_follows_pool_orientation() {
+        // Price token1/token0 rises 20% (sqrt * ~1.0954). With token1 as
+        // input (held = token0) that is a gain => take-profit; with token0
+        // as input (held = token1) the held token lost value => stop-loss.
+        let entry = 1u128 << 64;
+        let up = (entry as f64 * 1.2f64.sqrt()) as u128;
+        let cand = strategy::TokenCandidate {
+            liquidity_lamports: u64::MAX,
+            market_cap_lamports: 0,
+            holders: 100,
+            is_blocklisted: false,
+        };
+        for (input_is_token0, expect_tp) in [(false, true), (true, false)] {
+            let mut sim = PaperSimulator::new();
+            sim.input_is_token0 = input_is_token0;
+            let PaperTick::EntryPending(sig) = sim.tick(&cand, entry) else {
+                panic!("expected entry signal");
+            };
+            sim.confirm_entry(entry, sig);
+            match sim.tick(&cand, up) {
+                PaperTick::ClosedTakeProfit(pnl) => assert!(expect_tp && pnl > 0),
+                PaperTick::ClosedStopLoss(pnl) => assert!(!expect_tp && pnl < 0),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2357,5 +3654,145 @@ mod tests {
             ),
             pnl
         );
+    }
+
+    #[test]
+    fn min_liquidity_floor_and_strategy_config() {
+        assert!(validate_min_liquidity(1000.0).is_ok());
+        assert!(validate_min_liquidity(MIN_LIQUIDITY_FLOOR_SOL).is_ok());
+        assert!(validate_min_liquidity(5.0).is_err());
+        assert!(validate_min_liquidity(f64::NAN).is_err());
+        let args = Args::try_parse_from(["solana-sniper", "--min-liquidity-sol", "50"]).unwrap();
+        let cfg = strategy_config(&args);
+        assert_eq!(cfg.min_liquidity_lamports, 50_000_000_000);
+        assert_eq!(
+            cfg.max_trade_size_lamports,
+            strategy::StrategyConfig::default().max_trade_size_lamports
+        );
+        let defaults = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert_eq!(
+            strategy_config(&defaults).min_liquidity_lamports,
+            strategy::StrategyConfig::default().min_liquidity_lamports
+        );
+        assert!(!defaults.single_trade);
+        assert_eq!(defaults.entry_window_secs, 0);
+    }
+
+    #[test]
+    fn entry_window_never_abandons_an_open_position() {
+        assert!(!entry_window_expired(10_000, 0, false), "0 = unlimited");
+        assert!(!entry_window_expired(59, 60, false));
+        assert!(entry_window_expired(60, 60, false));
+        assert!(!entry_window_expired(10_000, 60, true));
+    }
+
+    #[test]
+    fn paper_forced_exits_match_live() {
+        let mut cand = rejected_candidate();
+        cand.liquidity_lamports = 100_000_000_000;
+
+        // Liquidity pulled while the price is flat: forced exit.
+        let mut sim = PaperSimulator::new();
+        sim.tick(&cand, 1_000_000_000); // records liquidity seen at entry
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        let mut drained = cand.clone();
+        drained.liquidity_lamports = 40_000_000_000;
+        assert!(matches!(
+            sim.tick(&drained, 1_000_000_000),
+            PaperTick::ClosedForced(strategy::ExitDecision::LiquidityDrop, _)
+        ));
+        assert!(!sim.has_open_position());
+
+        // Max holding time.
+        let mut sim = PaperSimulator::new();
+        sim.max_hold_ms = 60_000;
+        sim.now_ms = 1_000;
+        sim.tick(&cand, 1_000_000_000);
+        sim.confirm_entry(1_000_000_000, entry_signal(1_000_000_000));
+        sim.now_ms = 60_999;
+        assert!(matches!(sim.tick(&cand, 1_000_000_000), PaperTick::Hold));
+        sim.now_ms = 61_000;
+        assert!(matches!(
+            sim.tick(&cand, 1_000_000_000),
+            PaperTick::ClosedForced(strategy::ExitDecision::MaxHoldTime, 0)
+        ));
+        assert_eq!(sim.exits_forced, 1);
+    }
+
+    fn pending_fixture() -> (std::path::PathBuf, position::PendingEntry) {
+        let dir = std::env::temp_dir().join(format!(
+            "pending_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = position::PendingEntry {
+            signature: Signature::default().to_string(),
+            blockhash: solana_sdk::hash::Hash::default().to_string(),
+            before_in: 100,
+            before_out: 0,
+            position: position::LivePosition {
+                pool_id: Pubkey::new_unique().to_string(),
+                input_mint: amm::raydium_v4::NATIVE_MINT.into(),
+                output_mint: Pubkey::new_unique().to_string(),
+                entry_sqrt_price: "1".into(),
+                position_size_lamports: 10_000_000,
+                cost_input_units: 0,
+                token_amount: 0,
+                entry_signature: Signature::default().to_string(),
+                opened_at_ms: 1,
+                entry_liquidity_lamports: 0,
+            },
+        };
+        p.save(&dir).unwrap();
+        (dir, p)
+    }
+
+    fn mock_rpc_blockhash_expired() -> RpcClient {
+        let mut m = solana_rpc_client::mock_sender::MocksMap::default();
+        for _ in 0..4 {
+            m.insert(
+                solana_rpc_client_api::request::RpcRequest::IsBlockhashValid,
+                serde_json::json!({"context": {"slot": 1}, "value": false}),
+            );
+        }
+        RpcClient::new_mock_with_mocks_map("sig_not_found", m)
+    }
+
+    #[test]
+    fn unfinished_entry_that_never_landed_is_dropped() {
+        let (dir, _) = pending_fixture();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).unwrap();
+        assert_eq!(position::PendingEntry::load(&dir).unwrap(), None);
+        assert_eq!(position::LivePosition::load(&dir).unwrap(), None);
+        assert_eq!(rm.open_position_count(), 0);
+    }
+
+    #[test]
+    fn unfinished_entry_with_booked_position_only_needs_cleanup() {
+        let (dir, p) = pending_fixture();
+        let mut pos = p.position.clone();
+        pos.token_amount = 5;
+        pos.save(&dir).unwrap();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        // No RPC call is needed: the mock would fail any balance read.
+        reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).unwrap();
+        assert_eq!(position::PendingEntry::load(&dir).unwrap(), None);
+        assert_eq!(position::LivePosition::load(&dir).unwrap(), Some(pos));
+    }
+
+    #[test]
+    fn corrupt_pending_entry_refuses_live() {
+        let (dir, _) = pending_fixture();
+        std::fs::write(dir.join("pending_entry.json"), "{not json").unwrap();
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        assert!(reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).is_err());
     }
 }

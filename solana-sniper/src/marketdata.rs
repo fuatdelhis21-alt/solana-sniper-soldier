@@ -48,7 +48,7 @@ impl PoolPriceFeed {
     /// Refresh the cached pool state from the RPC. Fail-closed: any error
     /// propagates and the previous snapshot is retained.
     pub fn refresh(&self) -> Result<ResolvedPool, String> {
-        let pool = fetch_pool_state(&self.rpc, &self.pool_id)?;
+        let pool = fetch_pool_state(&self.rpc, &self.pool_id, &self.program_id)?;
         *self.last.lock().unwrap() = Some(pool.clone());
         *self.last_refreshed_ms.lock().unwrap() = Some(now_ms());
         Ok(pool)

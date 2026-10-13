@@ -1,124 +1,54 @@
-﻿# Solana HFT Platform — Deployment Checklist
+# Solana HFT Platform — Deployment Checklist
 
-## ✅ Tamamlanan
+Ayrıntılı adımlar: [`README_DEPLOY.md`](README_DEPLOY.md). Mainnet onay
+listesi: [`docs/mainnet_checklist.md`](docs/mainnet_checklist.md).
 
-1. **Project Setup & CI/CD Scaffold**
-   - ✅ Workspace manifest (`Cargo.toml`)
-   - ✅ GitHub Actions workflow (`.github/workflows/ci-cd.yml`)
-   - ✅ Build & publish script (`scripts/build_and_publish.sh`)
-   - ✅ Production config template (`config/production.example.toml`)
+## Kod tarafında giderilen canlıya geçiş engelleri
 
-2. **Deployment Infrastructure**
-   - ✅ Ansible playbook (`ansible/deploy.yml`)
-   - ✅ systemd unit template (`ansible/templates/solana-hft.service.j2`)
-   - ✅ Install script (`deploy/install_release.sh`)
-   - ✅ README_DEPLOY.md
+- [x] Swap talimatı yanlış Raydium CLMM program ID'sine gidiyordu
+      (`CAMMCzo5YLJbYF7r5...` hiçbir mainnet havuzuna ait değil) → tek kaynak
+      `account_resolver::RAYDIUM_CLMM_PROGRAM_ID`, adapter'a cluster'a göre set ediliyor;
+      WebSocket `programSubscribe` da düzeltildi.
+- [x] Live çıkış (exit) yolu yoktu: pozisyon açılıyor ama hiç satılmıyordu ve
+      `max_open_positions=1` yüzünden ilk işlemden sonra bot duruyordu → stop-loss /
+      take-profit ters swap, kalıcı `live_position.json`, gerçek bakiye farkıyla P&L.
+- [x] Swap tx'i sendable değildi (çıkış ATA'sı yok, SOL wrap yok, priority fee yok)
+      → idempotent ATA oluşturma, wSOL wrap/unwrap, compute budget.
+- [x] HSM imzası doğrulanmıyordu (sunucu hata durumunda HTTP 200 + sıfır imza dönüyordu)
+      → istemci Ed25519 doğrulaması, `--expected-signer` pin (live'da zorunlu), sunucu 400 +
+      `HSM_REQUIRE_KEY=1`.
+- [x] Prometheus `/metrics` + `/health` sunucusu hiç başlatılmıyordu → `--metrics-addr`.
+- [x] Sürekli çalışma yoktu (30 iterasyon sonra çıkış) → `--iterations 0`, SIGTERM ile
+      graceful stop; geçici circuit breaker artık servisi sonlandırmıyor.
+- [x] Config bağlı değildi → her flag `SNIPER_*` env değişkeniyle, `.env` otomatik yüklenir.
+- [x] systemd unit'i olmayan binary'yi (`solana-hft --config`) çalıştırıyordu; install
+      script `set -u` ile `$2` yüzünden çöküyordu; paket tüm `target/` dizinini içeriyordu;
+      Ansible `remote_src` hatalıydı → hepsi yeniden yazıldı, HSM için ayrı unit, rollback.
+- [x] CI: deprecated `actions-rs/toolchain`, kırmızı `risk::tests::audit_log_written_on_kill_switch`.
 
-3. **Build & Test Preparation**
-   - ✅ Workspace members configured (hft-core, hft-marketdata, hft-execution)
-   - ✅ Mock artifact created: `solana-hft-release-mock-20260716152808.tar.gz`
+- [x] Swap ücreti %0.05 sabitti → havuzun gerçek ücret kademesi AmmConfig'ten okunuyor.
+- [x] Yalnızca mevcut tick'in dizisi veriliyordu → swap yönündeki ilk başlatılmış 3 tick
+      array seçiliyor (boş dizi / sınır geçişi zincirde hata vermez).
+- [x] Jito bahşişi hiç eklenmiyordu → tip hesapları Block Engine'den canlı okunuyor,
+      bahşiş transferi imzadan önce işleme ekleniyor; bahşişsiz Jito live'da reddediliyor.
+- [x] `getTokenLargestAccounts` her turda çağrılıyordu → 60 sn önbellek.
 
-## 📋 Sonraki Adımlar (Priority Order)
+- [x] Onay 3 sn sonra bırakılıyordu → blockhash geçerli olduğu sürece beklenir; belirsiz
+      sonuç gerçek bakiyeden uzlaştırılır. Girişten önce boyut + 0.006 SOL rezerv kontrolü.
+- [x] Stop-loss satışı hızlı düşüşte %1 kaymaya takılabiliyordu → her başarısız çıkışta
+      tolerans bir adım artar (en fazla %5).
+- [x] Pozisyon süresiz açık kalabiliyordu → `SNIPER_MAX_HOLD_SECS` (varsayılan 24 saat).
+- [x] Uç fiyat aralığındaki havuzlar için tick-array bitmap extension desteği.
+- [x] Dry-run giriş ve çıkış swap'ını zincirde simüle eder (`SNIPER_SIMULATE_PAYER` ile
+      fonsuz doğrulama).
 
-### 1. GitHub Actions ile Real Build (⏳ En Önemli)
-```bash
-# Prerequisites:
-# - Git repo already pushed to https://github.com/fuatdelhis21-alt/solana-sniper-soldier
-# - GitHub Secrets configured (CI'da gerekli):
-#   - S3_ENDPOINT
-#   - S3_BUCKET
-#   - AWS_ACCESS_KEY_ID
-#   - AWS_SECRET_ACCESS_KEY
-#   - (optional) GPG_PRIVATE_KEY + GPG_PASSPHRASE
+## Operatörün yapması gerekenler (kodla çözülemez)
 
-# Action: Push to main branch (veya manual workflow_dispatch tetikle)
-git push -u origin main
-# → Actions kart başlayacak, build/test/artifact üretecek
-```
-
-### 2. Bare-Metal Deploy (Ansible) — SSH Gerekli
-```bash
-# Host prep (target sunucuda, root olarak):
-useradd -r -s /sbin/nologin solana || true
-mkdir -p /etc/solana-hft /opt/solana-hft
-cp config/production.example.toml /etc/solana-hft/config.toml
-# ... production env değerlerini Vault/export ile ekle ...
-
-# Deploy (control node'dan):
-export ARTIFACT_PATH=/path/to/solana-hft-release-YYYYMMDDHHMMSS.tar.gz
-ansible-playbook -i inventory.ini ansible/deploy.yml -u ubuntu -k
-
-# Verify:
-systemctl status solana-hft
-journalctl -u solana-hft -f
-```
-
-### 3. systemd Service Validation
-```bash
-# Bare-metal üzerinde:
-cat /etc/systemd/system/solana-hft.service
-systemctl enable solana-hft
-systemctl start solana-hft
-systemctl restart solana-hft  # graceful reload test
-```
-
-### 4. Monitoring & Rollback (Production)
-```bash
-# Monitoring (Prometheus scrape):
-curl http://localhost:9090/metrics  # (TBD: port, endpoint)
-
-# Rollback (previous artifact backup):
-tar -czf backup-$(date +%s).tar.gz -C /opt/solana-hft .
-./deploy/install_release.sh /path/to/backup-release.tar.gz
-
-# Kill-switch / circuit breaker:
-systemctl stop solana-hft
-systemctl disable solana-hft
-```
-
----
-
-## 📌 Gerekli Bilgiler (Eksik)
-
-- [ ] SSH Public Key (bare-metal için)
-- [ ] Inventory File (`inventory.ini` — host IPs, credentials)
-- [ ] Vault Token veya env secrets (production config için)
-- [ ] S3/Artifact Registry Credentials (CI için)
-- [ ] Rollback Policy (automatic vs. manual)
-
----
-
-## 🚀 Quick Start (Test Amaçlı)
-
-### Option A: GitHub Actions ile (Gerçek)
-```bash
-cd C:\Users\Lenovo\Downloads\solana-hft-platform
-git push -u origin main
-# → Watch Actions tab: github.com/fuatdelhis21-alt/solana-sniper-soldier/actions
-```
-
-### Option B: Lokal Mock Deploy (Test)
-```bash
-ansible-playbook ansible/deploy.yml -i localhost, \
-  -e "artifact_path=./solana-hft-release-mock-20260716152808.tar.gz" \
-  --check  # dry-run
-```
-
-### Option C: Manual Deploy (Bare-Metal)
-```bash
-./deploy/install_release.sh solana-hft-release-mock-20260716152808.tar.gz config/production.example.toml
-```
-
----
-
-## ⚠️ Critical Notes
-
-1. **Build**: Windows linker (`link.exe`) yok — GitHub Actions veya WSL/Linux kullanın.
-2. **Secrets**: Hiçbir zaman plaintext secret'ı git'e commit etmeyin — GitHub Secrets veya Vault kullanın.
-3. **SSH**: Bare-metal deploy için SSH public key ekle ve `ansible-inventory` yapılandır.
-4. **Service**: `systemd` user/group `solana:solana` olmalı; perms 0755 bin, 0600 config.
-5. **Rollback**: Gönderimi önceki artefakt backup'ını her zaman sakla.
-
----
-
-**Status**: ✅ Infrastructure Ready | ⏳ Awaiting Secrets + Build | ⏳ Deploy pending SSH setup
+- [ ] Ücretli mainnet RPC (Helius/Triton/QuickNode) → `SNIPER_RPC`, `SNIPER_WS`
+- [ ] Sunucu + SSH erişimi, `inventory.ini`
+- [ ] Gerçek cüzdan anahtarı → `hsm.env` (`HSM_KEY_B64`), pubkey → `SNIPER_EXPECTED_SIGNER`
+- [ ] Cüzdanı fonlama (işlem başı 0.01 SOL + ücretler + ATA rent ≈ 0.003 SOL)
+- [ ] Hedef havuz: `SNIPER_POOL_ID`, `SNIPER_OUTPUT_MINT` (mint/freeze authority'si
+      kaldırılmış token; aksi halde risk kapısı reddeder)
+- [ ] Paper → dry-run → live sırası; live için `SNIPER_LIVE=true` + `SNIPER_CONFIRM_LIVE=true`
+- [ ] (CI'da S3 yüklemesi istenirse) `S3_ENDPOINT`, `S3_BUCKET`, `AWS_*` secret'ları

@@ -1,0 +1,61 @@
+[Unit]
+Description=Solana HFT sniper bot (solana-sniper)
+Documentation=file:///opt/solana-hft/README_DEPLOY.md
+After=network-online.target solana-hsm.service
+Wants=network-online.target
+# A misconfiguration fails fast at startup; stop restarting after 5 tries in
+# 5 minutes instead of looping forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=solana
+Group=solana
+# Defaults; /etc/solana-hft/solana-hft.env overrides them (EnvironmentFile wins).
+Environment=SNIPER_DATA_DIR=/var/lib/solana-hft
+Environment=SNIPER_ITERATIONS=0
+Environment=SNIPER_METRICS_ADDR=127.0.0.1:9090
+EnvironmentFile=/etc/solana-hft/solana-hft.env
+WorkingDirectory=/var/lib/solana-hft
+StateDirectory=solana-hft
+ExecStart=/opt/solana-hft/bin/solana-sniper
+# Exit code 0 = deliberate stop (kill switch / daily cap / iterations done):
+# stay stopped. Non-zero = error: restart.
+Restart=on-failure
+RestartSec=10s
+# SIGTERM lets the bot finish the current iteration; an open position stays
+# persisted in live_position.json and is resumed on the next start. One
+# iteration can wait up to 180 s for a swap confirmation: the stop timeout
+# must cover it (an entry interrupted anyway is reconciled from
+# pending_entry.json on the next start).
+KillSignal=SIGTERM
+TimeoutStopSec=240
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+ReadWritePaths=/var/lib/solana-hft
+ReadOnlyPaths=/etc/solana-hft
+
+[Install]
+WantedBy=multi-user.target

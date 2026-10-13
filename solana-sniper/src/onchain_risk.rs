@@ -37,6 +37,9 @@ pub struct HolderStats {
     /// the SPL RPC standard, so this is the best measurable concentration.
     pub top20_holder_pct: f64,
     pub total_supply: u64,
+    /// Percentage (0-100) of supply in sampled accounts that were excluded
+    /// as program-controlled (PDA owner). Reported for operator visibility.
+    pub program_owned_pct: f64,
 }
 
 /// Holder-concentration thresholds (operator-approved design):
@@ -135,24 +138,99 @@ pub fn fetch_holder_stats(
         })
         .collect::<Result<_, String>>()?;
 
-    compute_holder_stats(total_supply, &entries, excludes)
+    // Program-controlled accounts are not "holders" in the rug-risk sense:
+    // a token account whose owner is a PDA (off the ed25519 curve) can only
+    // be moved by its program — other DEX pools' vaults, liquidity lockers,
+    // staking/vesting contracts. They dominate the top-20 of every
+    // established token and made the 70% gate reject all of them. Wallets
+    // (exchanges, whales, deployers) are on-curve and still count.
+    // Trade-off: a team multisig (e.g. Squads vault) is also a PDA and is
+    // excluded too. One extra RPC call (getMultipleAccounts, <= 20 keys).
+    let addrs: Vec<Pubkey> = entries
+        .iter()
+        .map(|(a, _)| Pubkey::from_str(a).map_err(|e| format!("invalid token account {a}: {e}")))
+        .collect::<Result<_, String>>()?;
+    let accounts = rpc
+        .get_multiple_accounts(&addrs)
+        .map_err(|e| format!("failed to fetch largest token accounts for {mint}: {e}"))?;
+    let mut program_owned: Vec<Pubkey> = Vec::new();
+    for (addr, acc) in addrs.iter().zip(accounts.iter()) {
+        // Unreadable account => keep it counted (fail-closed: never shrink
+        // the measured concentration on missing data).
+        if let Some(owner) = acc.as_ref().and_then(|a| token_account_owner(&a.data)) {
+            if !owner.is_on_curve() {
+                program_owned.push(*addr);
+            }
+        }
+    }
+
+    compute_holder_stats(total_supply, &entries, excludes, &program_owned)
+}
+
+/// How long a successful holder-concentration reading is reused. The
+/// distribution of a token's top holders does not move within seconds, and
+/// `getTokenLargestAccounts` is one of the heaviest RPC calls (providers
+/// answer "account index service overloaded" when it runs every iteration).
+pub const HOLDER_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type HolderCache =
+    std::sync::Mutex<std::collections::HashMap<Pubkey, (std::time::Instant, HolderStats)>>;
+
+fn holder_cache() -> &'static HolderCache {
+    static CACHE: std::sync::OnceLock<HolderCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `fetch_holder_stats` with a per-mint cache of successful readings for
+/// `HOLDER_STATS_TTL`. Errors are never cached (the next iteration retries,
+/// and the gate stays fail-closed meanwhile).
+pub fn fetch_holder_stats_cached(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    excludes: &[Pubkey],
+) -> Result<HolderStats, String> {
+    if let Some((at, stats)) = holder_cache().lock().unwrap().get(mint) {
+        if at.elapsed() < HOLDER_STATS_TTL {
+            return Ok(stats.clone());
+        }
+    }
+    let stats = fetch_holder_stats(rpc, mint, excludes)?;
+    holder_cache()
+        .lock()
+        .unwrap()
+        .insert(*mint, (std::time::Instant::now(), stats.clone()));
+    Ok(stats)
+}
+
+/// Owner field of an SPL token account (bytes 32..64), if the data is long
+/// enough to be one.
+fn token_account_owner(data: &[u8]) -> Option<Pubkey> {
+    let bytes: [u8; 32] = data.get(32..64)?.try_into().ok()?;
+    Some(Pubkey::new_from_array(bytes))
 }
 
 /// Pure, RPC-free holder-stat computation — unit-testable. Excludes the
-/// pool's own vault accounts, then measures single-holder and combined
-/// top-20 supply share (sample is capped at 20 by the SPL RPC standard).
+/// pool's own vault accounts and program-controlled (PDA-owned) accounts,
+/// then measures single-holder and combined top-20 supply share (sample is
+/// capped at 20 by the SPL RPC standard).
 fn compute_holder_stats(
     total_supply: u64,
     entries: &[(String, u64)],
     excludes: &[Pubkey],
+    program_owned: &[Pubkey],
 ) -> Result<HolderStats, String> {
     let mut sampled_holders = 0u64;
     let mut top_amount: u64 = 0;
     let mut combined_amount: u64 = 0;
+    let mut program_amount: u64 = 0;
     for (address, amount) in entries {
         let owner_pubkey = Pubkey::from_str(address)
             .map_err(|e| format!("invalid token account address {address}: {e}"))?;
         if excludes.contains(&owner_pubkey) {
+            continue;
+        }
+        if program_owned.contains(&owner_pubkey) {
+            program_amount = program_amount.saturating_add(*amount);
             continue;
         }
         sampled_holders += 1;
@@ -172,6 +250,7 @@ fn compute_holder_stats(
         top_holder_pct,
         top20_holder_pct,
         total_supply,
+        program_owned_pct: pct(program_amount),
     })
 }
 
@@ -208,6 +287,16 @@ pub fn fetch_mint_authority_risk(
     let account = rpc
         .get_account(mint)
         .map_err(|e| format!("failed to fetch mint account {mint}: {e}"))?;
+    // The swap path derives classic SPL Token ATAs and passes the classic
+    // token program: a Token-2022 mint (transfer fees, hooks, ...) cannot be
+    // traded safely here — reject it explicitly (fail-closed).
+    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    if account.owner != spl_token {
+        return Err(format!(
+            "mint {mint} is owned by {} — only classic SPL Token mints are supported (Token-2022 rejected)",
+            account.owner
+        ));
+    }
     // SPL Token Mint account is exactly 82 bytes (Token-2022 mints are
     // longer due to extensions, but the base Mint layout is a fixed prefix
     // in both, so this parse is valid for both program versions).
@@ -305,7 +394,7 @@ mod tests {
         // Build a synthetic 82-byte SPL Mint account: COption<Pubkey> tag is
         // a little-endian u32 (0 = None, 1 = Some) at offset 0 (mint_authority)
         // and offset 46 (freeze_authority).
-        let mut data = vec![0u8; 82];
+        let mut data = [0u8; 82];
         data[0..4].copy_from_slice(&1u32.to_le_bytes()); // mint_authority = Some
         data[46..50].copy_from_slice(&0u32.to_le_bytes()); // freeze_authority = None
         let mint_authority_tag = u32::from_le_bytes(data[0..4].try_into().unwrap());
@@ -329,6 +418,7 @@ mod tests {
 
 // ── Holder-concentration gate (operator-approved design) ──
 
+#[cfg(test)]
 fn entry(addr: u8, amount: u64) -> (String, u64) {
     // Deterministic pseudo-pubkey from a single byte.
     let mut pk = [0u8; 32];
@@ -344,12 +434,13 @@ fn holder_stats_excludes_pool_vaults_before_concentration() {
     let vault = Pubkey::new_from_array(vk);
     // Supply 1000; vault holds 800 (pool infrastructure — must not count
     // as a "holder"), one real holder holds 150.
-    let stats = compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[vault]).unwrap();
+    let stats =
+        compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[vault], &[]).unwrap();
     assert_eq!(stats.sampled_holders, 1, "vault must be excluded");
     assert_eq!(stats.top_holder_pct, 15.0);
     assert_eq!(stats.top20_holder_pct, 15.0);
     // Without the vault in the exclusion list it would dominate.
-    let naive = compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[]).unwrap();
+    let naive = compute_holder_stats(1_000, &[entry(9, 800), entry(1, 150)], &[], &[]).unwrap();
     assert_eq!(naive.sampled_holders, 2);
     assert_eq!(naive.top_holder_pct, 80.0);
 }
@@ -361,7 +452,7 @@ fn concentration_gate_accepts_under_both_thresholds() {
     for i in 1..=10u8 {
         es.push(entry(i, 10));
     }
-    let stats = compute_holder_stats(1_000, &es, &[]).unwrap();
+    let stats = compute_holder_stats(1_000, &es, &[], &[]).unwrap();
     assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
 }
 
@@ -369,8 +460,13 @@ fn concentration_gate_accepts_under_both_thresholds() {
 fn concentration_gate_rejects_single_holder_over_30pct() {
     // One holder at 40% (top-20 at 40% too) => single-holder breach fires
     // first with the 30% threshold.
-    let stats =
-        compute_holder_stats(1_000, &[entry(1, 400), entry(2, 100), entry(3, 100)], &[]).unwrap();
+    let stats = compute_holder_stats(
+        1_000,
+        &[entry(1, 400), entry(2, 100), entry(3, 100)],
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(
         holder_concentration_verdict(&stats),
         HolderVerdict::SingleHolderConcentrated(40.0)
@@ -384,7 +480,7 @@ fn concentration_gate_rejects_top20_over_70pct_even_if_single_under_30() {
     for i in 1..=19u8 {
         es.push(entry(i, 40));
     }
-    let stats = compute_holder_stats(1_000, &es, &[]).unwrap();
+    let stats = compute_holder_stats(1_000, &es, &[], &[]).unwrap();
     assert_eq!(stats.sampled_holders, 19);
     assert_eq!(stats.top20_holder_pct, 76.0);
     assert!(matches!(
@@ -396,8 +492,13 @@ fn concentration_gate_rejects_top20_over_70pct_even_if_single_under_30() {
 #[test]
 fn concentration_gate_boundaries_are_inclusive_pass() {
     // Exactly 30% single and exactly 70% top-20 pass (threshold is ">").
-    let stats =
-        compute_holder_stats(1_000, &[entry(1, 300), entry(2, 250), entry(3, 150)], &[]).unwrap();
+    let stats = compute_holder_stats(
+        1_000,
+        &[entry(1, 300), entry(2, 250), entry(3, 150)],
+        &[],
+        &[],
+    )
+    .unwrap();
     assert_eq!(stats.top_holder_pct, 30.0);
     assert_eq!(stats.top20_holder_pct, 70.0);
     assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
@@ -410,7 +511,7 @@ fn concentration_gate_unassessable_fails_closed() {
     let mut vk = [0u8; 32];
     vk[0] = 7;
     let vault = Pubkey::new_from_array(vk);
-    let stats = compute_holder_stats(1_000, &[entry(7, 1_000)], &[vault]).unwrap();
+    let stats = compute_holder_stats(1_000, &[entry(7, 1_000)], &[vault], &[]).unwrap();
     assert_eq!(stats.sampled_holders, 0);
     assert_eq!(
         holder_concentration_verdict(&stats),
@@ -423,9 +524,63 @@ fn concentration_gate_unassessable_fails_closed() {
         top_holder_pct: 1.0,
         top20_holder_pct: 5.0,
         total_supply: 0,
+        program_owned_pct: 0.0,
     };
     assert_eq!(
         holder_concentration_verdict(&stats),
         HolderVerdict::Unassessable
     );
+}
+
+#[test]
+fn program_owned_accounts_are_excluded_but_reported() {
+    // Supply 1000: two PDA-owned accounts (other DEX vault, locker) hold
+    // 500 + 300; three wallets hold 50 each. Without the exclusion the
+    // top-20 share is 95% (reject); with it, 15% (pass).
+    let es = [
+        entry(1, 500),
+        entry(2, 300),
+        entry(3, 50),
+        entry(4, 50),
+        entry(5, 50),
+    ];
+    let pdas = [
+        Pubkey::from_str(&es[0].0).unwrap(),
+        Pubkey::from_str(&es[1].0).unwrap(),
+    ];
+    let naive = compute_holder_stats(1_000, &es, &[], &[]).unwrap();
+    assert_eq!(naive.top20_holder_pct, 95.0);
+    let stats = compute_holder_stats(1_000, &es, &[], &pdas).unwrap();
+    assert_eq!(stats.sampled_holders, 3);
+    assert_eq!(stats.top_holder_pct, 5.0);
+    assert_eq!(stats.top20_holder_pct, 15.0);
+    assert_eq!(stats.program_owned_pct, 80.0);
+    assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
+}
+
+#[test]
+fn wallet_whale_still_rejected_after_pda_exclusion() {
+    // A single on-curve wallet with 40% is still a concentration breach.
+    let es = [entry(1, 500), entry(2, 400), entry(3, 50)];
+    let pdas = [Pubkey::from_str(&es[0].0).unwrap()];
+    let stats = compute_holder_stats(1_000, &es, &[], &pdas).unwrap();
+    assert_eq!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::SingleHolderConcentrated(40.0)
+    );
+}
+
+#[test]
+fn token_account_owner_parses_spl_layout_and_curve_check() {
+    let wallet = solana_sdk::signature::Keypair::new();
+    use solana_sdk::signature::Signer;
+    let (pda, _) = Pubkey::find_program_address(&[b"vault"], &Pubkey::new_unique());
+    for (owner, on_curve) in [(wallet.pubkey(), true), (pda, false)] {
+        let mut data = vec![0u8; 165];
+        data[32..64].copy_from_slice(owner.as_ref());
+        let parsed = token_account_owner(&data).unwrap();
+        assert_eq!(parsed, owner);
+        assert_eq!(parsed.is_on_curve(), on_curve);
+    }
+    assert!(token_account_owner(&[0u8; 40]).is_none());
 }

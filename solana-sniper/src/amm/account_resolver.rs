@@ -71,6 +71,9 @@ pub struct ResolvedPool {
     pub liquidity: u128,
     pub sqrt_price_x64: u128,
     pub tick_current: i32,
+    /// Pool trade fee from its AmmConfig, in parts per million (2500 =
+    /// 0.25%). `None` until `resolve_swap_accounts` reads the AmmConfig.
+    pub trade_fee_rate: Option<u32>,
 }
 
 impl ResolvedPool {
@@ -91,7 +94,28 @@ impl ResolvedPool {
 
     /// Derive the tick-array PDA for the current tick.
     pub fn tick_array_pda(&self, program_id: &Pubkey) -> Pubkey {
+        self.tick_array_pda_at(program_id, self.tick_array_start_index())
+    }
+
+    /// Tick-array PDAs to try for a swap, starting with the array holding
+    /// the current tick and walking in the price direction of the swap
+    /// (`zero_for_one` = selling token0 => price and tick go DOWN).
+    pub fn tick_array_candidates(
+        &self,
+        program_id: &Pubkey,
+        zero_for_one: bool,
+        count: i32,
+    ) -> Vec<Pubkey> {
+        let size = TICK_ARRAY_SIZE * i32::from(self.tick_spacing);
         let start = self.tick_array_start_index();
+        let step = if zero_for_one { -size } else { size };
+        (0..count)
+            .map(|k| self.tick_array_pda_at(program_id, start + k * step))
+            .collect()
+    }
+
+    /// Tick-array PDA for an explicit start index.
+    pub fn tick_array_pda_at(&self, program_id: &Pubkey, start: i32) -> Pubkey {
         let (pda, _) = Pubkey::find_program_address(
             &[TICK_ARRAY_SEED, self.pool_id.as_ref(), &start.to_be_bytes()],
             program_id,
@@ -140,7 +164,69 @@ pub fn parse_pool_state(pool_id: &Pubkey, data: &[u8]) -> Result<ResolvedPool, S
         liquidity,
         sqrt_price_x64,
         tick_current,
+        trade_fee_rate: None,
     })
+}
+
+/// `AmmConfig.trade_fee_rate` (u32 LE, parts per million) — layout:
+/// 8 discriminator + bump u8 + index u16 + owner Pubkey + protocol_fee_rate
+/// u32, so the trade fee starts at byte 47.
+pub fn parse_trade_fee_rate(data: &[u8]) -> Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(47..51)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("AmmConfig data too short ({} bytes)", data.len()))?;
+    let rate = u32::from_le_bytes(bytes);
+    // Raydium fee tiers are 100..=10_000 ppm (0.01%..1%); anything outside
+    // a sane range means a wrong account/layout — fail closed.
+    if rate == 0 || rate > 100_000 {
+        return Err(format!("implausible AmmConfig trade_fee_rate {rate}"));
+    }
+    Ok(rate)
+}
+
+/// Seed of the pool's TickArrayBitmapExtension PDA.
+pub const BITMAP_EXTENSION_SEED: &[u8] = b"pool_tick_array_bitmap_extension";
+/// The pool state's built-in bitmap tracks tick arrays whose start index is
+/// within ±512 arrays of tick 0; beyond that Raydium needs the extension.
+pub const DEFAULT_BITMAP_ARRAYS: i32 = 512;
+
+/// The pool's tick-array bitmap extension PDA.
+pub fn bitmap_extension_pda(pool_id: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[BITMAP_EXTENSION_SEED, pool_id.as_ref()], program_id).0
+}
+
+/// True when a swap scanning `scan` arrays from the current tick could
+/// leave the range of the pool's built-in bitmap (so the extension account
+/// must be supplied). Normal pools never get close to this.
+pub fn needs_bitmap_extension(tick_current: i32, tick_spacing: u16, scan: i32) -> bool {
+    let size = i64::from(TICK_ARRAY_SIZE) * i64::from(tick_spacing);
+    let limit = i64::from(DEFAULT_BITMAP_ARRAYS) * size;
+    i64::from(tick_current).abs() + i64::from(scan + 1) * size >= limit
+}
+
+/// Maximum tick arrays passed to a swap (the account in the instruction
+/// plus remaining accounts) and how far to scan for initialized ones.
+pub const MAX_SWAP_TICK_ARRAYS: usize = 3;
+pub const TICK_ARRAY_SCAN: i32 = 10;
+
+/// Pick the tick arrays for a swap: the candidates (in swap direction) that
+/// exist on-chain and are owned by the CLMM program, first `MAX` of them.
+/// Raydium requires the first *initialized* array in the swap direction as
+/// the instruction's tick-array account; an uninitialized PDA (the array of
+/// the current tick can be empty) makes the swap fail on-chain.
+pub fn select_tick_arrays(
+    candidates: &[Pubkey],
+    owners: &[Option<Pubkey>],
+    program_id: &Pubkey,
+) -> Vec<Pubkey> {
+    candidates
+        .iter()
+        .zip(owners.iter())
+        .filter(|(_, owner)| owner.as_ref() == Some(program_id))
+        .map(|(pk, _)| *pk)
+        .take(MAX_SWAP_TICK_ARRAYS)
+        .collect()
 }
 
 fn read_pubkey(c: &mut Cursor<&[u8]>) -> Result<Pubkey, String> {
@@ -163,10 +249,56 @@ pub fn resolve_user_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 /// Fetch and parse a pool state account from the RPC.
-pub fn fetch_pool_state(rpc: &RpcClient, pool_id: &Pubkey) -> Result<ResolvedPool, String> {
+/// Anchor account discriminator: sha256("account:<Name>")[..8].
+pub fn anchor_account_discriminator(name: &str) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(format!("account:{name}").as_bytes());
+    let mut d = [0u8; 8];
+    d.copy_from_slice(&h[..8]);
+    d
+}
+
+/// Fail-closed identity check of a CLMM program account: it must be owned
+/// by `program_id` and carry the Anchor discriminator of `kind` (e.g.
+/// "PoolState", "AmmConfig"). Without it any account with a matching byte
+/// layout (another program's, or a wrong cluster's) would be parsed and fed
+/// into the price / liquidity / fee data the risk gates rely on.
+pub fn verify_clmm_account(
+    kind: &str,
+    key: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+    program_id: &Pubkey,
+) -> Result<(), String> {
+    if owner != program_id {
+        return Err(format!(
+            "{kind} {key} is owned by {owner}, not the CLMM program {program_id} (fail-closed)"
+        ));
+    }
+    if data.get(..8) != Some(&anchor_account_discriminator(kind)[..]) {
+        return Err(format!(
+            "{key} is not a CLMM {kind} account (discriminator mismatch, fail-closed)"
+        ));
+    }
+    Ok(())
+}
+
+/// Fetch, verify (owner + discriminator) and parse a CLMM pool state.
+pub fn fetch_pool_state(
+    rpc: &RpcClient,
+    pool_id: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<ResolvedPool, String> {
     let account = rpc
         .get_account(pool_id)
         .map_err(|e| format!("failed to fetch pool state {pool_id}: {e}"))?;
+    verify_clmm_account(
+        "PoolState",
+        pool_id,
+        &account.owner,
+        &account.data,
+        program_id,
+    )?;
     parse_pool_state(pool_id, &account.data)
 }
 
@@ -182,7 +314,7 @@ pub fn resolve_swap_accounts(
     output_mint: &Pubkey,
     program_id: &Pubkey,
 ) -> Result<(SwapAccounts, ResolvedPool), String> {
-    let pool = fetch_pool_state(rpc, pool_id)?;
+    let mut pool = fetch_pool_state(rpc, pool_id, program_id)?;
 
     // Determine which vault is the input/output based on the requested mints.
     let (input_vault, output_vault) = if input_mint == &pool.token_mint_0 {
@@ -198,7 +330,56 @@ pub fn resolve_swap_accounts(
 
     let input_token_account = resolve_user_ata(user, input_mint);
     let output_token_account = resolve_user_ata(user, output_mint);
-    let tick_array = pool.tick_array_pda(program_id);
+
+    // One RPC round trip for the AmmConfig (real fee tier) and the
+    // tick-array candidates in the swap direction.
+    let zero_for_one = input_mint == &pool.token_mint_0;
+    let candidates = pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN);
+    let ext_needed = needs_bitmap_extension(pool.tick_current, pool.tick_spacing, TICK_ARRAY_SCAN);
+    let ext_pda = bitmap_extension_pda(pool_id, program_id);
+    let mut keys = Vec::with_capacity(candidates.len() + 2);
+    keys.push(pool.amm_config);
+    keys.extend_from_slice(&candidates);
+    if ext_needed {
+        keys.push(ext_pda);
+    }
+    let fetched = rpc
+        .get_multiple_accounts(&keys)
+        .map_err(|e| format!("failed to fetch amm config / tick arrays for {pool_id}: {e}"))?;
+    let amm_config = fetched
+        .first()
+        .and_then(|a| a.as_ref())
+        .ok_or_else(|| format!("amm config {} not found", pool.amm_config))?;
+    verify_clmm_account(
+        "AmmConfig",
+        &pool.amm_config,
+        &amm_config.owner,
+        &amm_config.data,
+        program_id,
+    )?;
+    pool.trade_fee_rate = Some(parse_trade_fee_rate(&amm_config.data)?);
+    let bitmap_extension = if ext_needed {
+        match fetched.get(1 + candidates.len()).and_then(|a| a.as_ref()) {
+            Some(acc) if &acc.owner == program_id => Some(ext_pda),
+            _ => {
+                return Err(format!(
+                    "pool {pool_id} trades near the edge of its tick bitmap but has no bitmap extension account (fail-closed)"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let owners: Vec<Option<Pubkey>> = fetched[1..1 + candidates.len()]
+        .iter()
+        .map(|a| a.as_ref().map(|acc| acc.owner))
+        .collect();
+    let arrays = select_tick_arrays(&candidates, &owners, program_id);
+    let Some((&tick_array, extra)) = arrays.split_first() else {
+        return Err(format!(
+            "no initialized tick array within {TICK_ARRAY_SCAN} arrays of the current tick in pool {pool_id} (fail-closed)"
+        ));
+    };
 
     let accounts = SwapAccounts {
         amm_config: pool.amm_config,
@@ -209,6 +390,8 @@ pub fn resolve_swap_accounts(
         output_vault,
         observation_state: pool.observation_key,
         tick_array,
+        extra_tick_arrays: extra.to_vec(),
+        bitmap_extension,
     };
 
     Ok((accounts, pool))
@@ -218,7 +401,38 @@ pub fn resolve_swap_accounts(
 mod tests {
     use super::*;
 
+    #[test]
+    fn clmm_account_discriminators_match_anchor() {
+        // sha256("account:PoolState")[..8] / sha256("account:AmmConfig")[..8]
+        // as published in the Raydium CLMM IDL.
+        assert_eq!(
+            anchor_account_discriminator("PoolState"),
+            [247, 237, 227, 245, 215, 195, 222, 70]
+        );
+        assert_eq!(
+            anchor_account_discriminator("AmmConfig"),
+            [218, 244, 33, 104, 203, 203, 43, 111]
+        );
+    }
+
+    #[test]
+    fn verify_clmm_account_is_fail_closed() {
+        let program = Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap();
+        let key = Pubkey::new_unique();
+        let mut data = anchor_account_discriminator("PoolState").to_vec();
+        data.extend_from_slice(&[0u8; 300]);
+        assert!(verify_clmm_account("PoolState", &key, &program, &data, &program).is_ok());
+        // Wrong owner (e.g. a look-alike account of another program).
+        let other = Pubkey::new_unique();
+        assert!(verify_clmm_account("PoolState", &key, &other, &data, &program).is_err());
+        // Right owner, wrong account type.
+        assert!(verify_clmm_account("AmmConfig", &key, &program, &data, &program).is_err());
+        // Too short.
+        assert!(verify_clmm_account("PoolState", &key, &program, &data[..4], &program).is_err());
+    }
+
     /// Build a synthetic 273-byte pool state buffer with known field values.
+    #[allow(clippy::too_many_arguments)]
     fn synthetic_pool_data(
         amm_config: &Pubkey,
         mint0: &Pubkey,
@@ -399,7 +613,7 @@ mod tests {
         let pool = parse_pool_state(&pool_id, &data).unwrap();
 
         // input = mint0 => input_vault = vault0, output_vault = vault1.
-        let (iv, ov) = if &mint0 == &pool.token_mint_0 {
+        let (iv, ov) = if mint0 == pool.token_mint_0 {
             (pool.token_vault_0, pool.token_vault_1)
         } else {
             (pool.token_vault_1, pool.token_vault_0)
@@ -410,5 +624,82 @@ mod tests {
         // tick array PDA is deterministic and non-zero.
         let ta = pool.tick_array_pda(&program_id);
         assert_ne!(ta, Pubkey::default());
+    }
+
+    #[test]
+    fn tick_array_candidates_walk_in_swap_direction() {
+        let program_id = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let data = synthetic_pool_data(
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            1u128 << 64,
+            0,
+            -130,
+            10,
+        );
+        let pool = parse_pool_state(&pool_id, &data).unwrap();
+        let size = TICK_ARRAY_SIZE * i32::from(pool.tick_spacing);
+        let start = pool.tick_array_start_index();
+        let down = pool.tick_array_candidates(&program_id, true, 3);
+        let up = pool.tick_array_candidates(&program_id, false, 3);
+        assert_eq!(down[0], up[0], "both start at the current tick's array");
+        assert_eq!(down[1], pool.tick_array_pda_at(&program_id, start - size));
+        assert_eq!(up[1], pool.tick_array_pda_at(&program_id, start + size));
+        assert_eq!(
+            down[2],
+            pool.tick_array_pda_at(&program_id, start - 2 * size)
+        );
+    }
+
+    #[test]
+    fn select_tick_arrays_skips_uninitialized_and_caps() {
+        let program_id = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let c: Vec<Pubkey> = (0..6).map(|_| Pubkey::new_unique()).collect();
+        // current array missing, then a foreign-owned account, then 4 valid
+        let owners = vec![
+            None,
+            Some(other),
+            Some(program_id),
+            Some(program_id),
+            Some(program_id),
+            Some(program_id),
+        ];
+        let sel = select_tick_arrays(&c, &owners, &program_id);
+        assert_eq!(sel, vec![c[2], c[3], c[4]]);
+        assert!(select_tick_arrays(&c, &[None; 6], &program_id).is_empty());
+    }
+
+    #[test]
+    fn bitmap_extension_only_needed_near_the_bitmap_edge() {
+        // spacing 60: built-in bitmap covers |tick| < 512*60*60 = 1_843_200,
+        // beyond Solana's max tick (443_636) — never needed.
+        assert!(!needs_bitmap_extension(443_636, 60, TICK_ARRAY_SCAN));
+        // spacing 1: covers |tick| < 30_720.
+        assert!(!needs_bitmap_extension(0, 1, TICK_ARRAY_SCAN));
+        assert!(!needs_bitmap_extension(-20_000, 1, TICK_ARRAY_SCAN));
+        assert!(needs_bitmap_extension(30_100, 1, TICK_ARRAY_SCAN));
+        assert!(needs_bitmap_extension(-40_000, 1, TICK_ARRAY_SCAN));
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        assert_eq!(
+            bitmap_extension_pda(&pool, &program),
+            bitmap_extension_pda(&pool, &program)
+        );
+    }
+
+    #[test]
+    fn trade_fee_rate_parses_amm_config_layout() {
+        let mut data = vec![0u8; 117];
+        data[47..51].copy_from_slice(&2500u32.to_le_bytes());
+        assert_eq!(parse_trade_fee_rate(&data).unwrap(), 2500);
+        assert!(parse_trade_fee_rate(&data[..40]).is_err());
+        let zero = vec![0u8; 117];
+        assert!(parse_trade_fee_rate(&zero).is_err());
     }
 }

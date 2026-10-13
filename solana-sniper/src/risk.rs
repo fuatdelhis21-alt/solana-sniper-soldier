@@ -299,7 +299,7 @@ impl RiskManager {
     /// - No file: fresh start, state is trivially verified (all-zero).
     /// - File present and parses: verified, counters restored.
     /// - File present but corrupt/unreadable: NOT verified (fail-closed).
-    fn load_state(data_dir: &PathBuf) -> (PersistedRiskState, bool) {
+    fn load_state(data_dir: &std::path::Path) -> (PersistedRiskState, bool) {
         let path = data_dir.join("risk_state.json");
         if !path.exists() {
             return (PersistedRiskState::default(), true);
@@ -834,9 +834,11 @@ mod tests {
 
     #[test]
     fn audit_log_written_on_kill_switch() {
-        let rm = RiskManager::new(test_config());
+        let cfg = test_config();
+        let data_dir = cfg.data_dir.clone();
+        let rm = RiskManager::new(cfg);
         rm.trigger_kill_switch("unit test");
-        let path = std::env::temp_dir().join("audit").join("risk_audit.jsonl");
+        let path = data_dir.join("audit").join("risk_audit.jsonl");
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("kill_switch_triggered"));
         assert!(content.contains("unit test"));

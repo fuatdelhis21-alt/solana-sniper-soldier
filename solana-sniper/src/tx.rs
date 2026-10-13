@@ -40,6 +40,6 @@ pub fn build_transfer_tx(
     lamports: u64,
     blockhash: Hash,
 ) -> Transaction {
-    let ix = solana_sdk::system_instruction::transfer(&signer.pubkey(), to, lamports);
+    let ix = solana_system_interface::instruction::transfer(&signer.pubkey(), to, lamports);
     build_signed_tx(signer, &[ix], blockhash, 10_000, 200_000)
 }

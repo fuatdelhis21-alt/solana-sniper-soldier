@@ -9,8 +9,15 @@
 //!
 //! ## Key source
 //! The signing key is loaded from the `HSM_KEY_B64` environment variable
-//! (base64-encoded 64-byte private key bytes). If unset/invalid, an ephemeral
-//! keypair is generated at startup (dev/test scaffold only).
+//! (base64-encoded 64-byte private key bytes). Fail-closed: a missing or
+//! invalid key stops the server. A throwaway ephemeral key is used ONLY with
+//! the explicit `--dev-ephemeral-key` flag (CI / local tests; never set by
+//! the systemd unit). No environment variable can enable the fallback.
+//!
+//! ## Signing policy
+//! Every transaction is checked by [`policy::check`] before it is signed:
+//! only the bot's swap / wrap / tip shapes, with all funds staying in the
+//! signer's own accounts (see policy.rs). Anything else is refused (HTTP 400).
 //!
 //! ## mTLS
 //! When `server.pem`, `server.key` and `ca.pem` exist in the certs directory,
@@ -35,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::transaction::Transaction;
 use warp::Filter;
+
+mod policy;
 
 /// Sign request body.
 #[derive(Deserialize)]
@@ -93,33 +102,53 @@ impl AuditLogger {
     }
 }
 
-/// Load signer from `HSM_KEY_B64`, otherwise generate an ephemeral keypair.
-fn load_or_create_signer() -> Keypair {
-    if let Ok(key_b64) = std::env::var("HSM_KEY_B64") {
-        if let Ok(bytes) = general_purpose::STANDARD.decode(key_b64) {
-            if let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice()) {
-                if let Ok(kp) = Keypair::from_bytes(&arr) {
-                    return kp;
-                }
+/// Load the signer from `HSM_KEY_B64`. Fail-closed: exits when the key is
+/// missing or invalid, unless `dev_ephemeral` (the `--dev-ephemeral-key`
+/// CLI flag) explicitly asks for a throwaway key.
+fn load_signer(dev_ephemeral: bool) -> Keypair {
+    match std::env::var("HSM_KEY_B64")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(key_b64) => match parse_key(&key_b64) {
+            Some(kp) => kp,
+            None => {
+                eprintln!("[hsm_server] FATAL: HSM_KEY_B64 is not a valid base64 64-byte keypair (fail-closed)");
+                std::process::exit(1);
             }
+        },
+        None if dev_ephemeral => {
+            let kp = Keypair::new();
+            println!(
+                "[hsm_server] WARNING: --dev-ephemeral-key: throwaway signer {} (never use with funds)",
+                kp.pubkey()
+            );
+            kp
         }
-        println!("[hsm_server] HSM_KEY_B64 invalid; using ephemeral keypair");
+        None => {
+            eprintln!("[hsm_server] FATAL: HSM_KEY_B64 missing (fail-closed; --dev-ephemeral-key is for tests only)");
+            std::process::exit(1);
+        }
     }
-    let kp = Keypair::new();
-    println!("[hsm_server] ephemeral signer pubkey: {}", kp.pubkey());
-    kp
+}
+
+fn parse_key(key_b64: &str) -> Option<Keypair> {
+    let bytes = general_purpose::STANDARD.decode(key_b64.trim()).ok()?;
+    let arr = <[u8; 64]>::try_from(bytes.as_slice()).ok()?;
+    Keypair::try_from(&arr[..]).ok()
 }
 
 /// Sign a base64-encoded bincode `Transaction`, returning the base64 signature.
 ///
 /// On invalid input this returns a Result so the caller can log a safe,
 /// non-sensitive error reason (never the raw payload).
-fn sign_tx_result(tx_b64: &str, kp: &Keypair) -> Result<String, String> {
+fn sign_tx_result(tx_b64: &str, kp: &Keypair, policy: &policy::Policy) -> Result<String, String> {
     let tx_bytes = general_purpose::STANDARD
         .decode(tx_b64)
         .map_err(|_| "invalid base64 in tx field".to_string())?;
     let tx: Transaction =
         bincode::deserialize(&tx_bytes).map_err(|_| "invalid bincode transaction".to_string())?;
+    policy::check(&tx.message, &kp.pubkey(), policy).map_err(|e| format!("policy: {e}"))?;
     let msg = tx.message.serialize();
     let sig = kp.sign_message(&msg);
     Ok(general_purpose::STANDARD.encode(sig.as_ref()))
@@ -150,10 +179,12 @@ fn build_audit_line(
     line.to_string()
 }
 
-/// Minimal CLI arg parser: `--certs <dir>` and `--log-file <path>`.
-fn parse_args() -> (PathBuf, Option<PathBuf>) {
+/// Minimal CLI arg parser: `--certs <dir>`, `--log-file <path>`,
+/// `--dev-ephemeral-key`.
+fn parse_args() -> (PathBuf, Option<PathBuf>, bool) {
     let mut certs_dir = PathBuf::from("certs");
     let mut log_file: Option<PathBuf> = None;
+    let mut dev_ephemeral = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -170,21 +201,36 @@ fn parse_args() -> (PathBuf, Option<PathBuf>) {
                     log_file = Some(PathBuf::from(&args[i]));
                 }
             }
+            "--dev-ephemeral-key" => dev_ephemeral = true,
             _ => {}
         }
         i += 1;
     }
-    (certs_dir, log_file)
+    (certs_dir, log_file, dev_ephemeral)
 }
 
 #[tokio::main]
 async fn main() {
-    let (certs_dir, log_file) = parse_args();
-    let signer = Arc::new(load_or_create_signer());
+    let (certs_dir, log_file, dev_ephemeral) = parse_args();
+    let signer = Arc::new(load_signer(dev_ephemeral));
+    let policy = match policy::Policy::from_env() {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("[hsm_server] FATAL: invalid signing policy config: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "[hsm_server] signing policy: max transfer out {} lamports, max CU price {}, {} extra destination(s)",
+        policy.max_transfer_lamports,
+        policy.max_cu_price_micro_lamports,
+        policy.extra_destinations.len()
+    );
     let audit = std::sync::Arc::new(AuditLogger::new(log_file));
 
     let audit2 = audit.clone();
     let signer2 = signer.clone();
+    let policy2 = policy.clone();
     let sign = warp::post()
         .and(warp::path("sign"))
         .and(warp::body::json())
@@ -194,14 +240,21 @@ async fn main() {
                 .unwrap_or_default()
                 .as_millis();
             let fallback = general_purpose::STANDARD.encode([0u8; 64]);
-            let (signature, status, error) = match sign_tx_result(&req.tx, &signer2) {
+            let (signature, status, error) = match sign_tx_result(&req.tx, &signer2, &policy2) {
                 Ok(sig) => (sig, "signed", None),
                 Err(e) => (fallback, "failed", Some(e)),
             };
             let line =
                 build_audit_line(now_ms, &request_id(), &signature, status, error.as_deref());
             audit2.log(&line.to_string());
-            warp::reply::json(&SignResponse { signature })
+            // A failed signing request is an HTTP error, never a 200 with a
+            // placeholder signature a client could mistake for a real one.
+            let code = if error.is_some() {
+                warp::http::StatusCode::BAD_REQUEST
+            } else {
+                warp::http::StatusCode::OK
+            };
+            warp::reply::with_status(warp::reply::json(&SignResponse { signature }), code)
         });
 
     // Public-key endpoint: lets the client build transactions without ever
@@ -247,7 +300,8 @@ mod tests {
     /// Build a valid unsigned transaction serialized to base64 bincode.
     fn valid_tx_b64(kp: &Keypair) -> String {
         let from = kp.pubkey();
-        let to = solana_sdk::pubkey::Pubkey::new_from_array([0u8; 32]);
+        let to = from; // self-transfer: allowed by the signing policy
+        #[allow(deprecated)]
         let ix = solana_sdk::system_instruction::transfer(&from, &to, 1_000);
         let msg = solana_sdk::message::Message::new(&[ix], Some(&from));
         let tx = solana_sdk::transaction::Transaction::new_unsigned(msg);
@@ -258,7 +312,7 @@ mod tests {
     #[test]
     fn sign_tx_result_ok_returns_64_byte_base64() {
         let kp = Keypair::new();
-        let sig_b64 = sign_tx_result(&valid_tx_b64(&kp), &kp).unwrap();
+        let sig_b64 = sign_tx_result(&valid_tx_b64(&kp), &kp, &policy::Policy::default()).unwrap();
         let decoded = general_purpose::STANDARD.decode(sig_b64).unwrap();
         assert_eq!(decoded.len(), 64);
     }
@@ -266,7 +320,7 @@ mod tests {
     #[test]
     fn sign_tx_result_reports_invalid_base64() {
         let kp = Keypair::new();
-        let err = sign_tx_result("!!!not-base64!!!", &kp).unwrap_err();
+        let err = sign_tx_result("!!!not-base64!!!", &kp, &policy::Policy::default()).unwrap_err();
         assert!(err.contains("base64"));
     }
 
@@ -274,8 +328,34 @@ mod tests {
     fn sign_tx_result_reports_invalid_bincode() {
         let kp = Keypair::new();
         let input = general_purpose::STANDARD.encode(vec![0u8; 32]);
-        let err = sign_tx_result(&input, &kp).unwrap_err();
+        let err = sign_tx_result(&input, &kp, &policy::Policy::default()).unwrap_err();
         assert!(err.contains("bincode"));
+    }
+
+    #[test]
+    fn sign_tx_result_refuses_policy_violation() {
+        let kp = Keypair::new();
+        let thief = solana_sdk::pubkey::Pubkey::new_unique();
+        #[allow(deprecated)]
+        let ix = solana_sdk::system_instruction::transfer(&kp.pubkey(), &thief, 1_000_000_000);
+        let msg = solana_sdk::message::Message::new(&[ix], Some(&kp.pubkey()));
+        let tx = solana_sdk::transaction::Transaction::new_unsigned(msg);
+        let b64 = general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let err = sign_tx_result(&b64, &kp, &policy::Policy::default()).unwrap_err();
+        assert!(err.starts_with("policy:"), "{err}");
+    }
+
+    #[test]
+    fn parse_key_accepts_only_valid_64_byte_keypairs() {
+        let kp = Keypair::new();
+        let good = general_purpose::STANDARD.encode(kp.to_bytes());
+        assert_eq!(parse_key(&good).unwrap().pubkey(), kp.pubkey());
+        assert!(parse_key("not base64!").is_none());
+        assert!(parse_key(&general_purpose::STANDARD.encode([7u8; 32])).is_none());
+        // 64 bytes whose public half does not match the secret half.
+        let mut bad = kp.to_bytes();
+        bad[63] ^= 1;
+        assert!(parse_key(&general_purpose::STANDARD.encode(bad)).is_none());
     }
 
     #[test]

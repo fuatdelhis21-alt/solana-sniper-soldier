@@ -11,15 +11,27 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::{MarketDataHandler, PriceQuote};
 
-/// Raydium V4 CLMM program ID (mainnet)
-pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3";
+/// Raydium CLMM program ID (mainnet). Must match
+/// `solana-sniper::amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID`.
+pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+/// Raydium CLMM program ID (devnet).
+pub const RAYDIUM_CLMM_PROGRAM_ID_DEVNET: &str = "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH";
+
+/// Select the CLMM program id by cluster (same rule as the bot: an RPC/WS
+/// URL containing "devnet" means devnet, anything else mainnet).
+pub fn clmm_program_id_for(url: &str) -> &'static str {
+    if url.contains("devnet") {
+        RAYDIUM_CLMM_PROGRAM_ID_DEVNET
+    } else {
+        RAYDIUM_CLMM_PROGRAM_ID
+    }
+}
 
 /// Real Raydium CLMM `PoolState` account size (zero_copy layout, including
 /// the 8-byte Anchor discriminator). Mirrors
@@ -66,7 +78,7 @@ impl SolanaWsProvider {
     /// memcmp filter is applied — computing the correct Anchor discriminator
     /// bytes is unnecessary since `dataSize` already narrows the subscription
     /// to CLMM-pool-shaped accounts under this program.
-    fn build_subscribe_request() -> String {
+    fn build_subscribe_request(program_id: &str) -> String {
         format!(
             r#"{{
                 "jsonrpc": "2.0",
@@ -83,7 +95,7 @@ impl SolanaWsProvider {
                     }}
                 ]
             }}"#,
-            RAYDIUM_CLMM_PROGRAM_ID, CLMM_POOL_STATE_SIZE
+            program_id, CLMM_POOL_STATE_SIZE
         )
     }
 
@@ -164,6 +176,7 @@ impl MarketDataHandler for SolanaWsProvider {
         let prices = self.prices.clone();
         let pools = self.pools.clone();
         let connected = self.connected.clone();
+        let program_id = clmm_program_id_for(&format!("{} {}", self.rpc_url, self.ws_url));
 
         tokio::spawn(async move {
             loop {
@@ -176,7 +189,7 @@ impl MarketDataHandler for SolanaWsProvider {
                         let (mut write, mut read) = ws_stream.split();
 
                         // Send programSubscribe request
-                        let subscribe_msg = SolanaWsProvider::build_subscribe_request();
+                        let subscribe_msg = SolanaWsProvider::build_subscribe_request(program_id);
                         if let Err(e) = write.send(Message::text(subscribe_msg.clone())).await {
                             tracing::error!(target: "solana_ws", error = %e, "failed to send subscribe");
                             *connected.write() = false;
@@ -357,8 +370,22 @@ mod tests {
 
     #[test]
     fn subscribe_request_uses_real_pool_state_size() {
-        let req = SolanaWsProvider::build_subscribe_request();
+        let req = SolanaWsProvider::build_subscribe_request(RAYDIUM_CLMM_PROGRAM_ID);
         assert!(req.contains(&CLMM_POOL_STATE_SIZE.to_string()));
         assert!(!req.contains("752"));
+    }
+
+    #[test]
+    fn subscribe_request_targets_cluster_program_id() {
+        assert_eq!(
+            clmm_program_id_for("https://api.devnet.solana.com"),
+            RAYDIUM_CLMM_PROGRAM_ID_DEVNET
+        );
+        assert_eq!(
+            clmm_program_id_for("https://mainnet.helius-rpc.com"),
+            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+        );
+        let req = SolanaWsProvider::build_subscribe_request(RAYDIUM_CLMM_PROGRAM_ID);
+        assert!(req.contains("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"));
     }
 }

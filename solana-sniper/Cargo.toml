@@ -37,6 +37,7 @@ solana-signature.workspace = true
 solana-pubkey.workspace = true
 solana-commitment-config.workspace = true
 solana-transaction-status.workspace = true
+solana-system-interface.workspace = true
 
 sha2.workspace = true
 byteorder.workspace = true
@@ -64,3 +65,7 @@ path = "src/bin/ledger_sign_test.rs"
 [[bin]]
 name = "devnet_swap_test"
 path = "src/bin/devnet_swap_test.rs"
+
+[[bin]]
+name = "pool-sniper"
+path = "src/bin/pool_sniper.rs"

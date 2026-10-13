@@ -1,0 +1,57 @@
+[Unit]
+Description=Solana HFT new-pool sniper (pool-sniper supervisor -> solana-sniper)
+Documentation=file:///opt/solana-hft/README_DEPLOY.md
+After=network-online.target solana-hsm.service
+Wants=network-online.target
+# Same wallet, data dir and risk state as the fixed-pool bot: never run both.
+Conflicts=solana-hft.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=solana
+Group=solana
+# Defaults; /etc/solana-hft/solana-hft.env overrides them (EnvironmentFile wins).
+# The per-pool settings (mode, pool, mints, iterations) of the spawned
+# solana-sniper processes are always set by pool-sniper itself.
+Environment=SNIPER_DATA_DIR=/var/lib/solana-hft
+Environment=SNIPER_DISCOVERY_MODE=paper
+EnvironmentFile=/etc/solana-hft/solana-hft.env
+WorkingDirectory=/var/lib/solana-hft
+StateDirectory=solana-hft
+ExecStart=/opt/solana-hft/bin/pool-sniper
+Restart=on-failure
+RestartSec=10s
+# SIGTERM reaches the supervisor and the running trading process; an open
+# live position stays persisted and is resumed on the next start.
+KillSignal=SIGTERM
+TimeoutStopSec=300
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+ReadWritePaths=/var/lib/solana-hft
+ReadOnlyPaths=/etc/solana-hft
+
+[Install]
+WantedBy=multi-user.target

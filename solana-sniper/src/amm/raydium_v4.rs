@@ -3,7 +3,8 @@
 //! Implements `AmmAdapter` for Raydium's Concentrated Liquidity Market Maker (CLMM).
 //!
 //! ## Program ID
-//! Mainnet: `CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3`
+//! Mainnet: `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK` (single source of
+//! truth: [`crate::amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID`]).
 
 use crate::amm::account_resolver::ResolvedPool;
 use crate::amm::{AmmAdapter, Quote, TradeIntent};
@@ -15,10 +16,37 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
 use std::str::FromStr;
 
-/// Raydium CLMM mainnet program ID.
-pub const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YLJbYF7r5WjRvb3mU1KJkNYfi3hqnZFN5gK3";
+/// Raydium CLMM mainnet program ID — re-exported from the account resolver so
+/// the swap instruction and the PDA derivations can never disagree again
+/// (the old constant here matched no mainnet pool, so every swap would have
+/// been sent to a non-existent program).
+pub use crate::amm::account_resolver::RAYDIUM_CLMM_PROGRAM_ID;
 /// SPL Token program ID.
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Associated Token Account program ID.
+pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+/// Wrapped SOL (native) mint.
+pub const NATIVE_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Transaction-level options for a real, sendable swap transaction.
+#[derive(Debug, Clone)]
+pub struct SwapTxOptions {
+    /// Mint the user pays with (the swap input side).
+    pub input_mint: Pubkey,
+    /// Mint the user receives (the swap output side).
+    pub output_mint: Pubkey,
+    /// Compute unit limit (0 = leave the runtime default, no instruction).
+    pub compute_unit_limit: u32,
+    /// Priority fee in micro-lamports per CU (0 = no priority fee).
+    pub priority_fee_micro_lamports: u64,
+    /// Close the (non-native) input token account after the swap. Set on an
+    /// exit that sells the whole balance, so the ATA rent comes back too.
+    pub close_input_token_account: bool,
+    /// Jito tip `(tip account, lamports)` appended as the last instruction
+    /// when submitting through a Block Engine (bundles without a tip are
+    /// dropped). `None` for plain RPC submission.
+    pub jito_tip: Option<(Pubkey, u64)>,
+}
 
 /// Anchor discriminator for `global:swap` = sha256("global:swap")[0..8].
 pub const SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
@@ -40,8 +68,15 @@ pub struct SwapAccounts {
     pub output_vault: Pubkey,
     /// Observation (oracle) state account.
     pub observation_state: Pubkey,
-    /// Tick array account for the current tick.
+    /// First initialized tick array in the swap direction.
     pub tick_array: Pubkey,
+    /// Further initialized tick arrays in the swap direction, passed as
+    /// remaining accounts so a swap may cross array boundaries.
+    pub extra_tick_arrays: Vec<Pubkey>,
+    /// The pool's tick-array bitmap extension, only when the price is near
+    /// the edge of the built-in bitmap (Raydium reads it as the FIRST
+    /// remaining account). `None` for normal pools.
+    pub bitmap_extension: Option<Pubkey>,
 }
 
 /// Adapter for Raydium V4 CLMM pools.
@@ -121,7 +156,7 @@ impl RaydiumV4ClmmAdapter {
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID)
             .map_err(|e| format!("invalid token program id: {e}"))?;
 
-        let metas = vec![
+        let mut metas = vec![
             AccountMeta::new(*signer, true), // payer (signer)
             AccountMeta::new_readonly(accounts.amm_config, false),
             AccountMeta::new(accounts.pool_state, false),
@@ -133,6 +168,15 @@ impl RaydiumV4ClmmAdapter {
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new(accounts.tick_array, false),
         ];
+        if let Some(ext) = accounts.bitmap_extension {
+            metas.push(AccountMeta::new_readonly(ext, false));
+        }
+        metas.extend(
+            accounts
+                .extra_tick_arrays
+                .iter()
+                .map(|pk| AccountMeta::new(*pk, false)),
+        );
 
         Ok(Instruction {
             program_id,
@@ -154,6 +198,109 @@ impl RaydiumV4ClmmAdapter {
         sqrt_f64 * sqrt_f64
     }
 
+    /// True when the swap input is the pool's token0 (selling token0 for
+    /// token1). Derived from the resolved swap accounts' input vault; without
+    /// accounts the legacy token0 -> token1 direction is assumed.
+    pub fn input_is_token0(&self) -> bool {
+        match (&self.accounts, &self.pool) {
+            (Some(a), Some(p)) => a.input_vault != p.token_vault_1,
+            _ => true,
+        }
+    }
+
+    /// Expected token0 output when selling `input_amount` of token1:
+    /// amount_out = (amount_in / price) * (1 - fee_rate).
+    pub fn compute_output_amount_reverse(
+        input_amount: u64,
+        sqrt_price: u128,
+        fee_rate_bps: u64,
+    ) -> u64 {
+        let price = Self::sqrt_price_to_price(sqrt_price);
+        if price <= 0.0 {
+            return 0;
+        }
+        let gross_output = (input_amount as f64 / price) as u64;
+        let fee = gross_output * fee_rate_bps / 1_000_000;
+        gross_output.saturating_sub(fee)
+    }
+
+    /// Build a complete, sendable swap transaction: compute budget (limit +
+    /// priority fee), idempotent creation of the user's input/output ATAs,
+    /// SOL wrapping when paying with native SOL, the CLMM swap itself, and
+    /// unwrapping (closing) any wSOL account at the end so proceeds land as
+    /// plain lamports. Without the ATA/wSOL setup a buy of a fresh token
+    /// fails on-chain because the output token account does not exist.
+    pub fn build_swap_transaction(
+        &self,
+        intent: &TradeIntent,
+        signer: &Pubkey,
+        blockhash: Hash,
+        opts: &SwapTxOptions,
+    ) -> Result<Transaction, Box<dyn std::error::Error>> {
+        let accounts = self
+            .accounts
+            .as_ref()
+            .ok_or("swap accounts not set — call with_swap_accounts first")?;
+        let native_mint = Pubkey::from_str(NATIVE_MINT)?;
+        let mut ixs: Vec<Instruction> = Vec::with_capacity(8);
+
+        if opts.compute_unit_limit > 0 {
+            ixs.push(
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                    opts.compute_unit_limit,
+                ),
+            );
+        }
+        if opts.priority_fee_micro_lamports > 0 {
+            ixs.push(
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                    opts.priority_fee_micro_lamports,
+                ),
+            );
+        }
+
+        ixs.push(create_ata_idempotent_ix(
+            signer,
+            &accounts.input_token_account,
+            &opts.input_mint,
+        )?);
+        ixs.push(create_ata_idempotent_ix(
+            signer,
+            &accounts.output_token_account,
+            &opts.output_mint,
+        )?);
+
+        if opts.input_mint == native_mint {
+            ixs.push(solana_system_interface::instruction::transfer(
+                signer,
+                &accounts.input_token_account,
+                intent.quote.input_amount,
+            ));
+            ixs.push(sync_native_ix(&accounts.input_token_account)?);
+        }
+
+        ixs.push(self.build_swap_instruction(intent, signer)?);
+
+        if opts.input_mint == native_mint || opts.close_input_token_account {
+            ixs.push(close_account_ix(&accounts.input_token_account, signer)?);
+        }
+        if opts.output_mint == native_mint {
+            ixs.push(close_account_ix(&accounts.output_token_account, signer)?);
+        }
+        if let Some((tip_account, lamports)) = opts.jito_tip {
+            ixs.push(solana_system_interface::instruction::transfer(
+                signer,
+                &tip_account,
+                lamports,
+            ));
+        }
+
+        let message = Message::new(&ixs, Some(signer));
+        let mut tx = Transaction::new_unsigned(message);
+        tx.message.recent_blockhash = blockhash;
+        Ok(tx)
+    }
+
     /// Compute expected output for a given input amount using constant product formula.
     /// For CLMM: amount_out = (amount_in * price) * (1 - fee_rate)
     pub fn compute_output_amount(input_amount: u64, sqrt_price: u128, fee_rate_bps: u64) -> u64 {
@@ -162,6 +309,55 @@ impl RaydiumV4ClmmAdapter {
         let fee = gross_output * fee_rate_bps / 1_000_000; // fee_rate is in BPS*100
         gross_output.saturating_sub(fee)
     }
+}
+
+/// ATA program `CreateIdempotent` (instruction index 1): creates the
+/// associated token account if missing, no-op if it already exists.
+fn create_ata_idempotent_ix(
+    payer: &Pubkey,
+    ata: &Pubkey,
+    mint: &Pubkey,
+) -> Result<Instruction, Box<dyn std::error::Error>> {
+    let owner = payer;
+    Ok(Instruction {
+        program_id: Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID)?,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM_ID)?, false),
+        ],
+        data: vec![1],
+    })
+}
+
+/// SPL Token `SyncNative` (instruction 17): sync a wSOL account's token
+/// amount with its lamport balance after a SOL transfer into it.
+fn sync_native_ix(account: &Pubkey) -> Result<Instruction, Box<dyn std::error::Error>> {
+    Ok(Instruction {
+        program_id: Pubkey::from_str(TOKEN_PROGRAM_ID)?,
+        accounts: vec![AccountMeta::new(*account, false)],
+        data: vec![17],
+    })
+}
+
+/// SPL Token `CloseAccount` (instruction 9): closes a (wSOL) token account,
+/// returning its lamports to the owner — this is the "unwrap" step.
+fn close_account_ix(
+    account: &Pubkey,
+    owner: &Pubkey,
+) -> Result<Instruction, Box<dyn std::error::Error>> {
+    Ok(Instruction {
+        program_id: Pubkey::from_str(TOKEN_PROGRAM_ID)?,
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new(*owner, false),
+            AccountMeta::new_readonly(*owner, true),
+        ],
+        data: vec![9],
+    })
 }
 
 impl AmmAdapter for RaydiumV4ClmmAdapter {
@@ -181,13 +377,29 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
             .as_ref()
             .ok_or("no resolved pool attached — call with_resolved_pool before quote")?;
         let sqrt_price = pool.sqrt_price_x64;
-        // 0.05% = 5 bps, in BPS*100 format = 500. (fee = gross * 500 / 1_000_000)
-        let fee_rate = 500u64;
-        let expected_output = Self::compute_output_amount(input_amount, sqrt_price, fee_rate);
+        // The pool's real fee tier (parts per million) read from its
+        // AmmConfig by resolve_swap_accounts; 500 (0.05%) only when no
+        // config was resolved (unit tests / offline).
+        let fee_rate = pool.trade_fee_rate.map(u64::from).unwrap_or(500);
+        // Direction: the pool price is token1/token0. Selling token0 yields
+        // `amount * price` token1; selling token1 yields `amount / price`
+        // token0. The direction is taken from the resolved swap accounts
+        // (input vault), so the exit (reverse) swap is quoted correctly too.
+        let input_is_token0 = self.input_is_token0();
+        let expected_output = if input_is_token0 {
+            Self::compute_output_amount(input_amount, sqrt_price, fee_rate)
+        } else {
+            Self::compute_output_amount_reverse(input_amount, sqrt_price, fee_rate)
+        };
+        let (input_mint, output_mint) = if input_is_token0 {
+            (pool.token_mint_0, pool.token_mint_1)
+        } else {
+            (pool.token_mint_1, pool.token_mint_0)
+        };
         Ok(Quote {
             pool_id: self.pool_id.clone(),
-            input_mint: pool.token_mint_0.to_string(),
-            output_mint: pool.token_mint_1.to_string(),
+            input_mint: input_mint.to_string(),
+            output_mint: output_mint.to_string(),
             input_amount,
             expected_output,
             slippage_bps,
@@ -288,6 +500,8 @@ mod tests {
             output_vault: Pubkey::new_unique(),
             observation_state: Pubkey::new_unique(),
             tick_array: Pubkey::new_unique(),
+            extra_tick_arrays: vec![],
+            bitmap_extension: None,
         };
         RaydiumV4ClmmAdapter::new("pool_test".to_string()).with_swap_accounts(accounts)
     }
@@ -376,6 +590,204 @@ mod tests {
     }
 
     #[test]
+    fn extra_tick_arrays_are_appended_as_writable_remaining_accounts() {
+        let mut adapter = sample_adapter();
+        let extra = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        adapter.accounts.as_mut().unwrap().extra_tick_arrays = extra.clone();
+        let quote = Quote {
+            pool_id: "pool_test".into(),
+            input_mint: "SOL".into(),
+            output_mint: "X".into(),
+            input_amount: 1_000,
+            expected_output: 999,
+            slippage_bps: 100,
+        };
+        let intent = adapter.build_intent(quote).unwrap();
+        let ix = adapter
+            .build_swap_instruction(&intent, &Pubkey::new_unique())
+            .unwrap();
+        assert_eq!(ix.accounts.len(), 12);
+        assert_eq!(ix.accounts[10].pubkey, extra[0]);
+        assert_eq!(ix.accounts[11].pubkey, extra[1]);
+        assert!(ix.accounts[10].is_writable && !ix.accounts[10].is_signer);
+
+        // With a bitmap extension it comes first among remaining accounts.
+        let ext = Pubkey::new_unique();
+        adapter.accounts.as_mut().unwrap().bitmap_extension = Some(ext);
+        let ix = adapter
+            .build_swap_instruction(&intent, &Pubkey::new_unique())
+            .unwrap();
+        assert_eq!(ix.accounts.len(), 13);
+        assert_eq!(ix.accounts[10].pubkey, ext);
+        assert_eq!(ix.accounts[11].pubkey, extra[0]);
+    }
+
+    #[test]
+    fn quote_uses_pool_fee_tier_when_resolved() {
+        let mut data = vec![0u8; 273];
+        data[253..269].copy_from_slice(&(1u128 << 64).to_le_bytes());
+        let mut pool =
+            RaydiumV4ClmmAdapter::parse_pool_state(&Pubkey::new_unique(), &data).unwrap();
+        pool.trade_fee_rate = Some(10_000); // 1% tier
+        let q = sample_adapter()
+            .with_resolved_pool(pool)
+            .quote(1_000_000, 100)
+            .unwrap();
+        assert_eq!(q.expected_output, 990_000);
+    }
+
+    #[test]
+    fn swap_program_id_is_canonical_mainnet_clmm() {
+        assert_eq!(
+            RAYDIUM_CLMM_PROGRAM_ID,
+            "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+        );
+        assert_eq!(
+            RaydiumV4ClmmAdapter::new("p".into()).program_id,
+            RAYDIUM_CLMM_PROGRAM_ID
+        );
+    }
+
+    #[test]
+    fn reverse_output_inverts_price() {
+        // sqrt = 2 * 2^64 => price = 4 token1 per token0.
+        let sqrt = 2u128 << 64;
+        assert_eq!(
+            RaydiumV4ClmmAdapter::compute_output_amount(1_000, sqrt, 0),
+            4_000
+        );
+        assert_eq!(
+            RaydiumV4ClmmAdapter::compute_output_amount_reverse(4_000, sqrt, 0),
+            1_000
+        );
+    }
+
+    #[test]
+    fn quote_direction_follows_input_vault() {
+        let mut data = vec![0u8; 273];
+        data[253..269].copy_from_slice(&(2u128 << 64).to_le_bytes());
+        let pool_id = Pubkey::new_unique();
+        let pool = RaydiumV4ClmmAdapter::parse_pool_state(&pool_id, &data).unwrap();
+        // Input vault == token_vault_1 => selling token1 for token0.
+        let mut accounts = sample_adapter().accounts.unwrap();
+        accounts.input_vault = pool.token_vault_1;
+        accounts.output_vault = Pubkey::new_unique();
+        let adapter = RaydiumV4ClmmAdapter::new("p".into())
+            .with_swap_accounts(accounts)
+            .with_resolved_pool(pool);
+        assert!(!adapter.input_is_token0());
+        let q = adapter.quote(4_000_000, 100).unwrap();
+        // price 4 => ~1_000_000 token0 minus 0.05% fee.
+        assert!(q.expected_output <= 1_000_000 && q.expected_output > 999_000);
+    }
+
+    #[test]
+    fn build_swap_transaction_wraps_sol_and_creates_atas() {
+        let adapter = sample_adapter();
+        let accounts = adapter.accounts.clone().unwrap();
+        let signer = Pubkey::new_unique();
+        let native = Pubkey::from_str(NATIVE_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let quote = Quote {
+            pool_id: "pool_test".into(),
+            input_mint: native.to_string(),
+            output_mint: token.to_string(),
+            input_amount: 10_000_000,
+            expected_output: 1,
+            slippage_bps: 100,
+        };
+        let intent = adapter.build_intent(quote).unwrap();
+        let opts = SwapTxOptions {
+            input_mint: native,
+            output_mint: token,
+            compute_unit_limit: 300_000,
+            priority_fee_micro_lamports: 10_000,
+            close_input_token_account: false,
+            jito_tip: None,
+        };
+        let tx = adapter
+            .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
+            .unwrap();
+        let keys = &tx.message.account_keys;
+        let programs: Vec<Pubkey> = tx
+            .message
+            .instructions
+            .iter()
+            .map(|ix| keys[ix.program_id_index as usize])
+            .collect();
+        // cu limit, cu price, ata(in), ata(out), transfer, sync, swap, close(wSOL in)
+        assert_eq!(programs.len(), 8);
+        assert_eq!(
+            programs[6],
+            Pubkey::from_str(RAYDIUM_CLMM_PROGRAM_ID).unwrap()
+        );
+        assert_eq!(programs[4], solana_sdk::system_program::id());
+        // Fee payer is the signer; wSOL ATA receives the transfer.
+        assert_eq!(keys[0], signer);
+        assert!(keys.contains(&accounts.input_token_account));
+        assert!(keys.contains(&accounts.output_token_account));
+    }
+
+    #[test]
+    fn build_swap_transaction_unwraps_sol_on_exit() {
+        let adapter = sample_adapter();
+        let signer = Pubkey::new_unique();
+        let native = Pubkey::from_str(NATIVE_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let quote = Quote {
+            pool_id: "pool_test".into(),
+            input_mint: token.to_string(),
+            output_mint: native.to_string(),
+            input_amount: 5_000,
+            expected_output: 1,
+            slippage_bps: 100,
+        };
+        let intent = adapter.build_intent(quote).unwrap();
+        let opts = SwapTxOptions {
+            input_mint: token,
+            output_mint: native,
+            compute_unit_limit: 0,
+            priority_fee_micro_lamports: 0,
+            close_input_token_account: false,
+            jito_tip: None,
+        };
+        let tx = adapter
+            .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
+            .unwrap();
+        // ata(in), ata(out), swap, close(wSOL out) — no wrap for a token input.
+        assert_eq!(tx.message.instructions.len(), 4);
+        let last = tx.message.instructions.last().unwrap();
+        assert_eq!(last.data, vec![9]);
+
+        // With a Jito tip the transfer to the tip account is the last ix.
+        let tip_account = Pubkey::new_unique();
+        let tipped = SwapTxOptions {
+            jito_tip: Some((tip_account, 10_000)),
+            ..opts.clone()
+        };
+        let tx = adapter
+            .build_swap_transaction(&intent, &signer, Hash::new_unique(), &tipped)
+            .unwrap();
+        let last = tx.message.instructions.last().unwrap();
+        let keys = &tx.message.account_keys;
+        assert_eq!(
+            keys[last.program_id_index as usize],
+            solana_sdk::system_program::id()
+        );
+        assert_eq!(keys[last.accounts[1] as usize], tip_account);
+
+        // Full exit: the emptied token ATA is closed too (rent refunded).
+        let full = SwapTxOptions {
+            close_input_token_account: true,
+            ..opts
+        };
+        let tx = adapter
+            .build_swap_transaction(&intent, &signer, Hash::new_unique(), &full)
+            .unwrap();
+        assert_eq!(tx.message.instructions.len(), 5);
+    }
+
+    #[test]
     fn build_transaction_returns_unsigned_with_blockhash() {
         let adapter = sample_adapter();
         let signer = Pubkey::new_unique();
@@ -399,5 +811,62 @@ mod tests {
             tx.signatures[0],
             solana_sdk::signature::Signature::default()
         );
+    }
+
+    #[test]
+    fn real_entry_and_exit_transactions_pass_the_hsm_signing_policy() {
+        // A builder change the HSM would refuse fails here, not live.
+        use crate::hsm_policy;
+        let signer = Pubkey::new_unique();
+        let native = Pubkey::from_str(NATIVE_MINT).unwrap();
+        let token = Pubkey::new_unique();
+        let pol = hsm_policy::Policy::default();
+        for (input, output, close, tip) in [
+            (native, token, false, None),
+            (
+                native,
+                token,
+                false,
+                Some((
+                    Pubkey::from_str("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5").unwrap(),
+                    10_000,
+                )),
+            ),
+            (token, native, false, None),
+            (token, native, true, None),
+        ] {
+            let mut accounts = sample_adapter().accounts.unwrap();
+            accounts.input_token_account =
+                crate::amm::account_resolver::resolve_user_ata(&signer, &input);
+            accounts.output_token_account =
+                crate::amm::account_resolver::resolve_user_ata(&signer, &output);
+            accounts.extra_tick_arrays = vec![Pubkey::new_unique(), Pubkey::new_unique()];
+            accounts.bitmap_extension = Some(Pubkey::new_unique());
+            let adapter =
+                RaydiumV4ClmmAdapter::new("pool_test".to_string()).with_swap_accounts(accounts);
+            let intent = adapter
+                .build_intent(Quote {
+                    pool_id: "pool_test".into(),
+                    input_mint: input.to_string(),
+                    output_mint: output.to_string(),
+                    input_amount: 10_000_000, // 0.01 SOL: the strategy's size
+                    expected_output: 1,
+                    slippage_bps: 100,
+                })
+                .unwrap();
+            let opts = SwapTxOptions {
+                input_mint: input,
+                output_mint: output,
+                compute_unit_limit: 300_000,
+                priority_fee_micro_lamports: 10_000,
+                close_input_token_account: close,
+                jito_tip: tip,
+            };
+            let tx = adapter
+                .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
+                .unwrap();
+            hsm_policy::check(&tx.message, &signer, &pol)
+                .unwrap_or_else(|e| panic!("HSM would refuse {input}->{output}: {e}"));
+        }
     }
 }

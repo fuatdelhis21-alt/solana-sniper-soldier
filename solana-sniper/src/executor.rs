@@ -1,7 +1,5 @@
 //! Transaction executor — builds, signs, and sends transactions with retry + priority fee.
 
-use std::sync::Arc;
-
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;
@@ -9,7 +7,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::message::Message;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::retry;
 
@@ -56,6 +54,6 @@ pub fn execute_transfer(
     lamports: u64,
     blockhash: Hash,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
-    let ix = solana_sdk::system_instruction::transfer(&signer.pubkey(), to, lamports);
+    let ix = solana_system_interface::instruction::transfer(&signer.pubkey(), to, lamports);
     execute_instructions(rpc, signer, &[ix], blockhash, 10_000, 200_000)
 }

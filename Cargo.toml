@@ -39,7 +39,7 @@ hex = "0.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 byteorder = "1.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 base64 = "0.22"
@@ -56,6 +56,7 @@ solana-signature = "2.2"
 solana-pubkey = "2.2"
 solana-commitment-config = "2.2"
 solana-compute-budget-interface = "2.2"
+solana-system-interface = { version = "1.0", features = ["bincode"] }
 solana-transaction-status = "2.2"
 spl-associated-token-account = "7.0"
 spl-token = "8.0"

@@ -43,6 +43,8 @@ impl RpcConfig {
 
 /// Standart Solana RPC yürütme backend'i.
 pub struct RpcBackend {
+    // Only read by the `live` feature build (network submission).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     config: RpcConfig,
     /// Emir kimliği → serialized tx deposu.
     store: TransactionStore,
@@ -83,6 +85,8 @@ impl RpcBackend {
     }
 
     /// `sendTransaction` JSON-RPC gövdesini oluşturur.
+    // Only read by the `live` feature build (network submission).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     fn build_send_tx_body(tx_b64: &str, skip_preflight: bool) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{tx_b64}",{{"encoding":"base64","skipPreflight":{skip_preflight},"maxRetries":0}}]}}"#

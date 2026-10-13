@@ -1,8 +1,8 @@
-/// # Alpha Discovery Scoring Engine
-///
-/// Token scoring and alpha discovery logic for HFT decision-making.
-/// Computes a composite alpha score from liquidity, holder concentration,
-/// and developer activity metrics.
+//! # Alpha Discovery Scoring Engine
+//!
+//! Token scoring and alpha discovery logic for HFT decision-making.
+//! Computes a composite alpha score from liquidity, holder concentration,
+//! and developer activity metrics.
 
 /// Token score structure used for alpha discovery.
 pub struct TokenScore {

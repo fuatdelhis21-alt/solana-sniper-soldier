@@ -1,0 +1,47 @@
+[Unit]
+Description=Solana HFT remote HSM signer (mTLS, 127.0.0.1:8443)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=solana-hsm
+Group=solana-hsm
+# HSM_KEY_B64=<base64 64-byte key> is mandatory: hsm_server has no ephemeral
+# fallback (only the --dev-ephemeral-key test flag, never used here). Every
+# transaction is checked by the signing policy (HSM_MAX_* in hsm.env).
+EnvironmentFile=/etc/solana-hft/hsm.env
+StateDirectory=solana-hsm
+ExecStart=/opt/solana-hft/bin/hsm_server --certs /etc/solana-hft/hsm-certs --log-file /var/lib/solana-hsm/hsm_audit.log
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The signing key lives in memory: no core dumps.
+LimitCORE=0
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+UMask=0077
+ReadWritePaths=/var/lib/solana-hsm
+ReadOnlyPaths=/etc/solana-hft
+
+[Install]
+WantedBy=multi-user.target

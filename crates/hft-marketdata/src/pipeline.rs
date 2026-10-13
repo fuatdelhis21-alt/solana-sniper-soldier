@@ -101,6 +101,11 @@ pub struct MarketDataPipeline {
 }
 
 impl MarketDataPipeline {
+    /// Pipeline yapılandırması.
+    pub fn config(&self) -> &PipelineConfig {
+        &self.config
+    }
+
     /// Yeni bir pipeline oluşturur.
     pub fn new(config: PipelineConfig) -> Self {
         MarketDataPipeline {
@@ -138,7 +143,7 @@ impl MarketDataPipeline {
                     self.ring.push(event);
 
                     // 3. Ring buffer'dan sıralı olarak al.
-                    while let Some(ordered) = self.ring.pop_ready(watermark) {
+                    if let Some(ordered) = self.ring.pop_ready(watermark) {
                         // 4. Latency izle.
                         self.latency.observe(&ordered);
                         self.consumed += 1;
@@ -295,7 +300,7 @@ mod tests {
 
     #[test]
     fn pipeline_stats_dolu() {
-        let mut pipeline = MarketDataPipeline::new(PipelineConfig::default());
+        let pipeline = MarketDataPipeline::new(PipelineConfig::default());
         let stats = pipeline.stats();
         assert_eq!(stats.total_polled, 0);
         assert_eq!(stats.consumed, 0);

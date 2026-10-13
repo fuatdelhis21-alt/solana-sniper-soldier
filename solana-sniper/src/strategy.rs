@@ -95,6 +95,27 @@ pub enum ExitDecision {
     StopLoss,
     /// Exit because price reached the take-profit threshold.
     TakeProfit,
+    /// Exit because the position reached its maximum holding time
+    /// (live only; set by the caller, never by the price checks).
+    MaxHoldTime,
+    /// Exit because the SOL-side pool liquidity fell far below its level at
+    /// entry (liquidity being pulled — the classic new-pool rug). Set by the
+    /// caller via [`liquidity_dropped`], never by the price checks.
+    LiquidityDrop,
+}
+
+/// SOL-side liquidity drop (bps of the entry level) that forces an exit.
+pub const LIQUIDITY_DROP_EXIT_BPS: u64 = 5_000;
+
+/// True when `current` liquidity is at least [`LIQUIDITY_DROP_EXIT_BPS`]
+/// below `at_entry`. `at_entry == 0` (unknown, e.g. an older position
+/// record) never triggers.
+pub fn liquidity_dropped(at_entry: u64, current: u64) -> bool {
+    if at_entry == 0 {
+        return false;
+    }
+    let floor = at_entry as u128 * (10_000 - LIQUIDITY_DROP_EXIT_BPS) as u128 / 10_000;
+    (current as u128) <= floor
 }
 
 /// Pure strategy logic. Deterministic — no I/O, no randomness.
@@ -165,6 +186,27 @@ impl SimpleSnipeStrategy {
             if loss_bps >= self.config.stop_loss_bps as f64 {
                 return ExitDecision::StopLoss;
             }
+        }
+        ExitDecision::Hold
+    }
+
+    /// Value-based exit decision for a REAL position: `cost` is what the
+    /// entry actually spent and `current_value` what selling the held tokens
+    /// would return right now (both in input-token units, e.g. lamports).
+    /// Unlike `should_exit` this is direction-independent — it does not
+    /// matter whether the bought token is the pool's token0 or token1 — and
+    /// it includes the pool fee on the way out.
+    pub fn should_exit_value(&self, cost: u64, current_value: u64) -> ExitDecision {
+        if cost == 0 {
+            return ExitDecision::Hold;
+        }
+        let ratio = current_value as f64 / cost as f64;
+        if ratio >= 1.0 {
+            if (ratio - 1.0) * 10_000.0 >= self.config.take_profit_bps as f64 {
+                return ExitDecision::TakeProfit;
+            }
+        } else if (1.0 - ratio) * 10_000.0 >= self.config.stop_loss_bps as f64 {
+            return ExitDecision::StopLoss;
         }
         ExitDecision::Hold
     }
@@ -248,6 +290,28 @@ mod tests {
     }
 
     #[test]
+    fn should_exit_value_thresholds() {
+        let s = SimpleSnipeStrategy::new(StrategyConfig::default());
+        assert_eq!(
+            s.should_exit_value(10_000_000, 10_000_000),
+            ExitDecision::Hold
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 11_000_000),
+            ExitDecision::TakeProfit
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 9_500_000),
+            ExitDecision::StopLoss
+        );
+        assert_eq!(
+            s.should_exit_value(10_000_000, 9_600_000),
+            ExitDecision::Hold
+        );
+        assert_eq!(s.should_exit_value(0, 1), ExitDecision::Hold);
+    }
+
+    #[test]
     fn should_exit_holds_at_entry() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let entry = 1u128 << 64;
@@ -315,5 +379,18 @@ mod tests {
         // Equal sizes are allowed; only exceeding the risk cap is an error.
         assert!(validate_position_size_invariant(50_000_000, 50_000_000).is_ok());
         assert!(validate_position_size_invariant(10_000_000, 50_000_000).is_ok());
+    }
+
+    #[test]
+    fn liquidity_drop_threshold() {
+        assert!(
+            !liquidity_dropped(0, 0),
+            "unknown entry liquidity never triggers"
+        );
+        assert!(!liquidity_dropped(100, 51));
+        assert!(liquidity_dropped(100, 50));
+        assert!(liquidity_dropped(100, 0));
+        assert!(!liquidity_dropped(100, 500), "rising liquidity is fine");
+        assert!(liquidity_dropped(u64::MAX, 1));
     }
 }
