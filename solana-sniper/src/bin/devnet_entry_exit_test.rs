@@ -360,24 +360,21 @@ fn main() -> Result<()> {
         .build_swap_instruction(&intent, &from)
         .map_err(|e| anyhow!("exit build_swap_instruction failed: {e}"))?;
 
-    let mut ixs: Vec<Instruction> = Vec::new();
-    ixs.push(
+    let ixs: Vec<Instruction> = vec![
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &from,
             &from,
             &output_mint,
             &spl_token::ID,
         ),
-    );
-    ixs.push(
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
             &from,
             &from,
             &input_mint,
             &spl_token::ID,
         ),
-    );
-    ixs.push(swap_ix);
+        swap_ix,
+    ];
 
     let blockhash = rpc.get_latest_blockhash().context("get_latest_blockhash")?;
     let msg = Message::new(&ixs, Some(&from));

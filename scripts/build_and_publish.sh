@@ -21,7 +21,13 @@ mkdir -p "$STAGE/bin" "$STAGE/systemd"
 for b in solana-sniper pool-sniper hsm_server send_transfer; do
   install -m 0755 "target/release/$b" "$STAGE/bin/$b"
 done
-cp deploy/systemd/*.service "$STAGE/systemd/"
+# Only the units install_release.sh manages. Other unit files in
+# deploy/systemd (e.g. the solana-sniper.service example) are templates the
+# operator installs by hand: installing them automatically could overwrite
+# a different service of the same name already running on the host.
+for u in solana-hft.service solana-hft-sniper.service solana-hsm.service; do
+  install -m 0644 "deploy/systemd/$u" "$STAGE/systemd/$u"
+done
 cp deploy/install_release.sh deploy/rollback.sh deploy/hsm.env.example "$STAGE/"
 cp .env.example "$STAGE/solana-hft.env.example"
 cp tools/hsm_server/certs/generate_certs.sh README_DEPLOY.md "$STAGE/"
