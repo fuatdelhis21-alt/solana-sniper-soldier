@@ -858,6 +858,59 @@ fn entry_required_balance(position_size: u64, input_is_native: bool) -> u64 {
     }
 }
 
+/// Build the exit (sell) transaction for `amount` raw units of the output
+/// mint back into the input mint — the same primitives the live exit path
+/// (`manage_open_position`) uses: reversed account resolution, real pool
+/// fee and tick arrays, ATA setup, wSOL unwrap.
+fn build_exit_tx(
+    args: &Args,
+    rpc: &RpcClient,
+    from: &Pubkey,
+    amount: u64,
+    blockhash: solana_sdk::hash::Hash,
+    jito_tip: Option<(Pubkey, u64)>,
+) -> Result<Transaction, String> {
+    let parse = |label: &str, v: Option<&str>| {
+        Pubkey::from_str(v.unwrap_or_default()).map_err(|e| format!("invalid {label}: {e}"))
+    };
+    let pool_id = parse("--pool-id", args.pool_id.as_deref())?;
+    let back_mint = parse("--input-mint", args.input_mint.as_deref())?;
+    let held_mint = parse("--output-mint", args.output_mint.as_deref())?;
+    if amount == 0 {
+        return Err("entry quote produced no output to sell".into());
+    }
+    let program_id = clmm_program_id(&args.rpc);
+    let (accounts, pool) = amm::account_resolver::resolve_swap_accounts(
+        rpc,
+        &pool_id,
+        from,
+        &held_mint,
+        &back_mint,
+        &program_id,
+    )?;
+    let adapter = amm::raydium_v4::RaydiumV4ClmmAdapter::new(pool_id.to_string())
+        .with_program_id(program_id.to_string())
+        .with_swap_accounts(accounts)
+        .with_resolved_pool(pool);
+    let quote = adapter
+        .quote(amount, args.max_slippage_bps)
+        .map_err(|e| format!("exit quote failed: {e}"))?;
+    let intent = adapter
+        .build_intent(quote)
+        .map_err(|e| format!("exit build_intent failed: {e}"))?;
+    let opts = amm::raydium_v4::SwapTxOptions {
+        input_mint: held_mint,
+        output_mint: back_mint,
+        compute_unit_limit: args.compute_unit_limit,
+        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
+        close_input_token_account: false,
+        jito_tip,
+    };
+    adapter
+        .build_swap_transaction(&intent, from, blockhash, &opts)
+        .map_err(|e| format!("exit build_transaction failed: {e}"))
+}
+
 /// Result of an RPC `simulateTransaction`.
 struct SimulationResult {
     err: Option<String>,
@@ -2417,6 +2470,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => {
                                 tracing::warn!(target: "dry_run", error = %e, "on-chain simulation unavailable")
                             }
+                        }
+                        // Exit (stop-loss / take-profit sell) path: the same
+                        // builder the live exit uses, selling the amount this
+                        // entry would buy back into the input mint. The fee
+                        // payer must hold that token for the simulation to
+                        // pass (an "insufficient funds" result then only means
+                        // the payer holds none, not a broken exit).
+                        match build_exit_tx(
+                            &args,
+                            &rpc_client,
+                            &from,
+                            swap_min_output,
+                            blockhash,
+                            jito_tip,
+                        )
+                        .and_then(|exit_tx| simulate_on_chain(&rpc_client, &exit_tx))
+                        {
+                            Ok(sim) => {
+                                let ok = sim.err.is_none();
+                                println!(
+                                    "[DRY-RUN] iter {}: EXIT (sell {} raw units) on-chain simulation {} (compute units {:?}){}",
+                                    i + 1,
+                                    swap_min_output,
+                                    if ok { "OK" } else { "FAILED" },
+                                    sim.units,
+                                    sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                );
+                                for line in sim.logs.iter().rev().take(12).rev() {
+                                    println!("    {line}");
+                                }
+                            }
+                            Err(e) => println!(
+                                "[DRY-RUN] iter {}: EXIT simulation unavailable: {e}",
+                                i + 1
+                            ),
                         }
                     }
                     tracing::info!(
