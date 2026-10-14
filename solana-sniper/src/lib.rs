@@ -16,6 +16,7 @@ pub mod redact;
 pub mod remote_hsm;
 pub mod retry;
 pub mod risk;
+pub mod sim_quote;
 pub mod strategy;
 pub mod tx;
 
