@@ -241,17 +241,23 @@ impl PendingSignatures {
     pub const MAX_ATTEMPTS: u32 = 5;
     const MAX_LEN: usize = 500;
 
-    pub fn push(&mut self, sig: String) {
+    /// Queue a signature (duplicates ignored). Returns `true` when the queue
+    /// was full and the oldest pending signature was evicted (a lost event:
+    /// counted by the caller).
+    pub fn push(&mut self, sig: String) -> bool {
         if self.attempts.contains_key(&sig) {
-            return;
+            return false;
         }
+        let mut evicted = false;
         if self.order.len() >= Self::MAX_LEN {
             if let Some(old) = self.order.pop_front() {
                 self.attempts.remove(&old);
+                evicted = true;
             }
         }
         self.attempts.insert(sig.clone(), 0);
         self.order.push_back(sig);
+        evicted
     }
 
     pub fn pop(&mut self) -> Option<String> {
@@ -419,6 +425,17 @@ mod tests {
         assert!(cap.reached(day * 10 + 7, 2));
         assert!(!cap.reached(day * 11, 2));
         assert_eq!(cap.count(day * 11), 0);
+    }
+
+    #[test]
+    fn pending_signatures_report_evictions() {
+        let mut p = PendingSignatures::default();
+        for i in 0..PendingSignatures::MAX_LEN {
+            assert!(!p.push(format!("s{i}")));
+        }
+        assert!(!p.push("s0".into()), "duplicate is not an eviction");
+        assert!(p.push("new".into()), "full queue evicts the oldest");
+        assert_eq!(p.len(), PendingSignatures::MAX_LEN);
     }
 
     #[test]

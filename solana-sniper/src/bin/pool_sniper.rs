@@ -103,6 +103,12 @@ struct Args {
     #[arg(long, env = "SNIPER_MIN_LIQUIDITY_SOL", default_value_t = 1000.0)]
     min_liquidity_sol: f64,
 
+    /// Pre-filter liquidity for a watched pool to be handed to a trading
+    /// process (SOL). Defaults to --min-liquidity-sol (the entry threshold,
+    /// which the trading process enforces again on its own).
+    #[arg(long, env = "SNIPER_DISCOVERY_MIN_LIQUIDITY_SOL")]
+    discovery_min_liquidity_sol: Option<f64>,
+
     /// How long a new pool stays on the watch list (seconds).
     #[arg(long, env = "SNIPER_DISCOVERY_WATCH_SECS", default_value_t = 1800)]
     watch_secs: u64,
@@ -151,6 +157,21 @@ struct Status {
     watched: AtomicU64,
     started_today: AtomicU64,
     child_running: AtomicBool,
+    // Cumulative discovery counters (bounded set, no per-pool labels).
+    create_pool_seen: AtomicU64,
+    stream_reconnects: AtomicU64,
+    signatures_evicted: AtomicU64,
+    signatures_unresolved: AtomicU64,
+    pools_watched: AtomicU64,
+    pools_not_wsol: AtomicU64,
+    pools_rejected: AtomicU64,
+    pools_expired: AtomicU64,
+    children_started: AtomicU64,
+    child_startup_failures: AtomicU64,
+}
+
+fn bump(c: &AtomicU64) {
+    c.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A busy program like the CLMM emits logs every few seconds; minutes of
@@ -170,13 +191,31 @@ fn health_verdict(loop_ms: u64, ws_ms: u64, now: u64) -> Result<(), String> {
 
 fn render_status(st: &Status, now: u64) -> String {
     let ws = st.ws_ms.load(Ordering::SeqCst);
-    format!(
+    let mut out = format!(
         "pool_sniper_ws_last_message_age_ms {}\npool_sniper_watch_list {}\npool_sniper_pools_started_today {}\npool_sniper_child_running {}\n",
         if ws == 0 { -1 } else { now.saturating_sub(ws) as i64 },
         st.watched.load(Ordering::SeqCst),
         st.started_today.load(Ordering::SeqCst),
         st.child_running.load(Ordering::SeqCst) as u8,
-    )
+    );
+    for (name, c) in [
+        ("create_pool_seen_total", &st.create_pool_seen),
+        ("stream_reconnects_total", &st.stream_reconnects),
+        ("signatures_evicted_total", &st.signatures_evicted),
+        ("signatures_unresolved_total", &st.signatures_unresolved),
+        ("pools_watched_total", &st.pools_watched),
+        ("pools_not_wsol_total", &st.pools_not_wsol),
+        ("pools_rejected_total", &st.pools_rejected),
+        ("pools_expired_total", &st.pools_expired),
+        ("children_started_total", &st.children_started),
+        ("child_startup_failures_total", &st.child_startup_failures),
+    ] {
+        out.push_str(&format!(
+            "pool_sniper_{name} {}\n",
+            c.load(Ordering::Relaxed)
+        ));
+    }
+    out
 }
 
 fn spawn_health_server(addr: &str, st: Arc<Status>) -> Result<(), String> {
@@ -235,6 +274,11 @@ fn validate(args: &Args) -> Result<(), String> {
         return Err(
             "--mode live requires --confirm-live (SNIPER_DISCOVERY_CONFIRM_LIVE=true)".into(),
         );
+    }
+    if let Some(d) = args.discovery_min_liquidity_sol {
+        if !d.is_finite() || d < 1.0 {
+            return Err("--discovery-min-liquidity-sol must be >= 1".into());
+        }
     }
     if !args.min_liquidity_sol.is_finite() || args.min_liquidity_sol < 20.0 {
         return Err("--min-liquidity-sol must be >= 20".into());
@@ -351,6 +395,7 @@ fn spawn_log_listener(
             let (mut client, receiver) = match sub {
                 Ok(v) => v,
                 Err(e) => {
+                    bump(&status.stream_reconnects);
                     tracing::warn!(target: "discovery", error = %e, backoff, "logsSubscribe failed — retrying");
                     std::thread::sleep(Duration::from_secs(backoff));
                     backoff = (backoff * 2).min(60);
@@ -368,6 +413,7 @@ fn spawn_log_listener(
                         status.ws_ms.store(now_ms(), Ordering::SeqCst);
                         let v = resp.value;
                         if v.err.is_none() && logs_contain_create_pool(&v.logs) {
+                            bump(&status.create_pool_seen);
                             tracing::info!(target: "discovery", signature = %v.signature, "CreatePool seen");
                             if tx.send(v.signature).is_err() {
                                 return;
@@ -375,6 +421,7 @@ fn spawn_log_listener(
                         }
                     }
                     Err(e) => {
+                        bump(&status.stream_reconnects);
                         tracing::warn!(target: "discovery", error = %e, "log stream ended — reconnecting");
                         break;
                     }
@@ -548,7 +595,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let program = clmm_program(&args.rpc);
     let wsol = Pubkey::from_str(WSOL).unwrap();
-    let min_liq = (args.min_liquidity_sol * 1e9) as u64;
+    let min_liq = (args
+        .discovery_min_liquidity_sol
+        .unwrap_or(args.min_liquidity_sol)
+        * 1e9) as u64;
     tracing::info!(
         target: "discovery",
         mode = ?args.mode,
@@ -623,16 +673,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 1) Child lifecycle.
         if let Some(r) = running.as_mut() {
             match r.child.try_wait() {
-                Ok(Some(status)) => {
+                Ok(Some(exit)) => {
                     let secs = r.started.elapsed().as_secs();
-                    if !status.success() && secs < 15 {
+                    if !exit.success() && secs < 15 {
                         // Fails right at startup: a configuration error, not
                         // a market condition. Back off instead of burning
                         // through the pools.
-                        tracing::error!(target: "discovery", pool = %r.pool, status = %status, "trading process failed at startup — check its log above; pausing 60 s");
+                        bump(&status.child_startup_failures);
+                        tracing::error!(target: "discovery", pool = %r.pool, status = %exit, "trading process failed at startup — check its log above; pausing 60 s");
                         risk_blocked_until = Some(Instant::now() + Duration::from_secs(60));
                     } else {
-                        tracing::info!(target: "discovery", pool = %r.pool, status = %status, secs, "trading process finished");
+                        tracing::info!(target: "discovery", pool = %r.pool, status = %exit, secs, "trading process finished");
                     }
                     running = None;
                 }
@@ -668,7 +719,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 2) New CreatePool signatures → watch list.
         while let Ok(sig) = sig_rx.try_recv() {
-            pending.push(sig);
+            if pending.push(sig) {
+                bump(&status.signatures_evicted);
+                tracing::warn!(target: "discovery", "pending signature queue full — oldest CreatePool dropped");
+            }
         }
         for _ in 0..pending.len().min(5) {
             let Some(sig) = pending.pop() else { break };
@@ -679,26 +733,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match token_side(&p, &wsol) {
                             Some(token) => {
                                 if watch.add(p, token, now_ms()) {
+                                    bump(&status.pools_watched);
                                     tracing::info!(target: "discovery", pool = %p.pool_id, token = %token, watched = watch.len(), "new wSOL pool on watch list");
                                 }
                             }
                             None => {
+                                bump(&status.pools_not_wsol);
                                 tracing::debug!(target: "discovery", pool = %p.pool_id, "not paired with wSOL — skipped")
                             }
                         }
                     }
                 }
                 Ok(None) => {
-                    pending.retry(sig);
+                    if !pending.retry(sig) {
+                        bump(&status.signatures_unresolved);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(target: "discovery", signature = %sig, error = %e, "CreatePool transaction fetch failed");
-                    pending.retry(sig);
+                    if !pending.retry(sig) {
+                        bump(&status.signatures_unresolved);
+                    }
                 }
             }
         }
         let now = now_ms();
         for c in watch.expire(now) {
+            bump(&status.pools_expired);
             tracing::info!(target: "discovery", pool = %c.pool.pool_id, checks = c.checks, last = %c.last_reason, "watch time over — dropped");
         }
 
@@ -767,6 +828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ) {
                                         Ok(r) => {
                                             daily.record(now_ms());
+                                            bump(&status.children_started);
                                             running = Some(r);
                                         }
                                         Err(e) => {
@@ -780,6 +842,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     watch.reschedule(c, now_ms(), reason);
                                 }
                                 CheckOutcome::Reject(reason) => {
+                                    bump(&status.pools_rejected);
                                     tracing::info!(target: "discovery", pool = %c.pool.pool_id, reason = %reason, "pool rejected");
                                 }
                             }
@@ -859,6 +922,19 @@ mod tests {
         let out = render_status(&st, now);
         assert!(out.contains("pool_sniper_watch_list 3"));
         assert!(out.contains("pool_sniper_ws_last_message_age_ms -1"));
+    }
+
+    #[test]
+    fn status_renders_bounded_counters() {
+        let st = Status::default();
+        bump(&st.create_pool_seen);
+        bump(&st.signatures_evicted);
+        let out = render_status(&st, 1);
+        assert!(out.contains("pool_sniper_create_pool_seen_total 1"));
+        assert!(out.contains("pool_sniper_signatures_evicted_total 1"));
+        assert!(out.contains("pool_sniper_child_startup_failures_total 0"));
+        assert!(validate(&args(&["--discovery-min-liquidity-sol", "0.5"])).is_err());
+        assert!(validate(&args(&["--discovery-min-liquidity-sol", "5"])).is_ok());
     }
 
     #[test]

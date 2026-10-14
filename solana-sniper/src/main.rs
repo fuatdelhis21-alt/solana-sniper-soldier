@@ -1201,6 +1201,11 @@ async fn submit_live_tx(
     rpc_client: &RpcClient,
     tx: &Transaction,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
+    // Last line of defence: nothing is ever broadcast outside an armed live
+    // run, whatever path reached this function.
+    if !args.live || !args.confirm_live || args.paper || args.dry_run {
+        return Err("broadcast refused: not an armed live run (fail-closed)".into());
+    }
     let Some(jito_ep) = &args.jito_endpoint else {
         return retry::send_with_retry(rpc_client, tx);
     };
@@ -4149,5 +4154,24 @@ mod tests {
         assert_eq!(signal_gate_rejects(&args, &empty, &cfg), Some("warming_up"));
         let off = Args::try_parse_from(["solana-sniper", "--signal-gate", "false"]).unwrap();
         assert_eq!(signal_gate_rejects(&off, &empty, &cfg), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paper_and_dry_run_can_never_broadcast() {
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let tx = Transaction::new_unsigned(solana_sdk::message::Message::new(&[], None));
+        for argv in [
+            vec!["solana-sniper", "--paper"],
+            vec!["solana-sniper", "--dry-run"],
+            vec!["solana-sniper", "--live"],
+            vec!["solana-sniper"],
+        ] {
+            let args = Args::try_parse_from(argv.clone()).unwrap();
+            let err = submit_live_tx(&args, &rpc, &tx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("broadcast refused"), "{argv:?}: {err}");
+        }
     }
 }
