@@ -33,7 +33,7 @@ use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
 use solana_sniper::{
     amm, decision, discovery, hw_signer, jito, marketdata, metrics, onchain_risk, position, redact,
-    remote_hsm, retry, risk, sim_quote, strategy,
+    remote_hsm, retry, risk, signal, sim_quote, strategy,
 };
 
 // ============================================================================
@@ -613,6 +613,20 @@ struct Args {
     #[arg(long, env = "SNIPER_EXIT_SLIPPAGE_ESCALATION", default_value_t = false)]
     exit_slippage_escalation: bool,
 
+    /// Signal gate on entries: EMA/MACD trend + RSI/volatility/liquidity
+    /// vetoes over this process's own timestamped pool-price samples (see
+    /// signal.rs). An entry waits until the indicators are warmed up.
+    #[arg(long, env = "SNIPER_SIGNAL_GATE", default_value_t = true, action = clap::ArgAction::Set)]
+    signal_gate: bool,
+
+    /// Minimum signal confidence (0-100) to enter.
+    #[arg(long, env = "SNIPER_SIGNAL_MIN_CONFIDENCE", default_value_t = 70)]
+    signal_min_confidence: u32,
+
+    /// Minimum spacing of the price samples (ms).
+    #[arg(long, env = "SNIPER_SIGNAL_SAMPLE_MS", default_value_t = 2000)]
+    signal_sample_ms: u64,
+
     /// Max spend in SOL for a single trade (security cap).
     #[arg(long, env = "SNIPER_MAX_SPEND_SOL", default_value_t = 0.01)]
     max_spend_sol: f64,
@@ -1029,6 +1043,22 @@ fn build_exit_tx(
     adapter
         .build_swap_transaction(&intent, from, blockhash, &opts)
         .map_err(|e| format!("exit build_transaction failed: {e}"))
+}
+
+/// The signal gate's rejection code, or `None` when the entry may proceed
+/// (or the gate is disabled).
+fn signal_gate_rejects(
+    args: &Args,
+    series: &signal::Series,
+    cfg: &signal::SignalConfig,
+) -> Option<&'static str> {
+    if !args.signal_gate {
+        return None;
+    }
+    match signal::evaluate(series, cfg) {
+        signal::SignalDecision::Trade { .. } => None,
+        signal::SignalDecision::NoTrade { reason, .. } => Some(reason),
+    }
 }
 
 /// Exact quote of a swap: the spot-price quote (reference for the price
@@ -1854,6 +1884,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /health turns 503 when the loop stops iterating. Generous limit: one
     // iteration may legitimately wait up to 180 s for a confirmation.
     metrics_registry.set_health_max_age(240_000 + 10 * args.loop_interval_ms.max(50));
+    // Genuine, timestamped pool-price observations for the signal gate.
+    let signal_cfg = signal::SignalConfig {
+        min_confidence: args.signal_min_confidence.min(100),
+        ..signal::SignalConfig::default()
+    };
+    let mut price_series = signal::Series::new(240, args.signal_sample_ms);
+    // Last advisory DexScreener fetch (rate-limited, see the live path).
+    let mut dexscreener_last: Option<std::time::Instant> = None;
     // --single-trade / --entry-window-secs (pool discovery supervisor).
     let run_start = std::time::Instant::now();
     let mut single_trade_done = false;
@@ -2118,6 +2156,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let strat_start = std::time::Instant::now();
             paper_sim.input_is_token0 = snapshot.input_is_token0;
             paper_sim.now_ms = marketdata::now_ms() as u64;
+            price_series.push(signal::Observation {
+                ts_ms: paper_sim.now_ms,
+                price: signal::held_token_price(
+                    snapshot.current_sqrt_price,
+                    snapshot.input_is_token0,
+                ),
+                liquidity: snapshot.liquidity_lamports,
+            });
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
 
@@ -2190,6 +2236,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 PaperTick::EntryPending(signal) => {
+                    if let Some(code) = signal_gate_rejects(&args, &price_series, &signal_cfg) {
+                        paper_rejects += 1;
+                        *rejected_by_reason.entry(code).or_insert(0) += 1;
+                        metrics::record_trade_rejected(&metrics_registry, "paper", code);
+                        rec.context = serde_json::json!({
+                            "action": "rejected",
+                            "reject_reason": code,
+                            "samples": price_series.len(),
+                            "source": snapshot.source,
+                            "simulated": true,
+                        });
+                        rec.save(&args.data_dir)?;
+                        tracing::info!(target: "paper", iteration = i + 1, reason = code, samples = price_series.len(), "signal gate: NO_TRADE");
+                        total_latency_ms =
+                            total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                        sleep(loop_interval).await;
+                        continue;
+                    }
                     // Real risk gates BEFORE the entry is simulated (same
                     // order as live): max-spend cap, then pre_trade_check.
                     let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
@@ -2574,10 +2638,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     live_holder_stats = Some(holder_stats);
                 }
 
-                if args.dexscreener_check {
-                    // Advisory only — never gates the trade. A failure here
-                    // is only logged as a warning.
-                    match discovery::fetch_snapshot(pool_id_str) {
+                // Advisory only — never gates the trade. A blocking HTTP call,
+                // so at most once a minute and off the async worker.
+                if args.dexscreener_check
+                    && dexscreener_last.map_or(true, |t: std::time::Instant| {
+                        t.elapsed() >= Duration::from_secs(60)
+                    })
+                {
+                    dexscreener_last = Some(std::time::Instant::now());
+                    match tokio::task::block_in_place(|| discovery::fetch_snapshot(pool_id_str)) {
                         Ok(snapshot) => tracing::info!(
                             mode = mode_target,
                             liquidity_usd = snapshot.liquidity_usd,
@@ -2597,6 +2666,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_program_id(program_id.to_string())
                     .with_swap_accounts(accounts)
                     .with_resolved_pool(resolved);
+                price_series.push(signal::Observation {
+                    ts_ms: marketdata::now_ms() as u64,
+                    price: signal::held_token_price(entry_sqrt, adapter.input_is_token0()),
+                    liquidity: live_liquidity.unwrap_or(0),
+                });
                 swap_adapter = Some(adapter);
             }
 
@@ -2677,6 +2751,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
+            if args.pool_id.is_some() {
+                if let Some(code) = signal_gate_rejects(&args, &price_series, &signal_cfg) {
+                    metrics::record_trade_rejected(&metrics_registry, mode_label, code);
+                    tracing::info!(
+                        mode = mode_target,
+                        iteration = i + 1,
+                        reason = code,
+                        samples = price_series.len(),
+                        "signal gate: NO_TRADE"
+                    );
+                    rec.context = serde_json::json!({
+                        "action": "rejected",
+                        "reject_reason": code,
+                        "samples": price_series.len(),
+                    });
+                    rec.save(&args.data_dir)?;
+                    sleep(loop_interval).await;
+                    continue;
+                }
+            }
             rec.amount_in = entry_signal.position_size_lamports;
             rec.save(&args.data_dir)?;
 
@@ -4043,5 +4137,17 @@ mod tests {
             entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000),
             Err("net_edge_too_small")
         );
+    }
+
+    #[test]
+    fn signal_gate_defaults_on_and_blocks_until_warmed_up() {
+        let args = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert!(args.signal_gate);
+        assert_eq!(args.signal_min_confidence, 70);
+        let cfg = signal::SignalConfig::default();
+        let empty = signal::Series::new(10, 1_000);
+        assert_eq!(signal_gate_rejects(&args, &empty, &cfg), Some("warming_up"));
+        let off = Args::try_parse_from(["solana-sniper", "--signal-gate", "false"]).unwrap();
+        assert_eq!(signal_gate_rejects(&off, &empty, &cfg), None);
     }
 }

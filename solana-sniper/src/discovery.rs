@@ -36,6 +36,10 @@ struct DexScreenerResponse {
 
 #[derive(Debug, Deserialize)]
 struct DexScreenerPairRaw {
+    #[serde(rename = "chainId")]
+    chain_id: Option<String>,
+    #[serde(rename = "pairAddress")]
+    pair_address: Option<String>,
     #[serde(rename = "priceUsd")]
     price_usd: Option<String>,
     liquidity: Option<DexScreenerLiquidity>,
@@ -81,18 +85,24 @@ pub fn fetch_snapshot(pair_address: &str) -> Result<DexScreenerSnapshot, String>
         .json()
         .map_err(|e| format!("failed to parse dexscreener response: {e}"))?;
 
-    let pair = body
-        .pairs
-        .and_then(|mut pairs| {
-            if pairs.is_empty() {
-                None
-            } else {
-                Some(pairs.remove(0))
-            }
-        })
-        .ok_or_else(|| format!("dexscreener has no pair data for {pair_address}"))?;
-
+    let pair = select_pair(body.pairs.unwrap_or_default(), pair_address)?;
     Ok(parse_pair(pair))
+}
+
+/// The response entry for exactly `pair_address` on Solana. The endpoint can
+/// return several or unrelated pairs; taking the first one blindly could
+/// attribute another pool's figures to this one.
+fn select_pair(
+    pairs: Vec<DexScreenerPairRaw>,
+    pair_address: &str,
+) -> Result<DexScreenerPairRaw, String> {
+    pairs
+        .into_iter()
+        .find(|p| {
+            p.chain_id.as_deref() == Some("solana")
+                && p.pair_address.as_deref() == Some(pair_address)
+        })
+        .ok_or_else(|| format!("dexscreener has no Solana pair data for {pair_address}"))
 }
 
 fn parse_pair(pair: DexScreenerPairRaw) -> DexScreenerSnapshot {
@@ -146,16 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_pairs_list_is_error_shaped() {
-        let json = r#"{"pairs": []}"#;
+    fn selects_only_the_requested_solana_pair() {
+        let json = r#"{"pairs": [
+            {"chainId": "ethereum", "pairAddress": "PAIR", "fdv": 1.0},
+            {"chainId": "solana", "pairAddress": "OTHER", "fdv": 2.0},
+            {"chainId": "solana", "pairAddress": "PAIR", "fdv": 3.0}
+        ]}"#;
         let body: DexScreenerResponse = serde_json::from_str(json).unwrap();
-        let result = body.pairs.and_then(|mut pairs| {
-            if pairs.is_empty() {
-                None
-            } else {
-                Some(pairs.remove(0))
-            }
-        });
-        assert!(result.is_none());
+        let pair = select_pair(body.pairs.unwrap(), "PAIR").unwrap();
+        assert_eq!(parse_pair(pair).fdv, Some(3.0));
+
+        let body: DexScreenerResponse =
+            serde_json::from_str(r#"{"pairs": [{"chainId": "solana", "pairAddress": "OTHER"}]}"#)
+                .unwrap();
+        assert!(select_pair(body.pairs.unwrap(), "PAIR").is_err());
+        assert!(select_pair(vec![], "PAIR").is_err());
+        let body: DexScreenerResponse = serde_json::from_str(r#"{"pairs": null}"#).unwrap();
+        assert!(select_pair(body.pairs.unwrap_or_default(), "PAIR").is_err());
     }
 }
