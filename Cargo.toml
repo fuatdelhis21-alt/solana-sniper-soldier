@@ -24,7 +24,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "time"] }
 tracing-appender = "0.2"
-prometheus = "0.13"
+prometheus = { version = "0.14", default-features = false }
 parking_lot = "0.12"
 arc-swap = "1.7"
 crossbeam = "0.8"

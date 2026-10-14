@@ -120,6 +120,16 @@ Tüm havuzların toplu sonucu (her havuz ayrı süreçte çalıştığı için):
 python3 /opt/solana-hft/sniper_report.py /var/lib/solana-hft --hours 24
 ```
 
+Giriş kararı (live/dry-run) sırası: on-chain risk kapıları → strateji →
+**sinyal kapısı** (EMA/MACD trend, RSI / volatilite / likidite vetoları; süreç
+kendi fiyat örneklerini toplar, ~34 örnek ısınma — `SNIPER_SIGNAL_*`) →
+**kesin kotasyon** (swap'ın kendisi `simulateTransaction` ile simüle edilir,
+çıktı programın kendi hesabıdır) → fiyat etkisi ≤ `SNIPER_MAX_PRICE_IMPACT_BPS`
+ve net kenar ≥ `SNIPER_MIN_NET_EDGE_BPS` → tamsayı `min_amount_out` → imza →
+gönderim. Simülasyon başarısızsa işlem yapılmaz. Paper modu imzalı işlem
+kurmaz; kotasyonu spot fiyat tahminidir. Durum ve kanıtlar:
+[docs/READINESS.md](docs/READINESS.md).
+
 Açık pozisyon için zorunlu çıkışlar (live ve paper aynı): stop-loss (-%5),
 take-profit (+%10), `SNIPER_DISCOVERY_MAX_HOLD_SECS` süresi doldu, ya da SOL
 tarafı likidite girişteki seviyenin **yarısına** düştü (likidite çekiliyor /

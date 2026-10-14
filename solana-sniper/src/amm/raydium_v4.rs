@@ -46,6 +46,10 @@ pub struct SwapTxOptions {
     /// when submitting through a Block Engine (bundles without a tip are
     /// dropped). `None` for plain RPC submission.
     pub jito_tip: Option<(Pubkey, u64)>,
+    /// Keep a native (wSOL) output wrapped: no CloseAccount of the output
+    /// account. Used only for the quote simulation, whose output amount is
+    /// read from that account's simulated state.
+    pub keep_output_wrapped: bool,
 }
 
 /// Anchor discriminator for `global:swap` = sha256("global:swap")[0..8].
@@ -284,7 +288,7 @@ impl RaydiumV4ClmmAdapter {
         if opts.input_mint == native_mint || opts.close_input_token_account {
             ixs.push(close_account_ix(&accounts.input_token_account, signer)?);
         }
-        if opts.output_mint == native_mint {
+        if opts.output_mint == native_mint && !opts.keep_output_wrapped {
             ixs.push(close_account_ix(&accounts.output_token_account, signer)?);
         }
         if let Some((tip_account, lamports)) = opts.jito_tip {
@@ -299,6 +303,44 @@ impl RaydiumV4ClmmAdapter {
         let mut tx = Transaction::new_unsigned(message);
         tx.message.recent_blockhash = blockhash;
         Ok(tx)
+    }
+
+    /// The pool's trade fee (ppm) from its AmmConfig; 500 when unresolved.
+    pub fn trade_fee_ppm(&self) -> u64 {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.trade_fee_rate)
+            .map(u64::from)
+            .unwrap_or(500)
+    }
+
+    /// The swap's output token account (where a simulation reads the
+    /// delivered amount).
+    pub fn output_token_account(&self) -> Option<Pubkey> {
+        self.accounts.as_ref().map(|a| a.output_token_account)
+    }
+
+    /// The swap transaction used for an exact on-chain quote: identical to
+    /// the real one except `minimum_amount_out = 1`, no output unwrap and no
+    /// tip (see [`crate::sim_quote`]). Simulated only, never signed or sent.
+    pub fn build_quote_transaction(
+        &self,
+        quote: &Quote,
+        signer: &Pubkey,
+        blockhash: Hash,
+        opts: &SwapTxOptions,
+    ) -> Result<Transaction, Box<dyn std::error::Error>> {
+        let intent = TradeIntent {
+            quote: quote.clone(),
+            min_output: 1,
+            pool_state_hash: String::new(),
+        };
+        let quote_opts = SwapTxOptions {
+            keep_output_wrapped: true,
+            jito_tip: None,
+            ..opts.clone()
+        };
+        self.build_swap_transaction(&intent, signer, blockhash, &quote_opts)
     }
 
     /// Compute expected output for a given input amount using constant product formula.
@@ -407,8 +449,8 @@ impl AmmAdapter for RaydiumV4ClmmAdapter {
     }
 
     fn build_intent(&self, quote: Quote) -> Result<TradeIntent, Box<dyn std::error::Error>> {
-        let min_output =
-            (quote.expected_output as f64 * (1.0 - quote.slippage_bps as f64 / 10_000.0)) as u64;
+        // Integer math, never 0 (a zero minimum accepts any price).
+        let min_output = crate::sim_quote::min_out(quote.expected_output, quote.slippage_bps);
         let pool_state_hash = {
             let mut hasher = Sha256::new();
             hasher.update(self.pool_id.as_bytes());
@@ -704,6 +746,7 @@ mod tests {
             priority_fee_micro_lamports: 10_000,
             close_input_token_account: false,
             jito_tip: None,
+            keep_output_wrapped: false,
         };
         let tx = adapter
             .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
@@ -750,6 +793,7 @@ mod tests {
             priority_fee_micro_lamports: 0,
             close_input_token_account: false,
             jito_tip: None,
+            keep_output_wrapped: false,
         };
         let tx = adapter
             .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)
@@ -861,6 +905,7 @@ mod tests {
                 priority_fee_micro_lamports: 10_000,
                 close_input_token_account: close,
                 jito_tip: tip,
+                keep_output_wrapped: false,
             };
             let tx = adapter
                 .build_swap_transaction(&intent, &signer, Hash::new_unique(), &opts)

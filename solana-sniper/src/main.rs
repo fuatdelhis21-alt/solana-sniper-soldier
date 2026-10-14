@@ -33,7 +33,7 @@ use hw_signer::SignerAdapter;
 use remote_hsm::RemoteHsmSigner;
 use solana_sniper::{
     amm, decision, discovery, hw_signer, jito, marketdata, metrics, onchain_risk, position, redact,
-    remote_hsm, retry, risk, strategy,
+    remote_hsm, retry, risk, signal, sim_quote, strategy,
 };
 
 // ============================================================================
@@ -597,6 +597,36 @@ struct Args {
     #[arg(long, env = "SNIPER_MAX_SLIPPAGE_BPS", default_value_t = 100)]
     max_slippage_bps: u64,
 
+    /// Max price impact (bps) of an entry: the exact, simulated output
+    /// against the spot-price output. Larger entries are rejected.
+    #[arg(long, env = "SNIPER_MAX_PRICE_IMPACT_BPS", default_value_t = 300)]
+    max_price_impact_bps: u64,
+
+    /// Minimum expected net edge (bps) of an entry: the take-profit target
+    /// minus both legs' trading fee, price impact and network fees.
+    #[arg(long, env = "SNIPER_MIN_NET_EDGE_BPS", default_value_t = 300)]
+    min_net_edge_bps: i64,
+
+    /// Widen the exit slippage after failed exit attempts (up to 5%). Off by
+    /// default: each exit attempt is quoted exactly by simulation, so a
+    /// wider tolerance only buys a worse price.
+    #[arg(long, env = "SNIPER_EXIT_SLIPPAGE_ESCALATION", default_value_t = false)]
+    exit_slippage_escalation: bool,
+
+    /// Signal gate on entries: EMA/MACD trend + RSI/volatility/liquidity
+    /// vetoes over this process's own timestamped pool-price samples (see
+    /// signal.rs). An entry waits until the indicators are warmed up.
+    #[arg(long, env = "SNIPER_SIGNAL_GATE", default_value_t = true, action = clap::ArgAction::Set)]
+    signal_gate: bool,
+
+    /// Minimum signal confidence (0-100) to enter.
+    #[arg(long, env = "SNIPER_SIGNAL_MIN_CONFIDENCE", default_value_t = 70)]
+    signal_min_confidence: u32,
+
+    /// Minimum spacing of the price samples (ms).
+    #[arg(long, env = "SNIPER_SIGNAL_SAMPLE_MS", default_value_t = 2000)]
+    signal_sample_ms: u64,
+
     /// Max spend in SOL for a single trade (security cap).
     #[arg(long, env = "SNIPER_MAX_SPEND_SOL", default_value_t = 0.01)]
     max_spend_sol: f64,
@@ -1008,10 +1038,84 @@ fn build_exit_tx(
         priority_fee_micro_lamports: args.priority_fee_micro_lamports,
         close_input_token_account: false,
         jito_tip,
+        keep_output_wrapped: false,
     };
     adapter
         .build_swap_transaction(&intent, from, blockhash, &opts)
         .map_err(|e| format!("exit build_transaction failed: {e}"))
+}
+
+/// The signal gate's rejection code, or `None` when the entry may proceed
+/// (or the gate is disabled).
+fn signal_gate_rejects(
+    args: &Args,
+    series: &signal::Series,
+    cfg: &signal::SignalConfig,
+) -> Option<&'static str> {
+    if !args.signal_gate {
+        return None;
+    }
+    match signal::evaluate(series, cfg) {
+        signal::SignalDecision::Trade { .. } => None,
+        signal::SignalDecision::NoTrade { reason, .. } => Some(reason),
+    }
+}
+
+/// Exact quote of a swap: the spot-price quote (reference for the price
+/// impact) and the output the deployed program actually delivers for this
+/// very swap, from an on-chain simulation (see `sim_quote`). Fail-closed:
+/// no simulated output, no quote.
+fn exact_quote(
+    rpc: &RpcClient,
+    adapter: &amm::raydium_v4::RaydiumV4ClmmAdapter,
+    amount: u64,
+    slippage_bps: u64,
+    from: &Pubkey,
+    opts: &amm::raydium_v4::SwapTxOptions,
+) -> Result<(amm::Quote, sim_quote::SimQuote), String> {
+    let spot = adapter
+        .quote(amount, slippage_bps)
+        .map_err(|e| format!("spot quote failed: {e}"))?;
+    let output_account = adapter
+        .output_token_account()
+        .ok_or("swap accounts not resolved")?;
+    let pre_balance = position::fetch_token_balance(rpc, &output_account)?;
+    let quote_tx = adapter
+        .build_quote_transaction(&spot, from, solana_sdk::hash::Hash::default(), opts)
+        .map_err(|e| format!("quote transaction build failed: {e}"))?;
+    let sim = sim_quote::simulate_swap_output(rpc, &quote_tx, &output_account, pre_balance)?;
+    Ok((spot, sim))
+}
+
+/// Entry economics gate on an exact quote: price impact and expected net
+/// edge after round-trip fees. `Err(code)` names the rejection.
+fn entry_economics(
+    args: &Args,
+    spot_out: u64,
+    exact_out: u64,
+    fee_ppm: u64,
+    position_lamports: u64,
+    jito_tip_lamports: u64,
+) -> Result<(u64, i64), &'static str> {
+    let impact = sim_quote::price_impact_bps(spot_out, exact_out);
+    let network = sim_quote::tx_network_cost_lamports(
+        args.compute_unit_limit,
+        args.priority_fee_micro_lamports,
+    ) + jito_tip_lamports;
+    let edge = sim_quote::net_edge_bps(
+        strategy_config(args).take_profit_bps,
+        fee_ppm,
+        impact,
+        network,
+        position_lamports,
+    );
+    if impact > args.max_price_impact_bps {
+        return Err("price_impact_exceeded");
+    }
+    if edge < args.min_net_edge_bps {
+        return Err("net_edge_too_small");
+    }
+    Ok((impact, edge))
 }
 
 /// Result of an RPC `simulateTransaction`.
@@ -1097,6 +1201,11 @@ async fn submit_live_tx(
     rpc_client: &RpcClient,
     tx: &Transaction,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
+    // Last line of defence: nothing is ever broadcast outside an armed live
+    // run, whatever path reached this function.
+    if !args.live || !args.confirm_live || args.paper || args.dry_run {
+        return Err("broadcast refused: not an armed live run (fail-closed)".into());
+    }
     let Some(jito_ep) = &args.jito_endpoint else {
         return retry::send_with_retry(rpc_client, tx);
     };
@@ -1280,10 +1389,38 @@ async fn manage_open_position(
         .with_program_id(program_id.to_string())
         .with_swap_accounts(accounts)
         .with_resolved_pool(pool);
-    let slippage = exit_slippage_bps(args.max_slippage_bps, exit_failures);
-    let quote = match adapter.quote(amount, slippage) {
-        Ok(q) => q,
-        Err(e) => return ExitOutcome::Failed(format!("exit quote failed: {e}")),
+    let slippage = if args.exit_slippage_escalation {
+        exit_slippage_bps(args.max_slippage_bps, exit_failures)
+    } else {
+        args.max_slippage_bps
+    };
+    let opts = amm::raydium_v4::SwapTxOptions {
+        input_mint: held_mint,
+        output_mint: back_mint,
+        compute_unit_limit: args.compute_unit_limit,
+        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
+        // Selling the whole balance empties the ATA: close it so its rent
+        // returns to the wallet and shows up in the realized P&L.
+        close_input_token_account: amount == held,
+        jito_tip,
+        keep_output_wrapped: false,
+    };
+    // The position is valued at what selling it would REALLY return (an
+    // on-chain simulation of this exit: price impact included). If the
+    // simulation is unavailable, the spot quote is used — its minimum
+    // output is stricter, so an exit never executes at a worse price.
+    let quote = match exact_quote(rpc_client, &adapter, amount, slippage, from, &opts) {
+        Ok((mut spot, sim)) => {
+            spot.expected_output = sim.amount_out;
+            spot
+        }
+        Err(e) => {
+            tracing::warn!(target: "live", error = %e, "exact exit quote unavailable — valuing at spot price");
+            match adapter.quote(amount, slippage) {
+                Ok(q) => q,
+                Err(e) => return ExitOutcome::Failed(format!("exit quote failed: {e}")),
+            }
+        }
     };
     // The exit signal compares against the amount actually swapped in (the
     // entry is exact-input), not the measured cost: the measured cost also
@@ -1350,16 +1487,6 @@ async fn manage_open_position(
     let blockhash = match blockhash_mgr.lock().unwrap().force_refresh() {
         Ok(b) => b,
         Err(e) => return ExitOutcome::Failed(format!("exit blockhash fetch failed: {e}")),
-    };
-    let opts = amm::raydium_v4::SwapTxOptions {
-        input_mint: held_mint,
-        output_mint: back_mint,
-        compute_unit_limit: args.compute_unit_limit,
-        priority_fee_micro_lamports: args.priority_fee_micro_lamports,
-        // Selling the whole balance empties the ATA: close it so its rent
-        // returns to the wallet and shows up in the realized P&L.
-        close_input_token_account: amount == held,
-        jito_tip,
     };
     let mut tx = match adapter.build_swap_transaction(&intent, from, blockhash, &opts) {
         Ok(t) => t,
@@ -1762,6 +1889,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /health turns 503 when the loop stops iterating. Generous limit: one
     // iteration may legitimately wait up to 180 s for a confirmation.
     metrics_registry.set_health_max_age(240_000 + 10 * args.loop_interval_ms.max(50));
+    // Genuine, timestamped pool-price observations for the signal gate.
+    let signal_cfg = signal::SignalConfig {
+        min_confidence: args.signal_min_confidence.min(100),
+        ..signal::SignalConfig::default()
+    };
+    let mut price_series = signal::Series::new(240, args.signal_sample_ms);
+    // Last advisory DexScreener fetch (rate-limited, see the live path).
+    let mut dexscreener_last: Option<std::time::Instant> = None;
     // --single-trade / --entry-window-secs (pool discovery supervisor).
     let run_start = std::time::Instant::now();
     let mut single_trade_done = false;
@@ -2026,6 +2161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let strat_start = std::time::Instant::now();
             paper_sim.input_is_token0 = snapshot.input_is_token0;
             paper_sim.now_ms = marketdata::now_ms() as u64;
+            price_series.push(signal::Observation {
+                ts_ms: paper_sim.now_ms,
+                price: signal::held_token_price(
+                    snapshot.current_sqrt_price,
+                    snapshot.input_is_token0,
+                ),
+                liquidity: snapshot.liquidity_lamports,
+            });
             let tick = paper_sim.tick(&candidate, snapshot.current_sqrt_price);
             paper_strategy_ms = paper_strategy_ms.saturating_add(strat_start.elapsed().as_millis());
 
@@ -2098,6 +2241,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 PaperTick::EntryPending(signal) => {
+                    if let Some(code) = signal_gate_rejects(&args, &price_series, &signal_cfg) {
+                        paper_rejects += 1;
+                        *rejected_by_reason.entry(code).or_insert(0) += 1;
+                        metrics::record_trade_rejected(&metrics_registry, "paper", code);
+                        rec.context = serde_json::json!({
+                            "action": "rejected",
+                            "reject_reason": code,
+                            "samples": price_series.len(),
+                            "source": snapshot.source,
+                            "simulated": true,
+                        });
+                        rec.save(&args.data_dir)?;
+                        tracing::info!(target: "paper", iteration = i + 1, reason = code, samples = price_series.len(), "signal gate: NO_TRADE");
+                        total_latency_ms =
+                            total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
+                        sleep(loop_interval).await;
+                        continue;
+                    }
                     // Real risk gates BEFORE the entry is simulated (same
                     // order as live): max-spend cap, then pre_trade_check.
                     let max_spend_lamports = sol_to_lamports(args.max_spend_sol);
@@ -2482,10 +2643,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     live_holder_stats = Some(holder_stats);
                 }
 
-                if args.dexscreener_check {
-                    // Advisory only — never gates the trade. A failure here
-                    // is only logged as a warning.
-                    match discovery::fetch_snapshot(pool_id_str) {
+                // Advisory only — never gates the trade. A blocking HTTP call,
+                // so at most once a minute and off the async worker.
+                if args.dexscreener_check
+                    && dexscreener_last.map_or(true, |t: std::time::Instant| {
+                        t.elapsed() >= Duration::from_secs(60)
+                    })
+                {
+                    dexscreener_last = Some(std::time::Instant::now());
+                    match tokio::task::block_in_place(|| discovery::fetch_snapshot(pool_id_str)) {
                         Ok(snapshot) => tracing::info!(
                             mode = mode_target,
                             liquidity_usd = snapshot.liquidity_usd,
@@ -2505,6 +2671,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .with_program_id(program_id.to_string())
                     .with_swap_accounts(accounts)
                     .with_resolved_pool(resolved);
+                price_series.push(signal::Observation {
+                    ts_ms: marketdata::now_ms() as u64,
+                    price: signal::held_token_price(entry_sqrt, adapter.input_is_token0()),
+                    liquidity: live_liquidity.unwrap_or(0),
+                });
                 swap_adapter = Some(adapter);
             }
 
@@ -2585,6 +2756,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
+            if args.pool_id.is_some() {
+                if let Some(code) = signal_gate_rejects(&args, &price_series, &signal_cfg) {
+                    metrics::record_trade_rejected(&metrics_registry, mode_label, code);
+                    tracing::info!(
+                        mode = mode_target,
+                        iteration = i + 1,
+                        reason = code,
+                        samples = price_series.len(),
+                        "signal gate: NO_TRADE"
+                    );
+                    rec.context = serde_json::json!({
+                        "action": "rejected",
+                        "reject_reason": code,
+                        "samples": price_series.len(),
+                    });
+                    rec.save(&args.data_dir)?;
+                    sleep(loop_interval).await;
+                    continue;
+                }
+            }
             rec.amount_in = entry_signal.position_size_lamports;
             rec.save(&args.data_dir)?;
 
@@ -2656,13 +2847,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Real swap: quote from the resolved on-chain price, apply
                     // slippage (min_amount_out), and build the full CLMM swap
                     // tx (compute budget, ATAs, SOL wrap/unwrap).
-                    let quote = adapter
-                        .quote(entry_signal.position_size_lamports, args.max_slippage_bps)
-                        .map_err(|e| format!("quote failed (fail-closed): {e}"))?;
-                    let intent = adapter
-                        .build_intent(quote)
-                        .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
-                    swap_min_output = intent.min_output;
                     let opts = amm::raydium_v4::SwapTxOptions {
                         input_mint: Pubkey::from_str(
                             args.input_mint.as_deref().unwrap_or_default(),
@@ -2676,7 +2860,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         priority_fee_micro_lamports: args.priority_fee_micro_lamports,
                         close_input_token_account: false,
                         jito_tip,
+                        keep_output_wrapped: false,
                     };
+                    // Exact quote from an on-chain simulation of this very
+                    // swap (price impact and tick crossings included), then
+                    // the economics gate. Any failure: no trade.
+                    let (spot, sim) = match exact_quote(
+                        &rpc_client,
+                        adapter,
+                        entry_signal.position_size_lamports,
+                        args.max_slippage_bps,
+                        &from,
+                        &opts,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            metrics::record_trade_rejected(
+                                &metrics_registry,
+                                mode_label,
+                                "quote_simulation_failed",
+                            );
+                            tracing::warn!(mode = mode_target, error = %e, "exact quote unavailable — no trade (fail-closed)");
+                            rec.context = serde_json::json!({
+                                "action": "rejected",
+                                "reject_reason": "quote_simulation_failed",
+                                "error": e,
+                            });
+                            rec.save(&args.data_dir)?;
+                            sleep(loop_interval).await;
+                            continue;
+                        }
+                    };
+                    let economics = entry_economics(
+                        &args,
+                        spot.expected_output,
+                        sim.amount_out,
+                        adapter.trade_fee_ppm(),
+                        entry_signal.position_size_lamports,
+                        jito_tip.map(|(_, l)| l).unwrap_or(0),
+                    );
+                    let (impact_bps, edge_bps) = match economics {
+                        Ok(v) => v,
+                        Err(code) => {
+                            metrics::record_trade_rejected(&metrics_registry, mode_label, code);
+                            tracing::warn!(
+                                mode = mode_target,
+                                reason = code,
+                                spot_out = spot.expected_output,
+                                exact_out = sim.amount_out,
+                                "entry economics rejected — no trade"
+                            );
+                            rec.context = serde_json::json!({
+                                "action": "rejected",
+                                "reject_reason": code,
+                                "spot_out": spot.expected_output,
+                                "exact_out": sim.amount_out,
+                            });
+                            rec.save(&args.data_dir)?;
+                            sleep(loop_interval).await;
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        mode = mode_target,
+                        spot_out = spot.expected_output,
+                        exact_out = sim.amount_out,
+                        impact_bps,
+                        edge_bps,
+                        compute_units = ?sim.compute_units,
+                        "exact entry quote (on-chain simulation)"
+                    );
+                    let mut exact = spot;
+                    exact.expected_output = sim.amount_out;
+                    let intent = adapter
+                        .build_intent(exact)
+                        .map_err(|e| format!("build_intent failed (fail-closed): {e}"))?;
+                    swap_min_output = intent.min_output;
                     adapter
                         .build_swap_transaction(&intent, &from, blockhash, &opts)
                         .map_err(|e| format!("build_transaction failed (fail-closed): {e}"))?
@@ -3848,5 +4107,71 @@ mod tests {
         let rm =
             risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
         assert!(reconcile_pending_entry(&dir, &mock_rpc_blockhash_expired(), &rm).is_err());
+    }
+
+    #[test]
+    fn entry_economics_rejects_impact_and_thin_edge() {
+        let args = Args::try_parse_from([
+            "solana-sniper",
+            "--compute-unit-limit",
+            "300000",
+            "--priority-fee-micro-lamports",
+            "10000",
+        ])
+        .unwrap();
+        assert_eq!(args.max_price_impact_bps, 300);
+        assert_eq!(args.min_net_edge_bps, 300);
+        assert!(!args.exit_slippage_escalation);
+        // 1% impact, 0.25% fee: 10% target - 0.5% - 2% - network ~1.6% ≈ 5.9%.
+        let (impact, edge) =
+            entry_economics(&args, 1_000_000, 990_000, 2_500, 10_000_000, 0).unwrap();
+        assert_eq!(impact, 100);
+        assert!(edge > 300, "{edge}");
+        // 4% impact > 3% cap.
+        assert_eq!(
+            entry_economics(&args, 1_000_000, 960_000, 2_500, 10_000_000, 0),
+            Err("price_impact_exceeded")
+        );
+        // 2.9% impact passes the cap but leaves too little edge after a 1% fee.
+        assert_eq!(
+            entry_economics(&args, 1_000_000, 971_000, 10_000, 10_000_000, 0),
+            Err("net_edge_too_small")
+        );
+        // A huge Jito tip on a tiny position kills the edge too.
+        assert_eq!(
+            entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000),
+            Err("net_edge_too_small")
+        );
+    }
+
+    #[test]
+    fn signal_gate_defaults_on_and_blocks_until_warmed_up() {
+        let args = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert!(args.signal_gate);
+        assert_eq!(args.signal_min_confidence, 70);
+        let cfg = signal::SignalConfig::default();
+        let empty = signal::Series::new(10, 1_000);
+        assert_eq!(signal_gate_rejects(&args, &empty, &cfg), Some("warming_up"));
+        let off = Args::try_parse_from(["solana-sniper", "--signal-gate", "false"]).unwrap();
+        assert_eq!(signal_gate_rejects(&off, &empty, &cfg), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paper_and_dry_run_can_never_broadcast() {
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let tx = Transaction::new_unsigned(solana_sdk::message::Message::new(&[], None));
+        for argv in [
+            vec!["solana-sniper", "--paper"],
+            vec!["solana-sniper", "--dry-run"],
+            vec!["solana-sniper", "--live"],
+            vec!["solana-sniper"],
+        ] {
+            let args = Args::try_parse_from(argv.clone()).unwrap();
+            let err = submit_live_tx(&args, &rpc, &tx)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("broadcast refused"), "{argv:?}: {err}");
+        }
     }
 }

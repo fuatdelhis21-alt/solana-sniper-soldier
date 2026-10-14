@@ -38,6 +38,7 @@ solana-pubkey.workspace = true
 solana-commitment-config.workspace = true
 solana-transaction-status.workspace = true
 solana-system-interface.workspace = true
+solana-account-decoder.workspace = true
 
 sha2.workspace = true
 byteorder.workspace = true

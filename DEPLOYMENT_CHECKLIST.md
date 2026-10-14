@@ -35,8 +35,12 @@ listesi: [`docs/mainnet_checklist.md`](docs/mainnet_checklist.md).
 
 - [x] Onay 3 sn sonra bırakılıyordu → blockhash geçerli olduğu sürece beklenir; belirsiz
       sonuç gerçek bakiyeden uzlaştırılır. Girişten önce boyut + 0.006 SOL rezerv kontrolü.
-- [x] Stop-loss satışı hızlı düşüşte %1 kaymaya takılabiliyordu → her başarısız çıkışta
-      tolerans bir adım artar (en fazla %5).
+- [x] Stop-loss satışı hızlı düşüşte %1 kaymaya takılabiliyordu → çıkış her denemede
+      zincir simülasyonuyla kesin kotalanır; tolerans artırma artık isteğe bağlıdır
+      (`SNIPER_EXIT_SLIPPAGE_ESCALATION`, varsayılan kapalı).
+- [x] Kotasyon spot fiyattan `f64` ile yapılıyordu (fiyat etkisi / tick geçişi yok) →
+      giriş ve çıkış `sim_quote` ile zincir simülasyonundan kesin kotalanır,
+      `min_amount_out` tamsayı aritmetiğiyle; fiyat etkisi ve net kenar kapısı.
 - [x] Pozisyon süresiz açık kalabiliyordu → `SNIPER_MAX_HOLD_SECS` (varsayılan 24 saat).
 - [x] Uç fiyat aralığındaki havuzlar için tick-array bitmap extension desteği.
 - [x] Dry-run giriş ve çıkış swap'ını zincirde simüle eder (`SNIPER_SIMULATE_PAYER` ile
