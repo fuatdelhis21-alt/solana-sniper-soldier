@@ -67,7 +67,10 @@ for f in README_DEPLOY.md solana-hft.env.example hsm.env.example generate_certs.
 done
 chmod 0755 "$RELEASE_DIR"/*.sh "$RELEASE_DIR"/*.py 2>/dev/null || true
 
-install -m 0644 "$TMPDIR"/systemd/*.service /etc/systemd/system/
+# Only our own units (never a same-named service of another bot on the host).
+for u in solana-hft.service solana-hft-sniper.service solana-hsm.service; do
+  install -m 0644 "$TMPDIR/systemd/$u" "/etc/systemd/system/$u"
+done
 
 install -d -m 0755 "$CONFIG_DIR"
 install -d -m 0700 -o solana-hsm -g solana-hsm "$CONFIG_DIR/hsm-certs"

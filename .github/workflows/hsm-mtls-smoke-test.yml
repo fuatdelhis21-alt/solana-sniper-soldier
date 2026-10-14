@@ -22,8 +22,13 @@ jobs:
 
       - name: Run HSM Server (Background)
         run: |
-          # Throwaway key for CI only; production has no ephemeral fallback.
-          nohup ./target/debug/hsm_server --dev-ephemeral-key --certs tools/hsm_server/certs --log-file hsm_audit.log > hsm_server.log 2>&1 &
+          # hsm_server has no ephemeral-key fallback: CI passes a throwaway
+          # ed25519 keypair (32-byte seed + 32-byte public key, base64) the
+          # same way production passes the real one.
+          openssl genpkey -algorithm ed25519 -outform DER -out ci_key.der
+          export HSM_KEY_B64=$( (tail -c 32 ci_key.der; openssl pkey -inform DER -in ci_key.der -pubout -outform DER | tail -c 32) | base64 -w0)
+          rm -f ci_key.der
+          nohup ./target/debug/hsm_server --certs tools/hsm_server/certs --log-file hsm_audit.log > hsm_server.log 2>&1 &
 
       - name: Wait for HSM Server + Verify mTLS Enabled
         run: |
