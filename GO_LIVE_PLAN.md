@@ -1,5 +1,11 @@
 # Solana HFT Platform — Canlıya Alma Planı (Go-Live Plan)
 
+> **Tarihsel belge.** Aşağıdaki "✅ Tamamlanan" etiketleri ilk geliştirme
+> aşamalarını anlatır ve canlıya hazır olma kanıtı değildir (ör. Phase 3'teki
+> `compute_output_amount()` yalnızca spot fiyat tahminidir; gerçek kotasyon artık
+> `sim_quote` ile zincir simülasyonundan gelir). Güncel, kanıta dayalı durum:
+> **[docs/READINESS.md](docs/READINESS.md)**.
+
 ## ✅ Tamamlanan (Phase 1-4)
 
 ### Phase 1: Execution & Signing Layer ✅
