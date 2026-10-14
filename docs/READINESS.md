@@ -10,7 +10,7 @@ Legend: ✅ verified (how is stated) · ⚠️ implemented, evidence incomplete 
 
 | # | Criterion | Status | Evidence / gap |
 |---|---|---|---|
-| 1 | Correct quotes for every enabled AMM adapter | ⚠️ | Only Raydium CLMM is enabled. Live/dry-run quotes come from `simulateTransaction` of the exact swap (`sim_quote.rs`): the deployed program computes the output (ticks, fees, impact). Verified on mainnet earlier for the entry swap (PYTH pool; launch pool `AJTe…`, 94k CU) with the previous spot-quote build; **the exact-quote build itself still needs a VPS dry-run** (see below). Paper mode still uses the spot quote (no funded payer) — its P&L is an estimate. |
+| 1 | Correct quotes for every enabled AMM adapter | ✅ (liquid pool) / ⚠️ (launch pools) | Only Raydium CLMM is enabled. Live/dry-run quotes come from `simulateTransaction` of the exact swap (`sim_quote.rs`). **Verified on mainnet 2026-10-14** (VPS dry-run, PYTH/wSOL CLMM, 0.01 SOL): `spot_out 13218796`, `exact_out 13218790`, `impact_bps 0`, `edge_bps 934`, entry and exit simulations OK (70 233 / 66 348 CU), signal gate passed after warm-up. Not yet observed on a thin launch pool, where impact is non-zero. Paper mode still uses the spot quote — its P&L is an estimate. |
 | 2 | Token decimals and swap direction tested | ✅ | Unit tests: direction from the input vault (`input_is_token0`), held-token price orientation (`signal::held_token_price`), paper exit orientation; quotes are raw-unit integers, decimals not needed. |
 | 3 | Quote output and on-chain minimum output consistent | ✅ | `min_amount_out = sim_quote::min_out(exact_out, slippage)` (integer, never 0) is placed in the same instruction that was simulated; tests in `sim_quote.rs`. |
 | 4 | Pool identity and account ownership validated | ✅ | `verify_clmm_account` (owner = CLMM program + Anchor discriminator) for PoolState and AmmConfig; tests + mainnet run. |
@@ -23,7 +23,7 @@ Legend: ✅ verified (how is stated) · ⚠️ implemented, evidence incomplete 
 | 11 | Risk state survives restarts | ✅ | Atomic `risk_state.json`, `live_position.json`, `pending_entry.json` reconciliation; tests. |
 | 12 | Discovery handles duplicate / missed events | ⚠️ | Duplicates: signature and pool dedup (tests). Missed events: `logsSubscribe` gives no delivery guarantee; there is **no backfill/reconciliation** (a CLMM-wide `getSignaturesForAddress` scan is too costly). Losses are observable (`pool_sniper_signatures_evicted_total`, `…_unresolved_total`, reconnect counter, stream-age health). |
 | 13 | Tests, formatting, compilation, lint pass | ✅ | See the latest change report (fmt, check, test, clippy `-D warnings`, release build). |
-| 14 | No unresolved P0/P1 in the enabled live path | ⚠️ | No known open P0. P1 open: exact-quote build not yet run on mainnet; exit simulation on launch pools unverified. |
+| 14 | No unresolved P0/P1 in the enabled live path | ⚠️ | No known open P0. P1 open: exit simulation on launch pools unverified (needs a payer holding the token); no paper sample with closed trades yet. |
 | 15 | Deployment and rollback documented | ✅ | `README_DEPLOY.md`, `deploy/install_release.sh`, `deploy/rollback.sh`, runbooks. |
 | 16 | No unverified claims of profitability / readiness | ✅ | This file; `GO_LIVE_PLAN.md` marked historical. No paper sample with closed trades exists yet. |
 
