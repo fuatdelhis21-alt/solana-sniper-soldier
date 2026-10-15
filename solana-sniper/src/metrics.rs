@@ -368,8 +368,6 @@ const MS_BUCKETS: [f64; 16] = [
 pub enum Stage {
     /// Market data fetch (pool state / vaults / risk data).
     MarketData,
-    /// Strategy + signal + risk gates.
-    Decision,
     /// Exact quote by on-chain simulation.
     QuoteSim,
     /// HSM signing round trip.
@@ -384,7 +382,6 @@ impl Stage {
     pub fn label(self) -> &'static str {
         match self {
             Stage::MarketData => "market_data",
-            Stage::Decision => "decision",
             Stage::QuoteSim => "quote_sim",
             Stage::Sign => "sign",
             Stage::SubmitConfirm => "submit_confirm",
@@ -496,7 +493,6 @@ mod tests {
         let m = Metrics::new();
         for st in [
             Stage::MarketData,
-            Stage::Decision,
             Stage::QuoteSim,
             Stage::Sign,
             Stage::SubmitConfirm,
@@ -506,7 +502,7 @@ mod tests {
         }
         let out = m.render();
         assert!(out.contains("sniper_stage_latency_ms_bucket{stage=\"quote_sim\",le=\"25\"} 1"));
-        assert_eq!(out.matches("sniper_stage_latency_ms_count{").count(), 6);
+        assert_eq!(out.matches("sniper_stage_latency_ms_count{").count(), 5);
         record_hsm(&m, true, 40.0);
         assert!(m
             .render()

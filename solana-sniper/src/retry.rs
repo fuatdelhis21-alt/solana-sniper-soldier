@@ -166,7 +166,7 @@ pub fn confirm_transaction_with(
         }
         polls += 1;
         let past_deadline = started.elapsed() > timing.deadline;
-        if past_deadline || polls % timing.validity_every.max(1) == 0 {
+        if past_deadline || polls.is_multiple_of(timing.validity_every.max(1)) {
             let valid = rpc.is_blockhash_valid(
                 blockhash,
                 solana_commitment_config::CommitmentConfig::processed(),

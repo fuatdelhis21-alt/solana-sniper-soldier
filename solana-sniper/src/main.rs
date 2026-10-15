@@ -1663,6 +1663,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         strategy::StrategyConfig::default().max_trade_size_lamports,
         risk_cfg.max_trade_size_lamports,
     )?;
+    // One live process per data dir, taken BEFORE the risk state is read so
+    // no other process can change it underneath this one.
+    let _instance_lock = if args.live {
+        Some(position::InstanceLock::acquire(&args.data_dir)?)
+    } else {
+        None
+    };
     let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg.clone()));
     tracing::info!(
         target: "main",
@@ -2464,7 +2471,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
 
             // Periodic metrics snapshot (paper included; mode-labeled).
-            if total_trades > 0 && total_trades % 10 == 0 {
+            if total_trades > 0 && total_trades.is_multiple_of(10) {
                 let avg_latency = total_latency_ms / paper_iterations.max(1) as u128;
                 use std::io::Write;
                 let metrics_path = args.data_dir.join("metrics.jsonl");
@@ -2763,9 +2770,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Advisory only — never gates the trade. A blocking HTTP call,
                 // so at most once a minute and off the async worker.
                 if args.dexscreener_check
-                    && dexscreener_last.map_or(true, |t: std::time::Instant| {
-                        t.elapsed() >= Duration::from_secs(60)
-                    })
+                    && dexscreener_last
+                        .is_none_or(|t: std::time::Instant| t.elapsed() >= Duration::from_secs(60))
                 {
                     dexscreener_last = Some(std::time::Instant::now());
                     match tokio::task::block_in_place(|| discovery::fetch_snapshot(pool_id_str)) {
@@ -3399,7 +3405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_latency_ms = total_latency_ms.saturating_add(elapsed_ms);
         total_trades += 1;
 
-        if total_trades % 10 == 0 {
+        if total_trades.is_multiple_of(10) {
             let avg_latency = if total_trades > 0 {
                 total_latency_ms / total_trades as u128
             } else {
