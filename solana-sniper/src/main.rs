@@ -3206,6 +3206,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 i + 1
                             ),
                         }
+                        // The payer usually holds none of a fresh launch
+                        // token, so its exit simulation cannot pass. Run the
+                        // same exit once more as an existing wallet holder
+                        // of the token (read-only simulation, nothing is
+                        // signed): a pass shows the exit path itself works
+                        // on this pool.
+                        let held =
+                            Pubkey::from_str(args.output_mint.as_deref().unwrap_or_default());
+                        if let Ok(held) = held {
+                            match onchain_risk::find_simulation_holder(
+                                &rpc_client,
+                                &held,
+                                swap_min_output,
+                            ) {
+                                Ok(Some(holder)) => match build_exit_tx(
+                                    &args,
+                                    &rpc_client,
+                                    &holder,
+                                    swap_min_output,
+                                    blockhash,
+                                    jito_tip,
+                                )
+                                .and_then(|t| simulate_on_chain(&rpc_client, &t))
+                                {
+                                    Ok(sim) => {
+                                        let ok = sim.err.is_none();
+                                        println!(
+                                            "[DRY-RUN] iter {}: EXIT simulation as token holder {holder}: {} (compute units {:?}){}",
+                                            i + 1,
+                                            if ok { "OK" } else { "FAILED" },
+                                            sim.units,
+                                            sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                        );
+                                        if !ok {
+                                            for line in sim.logs.iter().rev().take(8).rev() {
+                                                println!("    {line}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!(
+                                        "[DRY-RUN] iter {}: EXIT simulation as token holder unavailable: {e}",
+                                        i + 1
+                                    ),
+                                },
+                                Ok(None) => println!(
+                                    "[DRY-RUN] iter {}: no wallet holds >= {swap_min_output} of the token in its ATA — exit path unverified on this pool",
+                                    i + 1
+                                ),
+                                Err(e) => println!(
+                                    "[DRY-RUN] iter {}: token holder lookup failed: {e}",
+                                    i + 1
+                                ),
+                            }
+                        }
                     }
                     tracing::info!(
                         target: "dry_run",

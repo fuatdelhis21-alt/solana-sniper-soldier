@@ -202,6 +202,50 @@ pub fn fetch_holder_stats_cached(
     Ok(stats)
 }
 
+/// Pick a wallet that can stand in as the payer of an exit SIMULATION
+/// (dry-run only; nothing is signed or sent): an on-curve owner whose
+/// associated token account holds at least `min_amount` of `mint`, so the
+/// exit swap built for that owner is the same one the bot would send. Pure.
+pub fn pick_simulation_holder(
+    mint: &Pubkey,
+    accounts: &[(Pubkey, Option<Vec<u8>>)],
+    min_amount: u64,
+) -> Option<Pubkey> {
+    accounts.iter().find_map(|(addr, data)| {
+        let data = data.as_ref()?;
+        let owner = token_account_owner(data)?;
+        let amount = crate::sim_quote::token_amount(data)?;
+        (owner.is_on_curve()
+            && amount >= min_amount
+            && *addr == crate::amm::account_resolver::resolve_user_ata(&owner, mint))
+        .then_some(owner)
+    })
+}
+
+/// `pick_simulation_holder` over the mint's largest token accounts.
+pub fn find_simulation_holder(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    min_amount: u64,
+) -> Result<Option<Pubkey>, String> {
+    let largest = rpc
+        .get_token_largest_accounts(mint)
+        .map_err(|e| format!("failed to fetch largest accounts for {mint}: {e}"))?;
+    let addrs: Vec<Pubkey> = largest
+        .iter()
+        .filter_map(|e| Pubkey::from_str(&e.address).ok())
+        .collect();
+    let accs = rpc
+        .get_multiple_accounts(&addrs)
+        .map_err(|e| format!("failed to fetch token accounts for {mint}: {e}"))?;
+    let pairs: Vec<(Pubkey, Option<Vec<u8>>)> = addrs
+        .into_iter()
+        .zip(accs)
+        .map(|(a, acc)| (a, acc.map(|x| x.data)))
+        .collect();
+    Ok(pick_simulation_holder(mint, &pairs, min_amount))
+}
+
 /// Owner field of an SPL token account (bytes 32..64), if the data is long
 /// enough to be one.
 fn token_account_owner(data: &[u8]) -> Option<Pubkey> {
@@ -647,4 +691,31 @@ fn classify_mint_rejects_token_2022_and_malformed_mints() {
     let mut bad = clean.clone();
     bad[0] = 7;
     assert!(classify_mint(&mint, &spl, &bad).is_err());
+}
+
+#[test]
+fn simulation_holder_must_be_an_on_curve_ata_with_enough_tokens() {
+    use solana_sdk::signature::Signer;
+    let mint = Pubkey::new_unique();
+    let wallet = solana_sdk::signature::Keypair::new().pubkey();
+    let (pda, _) = Pubkey::find_program_address(&[b"v"], &Pubkey::new_unique());
+    let acct = |owner: &Pubkey, amount: u64| {
+        let mut d = vec![0u8; 165];
+        d[0..32].copy_from_slice(mint.as_ref());
+        d[32..64].copy_from_slice(owner.as_ref());
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        Some(d)
+    };
+    let ata = |o: &Pubkey| crate::amm::account_resolver::resolve_user_ata(o, &mint);
+    // PDA vault, non-ATA account, too-small balance, missing data: skipped.
+    let accounts = vec![
+        (Pubkey::new_unique(), acct(&pda, 1_000)),
+        (Pubkey::new_unique(), acct(&wallet, 1_000)),
+        (ata(&wallet), acct(&wallet, 10)),
+        (Pubkey::new_unique(), None),
+    ];
+    assert_eq!(pick_simulation_holder(&mint, &accounts, 100), None);
+    let mut ok = accounts.clone();
+    ok.push((ata(&wallet), acct(&wallet, 500)));
+    assert_eq!(pick_simulation_holder(&mint, &ok, 100), Some(wallet));
 }
