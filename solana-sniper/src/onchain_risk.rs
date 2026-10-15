@@ -287,30 +287,49 @@ pub fn fetch_mint_authority_risk(
     let account = rpc
         .get_account(mint)
         .map_err(|e| format!("failed to fetch mint account {mint}: {e}"))?;
-    // The swap path derives classic SPL Token ATAs and passes the classic
-    // token program: a Token-2022 mint (transfer fees, hooks, ...) cannot be
-    // traded safely here — reject it explicitly (fail-closed).
-    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    if account.owner != spl_token {
+    classify_mint(mint, &account.owner, &account.data)
+}
+
+/// Classic SPL Token program id.
+pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+/// Classify a mint account (pure). The swap path derives classic SPL Token
+/// ATAs and passes the classic token program: a Token-2022 mint (transfer
+/// fees, hooks, ...) or any other owner cannot be traded safely here and is
+/// rejected (the error text contains "Token-2022", which discovery treats
+/// as a permanent rejection). A malformed, wrong-size or uninitialized mint
+/// is an error too — never "safe".
+pub fn classify_mint(
+    mint: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+) -> Result<MintAuthorityRisk, String> {
+    let spl_token = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+    if *owner != spl_token {
         return Err(format!(
-            "mint {mint} is owned by {} — only classic SPL Token mints are supported (Token-2022 rejected)",
-            account.owner
+            "mint {mint} is owned by {owner} — only classic SPL Token mints are supported (Token-2022 rejected)"
         ));
     }
-    // SPL Token Mint account is exactly 82 bytes (Token-2022 mints are
-    // longer due to extensions, but the base Mint layout is a fixed prefix
-    // in both, so this parse is valid for both program versions).
-    if account.data.len() < 82 {
+    // Classic SPL Mint: exactly 82 bytes — COption<Pubkey> mint authority
+    // (0..36), supply (36..44), decimals (44), is_initialized (45),
+    // COption<Pubkey> freeze authority (46..82).
+    if data.len() != 82 {
         return Err(format!(
-            "mint {mint} account data too short ({} bytes) to be a valid SPL Mint",
-            account.data.len()
+            "mint {mint} account data is {} bytes, not an SPL Mint (82)",
+            data.len()
         ));
     }
-    let mint_authority_tag = u32::from_le_bytes(account.data[0..4].try_into().unwrap());
-    let freeze_authority_tag = u32::from_le_bytes(account.data[46..50].try_into().unwrap());
+    if data[45] != 1 {
+        return Err(format!("mint {mint} is not initialized"));
+    }
+    let tag = |r: std::ops::Range<usize>| u32::from_le_bytes(data[r].try_into().unwrap());
+    let (mint_tag, freeze_tag) = (tag(0..4), tag(46..50));
+    if mint_tag > 1 || freeze_tag > 1 {
+        return Err(format!("mint {mint} has a malformed authority option"));
+    }
     Ok(MintAuthorityRisk {
-        mint_authority_present: mint_authority_tag != 0,
-        freeze_authority_present: freeze_authority_tag != 0,
+        mint_authority_present: mint_tag != 0,
+        freeze_authority_present: freeze_tag != 0,
     })
 }
 
@@ -583,4 +602,49 @@ fn token_account_owner_parses_spl_layout_and_curve_check() {
         assert_eq!(parsed.is_on_curve(), on_curve);
     }
     assert!(token_account_owner(&[0u8; 40]).is_none());
+}
+
+#[test]
+fn classify_mint_rejects_token_2022_and_malformed_mints() {
+    let mint = Pubkey::new_unique();
+    let spl = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let mut clean = vec![0u8; 82];
+    clean[45] = 1;
+    let r = classify_mint(&mint, &spl, &clean).unwrap();
+    assert!(!r.is_risky());
+
+    // Token-2022 (and any other owner) is rejected with the marker text
+    // discovery relies on, even when the base layout looks clean.
+    let mut ext = clean.clone();
+    ext.resize(200, 0);
+    for owner in [token_2022, Pubkey::new_unique()] {
+        let e = classify_mint(&mint, &owner, &ext).unwrap_err();
+        assert!(e.contains("Token-2022"), "{e}");
+    }
+
+    let mut auth = clean.clone();
+    auth[0] = 1;
+    assert!(
+        classify_mint(&mint, &spl, &auth)
+            .unwrap()
+            .mint_authority_present
+    );
+    let mut frz = clean.clone();
+    frz[46] = 1;
+    assert!(
+        classify_mint(&mint, &spl, &frz)
+            .unwrap()
+            .freeze_authority_present
+    );
+
+    // Wrong size, uninitialized, malformed option tags: errors, never safe.
+    assert!(classify_mint(&mint, &spl, &clean[..81]).is_err());
+    assert!(classify_mint(&mint, &spl, &ext).is_err());
+    let mut uninit = clean.clone();
+    uninit[45] = 0;
+    assert!(classify_mint(&mint, &spl, &uninit).is_err());
+    let mut bad = clean.clone();
+    bad[0] = 7;
+    assert!(classify_mint(&mint, &spl, &bad).is_err());
 }

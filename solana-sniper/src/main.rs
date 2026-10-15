@@ -4386,4 +4386,37 @@ mod tests {
             assert!(err.contains("broadcast refused"), "{argv:?}: {err}");
         }
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_exit_keeps_the_position_and_ignores_entry_gates() {
+        let (dir, p) = pending_fixture();
+        let pos = p.position.clone();
+        pos.save(&dir).unwrap();
+        let args = Args::try_parse_from(["solana-sniper", "--live"]).unwrap();
+        let rpc = Arc::new(RpcClient::new_mock("fails".to_string()));
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        // Entry gates closed: the exit must still be attempted.
+        rm.trigger_kill_switch("test");
+        let m = metrics::Metrics::new();
+        let bh = std::sync::Mutex::new(retry::BlockhashManager::new(rpc.clone()));
+        let out = manage_open_position(
+            &args,
+            &rpc,
+            &rm,
+            &m,
+            &bh,
+            &Pubkey::new_unique(),
+            &pos,
+            None,
+            0,
+        )
+        .await;
+        match out {
+            ExitOutcome::Failed(e) => assert!(!e.contains("kill"), "{e}"),
+            other => panic!("expected a failed exit, got {other:?}"),
+        }
+        // The position record is untouched: the next iteration retries.
+        assert!(position::LivePosition::load(&dir).unwrap().is_some());
+    }
 }

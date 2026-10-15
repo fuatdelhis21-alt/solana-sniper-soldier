@@ -442,4 +442,17 @@ mod tests {
         assert_eq!(token_amount(&d), Some(42));
         assert_eq!(token_amount(&d[..70]), None);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulation_errors_and_missing_state_fail_closed() {
+        let tx = Transaction::new_unsigned(solana_sdk::message::Message::new(&[], None));
+        let acct = Pubkey::new_unique();
+        // RPC failure.
+        let rpc = RpcClient::new_mock("fails".to_string());
+        assert!(simulate_swap_output(&rpc, &tx, &acct, 0).is_err());
+        // A successful simulation that returns no output account state.
+        let rpc = RpcClient::new_mock("succeeds".to_string());
+        let e = simulate_swap_output(&rpc, &tx, &acct, 0).unwrap_err();
+        assert!(e.contains("no output account"), "{e}");
+    }
 }
