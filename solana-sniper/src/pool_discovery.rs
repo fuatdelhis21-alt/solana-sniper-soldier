@@ -117,6 +117,8 @@ pub struct Candidate {
 pub struct WatchList {
     items: VecDeque<Candidate>,
     seen: HashSet<Pubkey>,
+    /// Insertion order of `seen`, so the dedup set stays bounded.
+    seen_order: VecDeque<Pubkey>,
     max_len: usize,
     watch_ms: u64,
     recheck_ms: u64,
@@ -127,6 +129,7 @@ impl WatchList {
         Self {
             items: VecDeque::new(),
             seen: HashSet::new(),
+            seen_order: VecDeque::new(),
             max_len: max_len.max(1),
             watch_ms,
             recheck_ms: recheck_ms.max(1),
@@ -145,7 +148,7 @@ impl WatchList {
     /// list). The oldest entry is dropped when the list is full. Returns
     /// whether it was added.
     pub fn add(&mut self, pool: NewPool, token_mint: Pubkey, now_ms: u64) -> bool {
-        if !self.seen.insert(pool.pool_id) {
+        if !self.remember(pool.pool_id) {
             return false;
         }
         if self.items.len() >= self.max_len {
@@ -166,8 +169,32 @@ impl WatchList {
     /// Mark a pool as already handled (e.g. a resumed live position) so a
     /// late CreatePool notification never re-adds it.
     pub fn mark_seen(&mut self, pool_id: Pubkey) {
-        self.seen.insert(pool_id);
+        self.remember(pool_id);
         self.items.retain(|c| c.pool.pool_id != pool_id);
+    }
+
+    /// Dedup memory: at most this many pool ids (oldest forgotten first; a
+    /// CreatePool is not re-emitted, so only a very late duplicate of a
+    /// pool this old could slip through, and the trading process still
+    /// applies every gate).
+    pub const MAX_SEEN: usize = 100_000;
+
+    fn remember(&mut self, pool_id: Pubkey) -> bool {
+        if !self.seen.insert(pool_id) {
+            return false;
+        }
+        self.seen_order.push_back(pool_id);
+        while self.seen_order.len() > Self::MAX_SEEN {
+            if let Some(old) = self.seen_order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn seen_len(&self) -> usize {
+        self.seen.len()
     }
 
     /// Drop candidates whose watch time is over; returns them.
@@ -197,7 +224,7 @@ impl WatchList {
 }
 
 /// Per-UTC-day counter of started trading processes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DailyCap {
     day: i64,
     count: u32,
@@ -288,6 +315,43 @@ impl PendingSignatures {
 
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+}
+
+/// Discovery state that must survive a supervisor restart: the per-day
+/// start counter (else a restart resets `--max-pools-per-day`) and the pools
+/// already handed to a trading process (else a re-delivered or replayed
+/// event could start a second process on the same pool). Bounded.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryState {
+    pub daily: DailyCap,
+    pub traded_pools: VecDeque<String>,
+}
+
+impl DiscoveryState {
+    pub const MAX_TRADED_POOLS: usize = 5_000;
+    pub const FILE: &'static str = "discovery_state.json";
+
+    /// Record a started trading process for `pool`.
+    pub fn record_start(&mut self, pool: &str, now_ms: u64) {
+        self.daily.record(now_ms);
+        if !self.traded_pools.iter().any(|p| p == pool) {
+            self.traded_pools.push_back(pool.to_string());
+            while self.traded_pools.len() > Self::MAX_TRADED_POOLS {
+                self.traded_pools.pop_front();
+            }
+        }
+    }
+
+    /// Parse a persisted state. A corrupt file is an error (the caller must
+    /// not silently start from zero: that would reset the daily cap).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut st: Self =
+            serde_json::from_str(raw).map_err(|e| format!("corrupt discovery state: {e}"))?;
+        while st.traded_pools.len() > Self::MAX_TRADED_POOLS {
+            st.traded_pools.pop_front();
+        }
+        Ok(st)
     }
 }
 
@@ -451,5 +515,35 @@ mod tests {
         }
         assert!(!p.retry(s));
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn discovery_state_roundtrips_bounded_and_rejects_corruption() {
+        let mut st = DiscoveryState::default();
+        let day = 20_000 * 86_400_000;
+        st.record_start("A", day + 1);
+        st.record_start("A", day + 2);
+        st.record_start("B", day + 3);
+        assert_eq!(st.traded_pools.len(), 2);
+        let raw = serde_json::to_string(&st).unwrap();
+        let mut back = DiscoveryState::parse(&raw).unwrap();
+        assert_eq!(back, st);
+        // The daily cap survives the restart, and resets on the next day.
+        assert!(back.daily.reached(day + 10, 3));
+        assert!(!back.daily.reached(day + 86_400_000, 1));
+        assert!(DiscoveryState::parse("{ not json").is_err());
+        for i in 0..DiscoveryState::MAX_TRADED_POOLS + 10 {
+            st.record_start(&i.to_string(), day);
+        }
+        assert_eq!(st.traded_pools.len(), DiscoveryState::MAX_TRADED_POOLS);
+    }
+
+    #[test]
+    fn dedup_memory_is_bounded() {
+        let mut w = WatchList::new(10, 1_000, 100);
+        for _ in 0..WatchList::MAX_SEEN + 5 {
+            w.mark_seen(Pubkey::new_unique());
+        }
+        assert_eq!(w.seen_len(), WatchList::MAX_SEEN);
     }
 }

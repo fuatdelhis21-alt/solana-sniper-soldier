@@ -23,6 +23,26 @@ use crate::amm::raydium_v4::NATIVE_MINT;
 
 const POSITION_FILE: &str = "live_position.json";
 
+/// Crash-safe file replacement: write `tmp`, fsync it, rename it over
+/// `path`, then fsync the directory so the rename itself is durable. A
+/// crash leaves either the old or the new content, never a torn file.
+pub fn write_atomic(path: &Path, tmp: &Path, body: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f =
+        std::fs::File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    f.write_all(body)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(tmp, path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// One open live position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LivePosition {
@@ -71,9 +91,7 @@ impl LivePosition {
         let path = Self::path(data_dir);
         let tmp = data_dir.join(format!("{POSITION_FILE}.tmp"));
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("cannot rename to {}: {e}", path.display()))
+        write_atomic(&path, &tmp, body.as_bytes())
     }
 
     /// Remove the record after a confirmed exit.
@@ -136,9 +154,7 @@ impl PendingEntry {
         let path = Self::path(data_dir);
         let tmp = data_dir.join(format!("{PENDING_FILE}.tmp"));
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("cannot rename to {}: {e}", path.display()))
+        write_atomic(&path, &tmp, body.as_bytes())
     }
 
     pub fn clear(data_dir: &Path) -> Result<(), String> {

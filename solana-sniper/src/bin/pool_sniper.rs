@@ -32,7 +32,7 @@ use solana_sniper::amm::account_resolver;
 use solana_sniper::onchain_risk;
 use solana_sniper::pool_discovery::{
     find_create_pools, logs_contain_create_pool, resolve_indexes, token_side, Candidate,
-    CheckOutcome, DailyCap, NewPool, PendingSignatures, RawInstruction, WatchList,
+    CheckOutcome, DiscoveryState, NewPool, PendingSignatures, RawInstruction, WatchList,
 };
 use solana_sniper::position::{LivePosition, PendingEntry};
 use solana_sniper::redact::RedactingMakeWriter;
@@ -168,10 +168,48 @@ struct Status {
     pools_expired: AtomicU64,
     children_started: AtomicU64,
     child_startup_failures: AtomicU64,
+    /// Unix ms of the last moment discovery may have missed a pool (stream
+    /// reconnect, queue overflow, unresolvable CreatePool); 0 = never.
+    last_gap_ms: AtomicU64,
+    /// Discovery state could not be persisted: no new pools are started.
+    state_persist_failed: AtomicBool,
 }
 
 fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a possible discovery gap and remember when it happened.
+fn gap(st: &Status, c: &AtomicU64) {
+    bump(c);
+    st.last_gap_ms.store(now_ms(), Ordering::SeqCst);
+}
+
+/// /ready stays 503 this long after a possible gap: `logsSubscribe` has no
+/// replay and a CLMM-wide signature backfill is too costly, so a gap is
+/// reported instead of silently treated as complete coverage.
+const GAP_READY_WINDOW_MS: u64 = 300_000;
+
+/// Bound of the listener → supervisor signature channel.
+const SIGNATURE_CHANNEL_CAP: usize = 1_024;
+
+fn ready_verdict(st: &Status, now: u64) -> Result<(), String> {
+    health_verdict(
+        st.loop_ms.load(Ordering::SeqCst),
+        st.ws_ms.load(Ordering::SeqCst),
+        now,
+    )?;
+    if st.state_persist_failed.load(Ordering::SeqCst) {
+        return Err("discovery state not persisted — new pools blocked".into());
+    }
+    let g = st.last_gap_ms.load(Ordering::SeqCst);
+    if g != 0 && now.saturating_sub(g) < GAP_READY_WINDOW_MS {
+        return Err(format!(
+            "possible discovery gap {} s ago (reconnect / overflow / unresolved)",
+            now.saturating_sub(g) / 1000
+        ));
+    }
+    Ok(())
 }
 
 /// A busy program like the CLMM emits logs every few seconds; minutes of
@@ -191,9 +229,12 @@ fn health_verdict(loop_ms: u64, ws_ms: u64, now: u64) -> Result<(), String> {
 
 fn render_status(st: &Status, now: u64) -> String {
     let ws = st.ws_ms.load(Ordering::SeqCst);
+    let g = st.last_gap_ms.load(Ordering::SeqCst);
     let mut out = format!(
-        "pool_sniper_ws_last_message_age_ms {}\npool_sniper_watch_list {}\npool_sniper_pools_started_today {}\npool_sniper_child_running {}\n",
+        "pool_sniper_ws_last_message_age_ms {}\npool_sniper_last_gap_age_ms {}\npool_sniper_ready {}\npool_sniper_watch_list {}\npool_sniper_pools_started_today {}\npool_sniper_child_running {}\n",
         if ws == 0 { -1 } else { now.saturating_sub(ws) as i64 },
+        if g == 0 { -1 } else { now.saturating_sub(g) as i64 },
+        ready_verdict(st, now).is_ok() as u8,
         st.watched.load(Ordering::SeqCst),
         st.started_today.load(Ordering::SeqCst),
         st.child_running.load(Ordering::SeqCst) as u8,
@@ -240,6 +281,10 @@ fn spawn_health_server(addr: &str, st: Arc<Status>) -> Result<(), String> {
                     Ok(()) => ("200 OK", "ok".to_string()),
                     Err(e) => ("503 Service Unavailable", e),
                 },
+                "/ready" => match ready_verdict(&st, now) {
+                    Ok(()) => ("200 OK", "ready".to_string()),
+                    Err(e) => ("503 Service Unavailable", e),
+                },
                 "/metrics" => ("200 OK", render_status(&st, now)),
                 _ => ("404 Not Found", "not found".to_string()),
             };
@@ -251,6 +296,15 @@ fn spawn_health_server(addr: &str, st: Arc<Status>) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+fn save_discovery_state(dir: &Path, st: &DiscoveryState) -> Result<(), String> {
+    let body = serde_json::to_vec(st).map_err(|e| e.to_string())?;
+    solana_sniper::position::write_atomic(
+        &dir.join(DiscoveryState::FILE),
+        &dir.join(format!("{}.tmp", DiscoveryState::FILE)),
+        &body,
+    )
 }
 
 fn now_ms() -> u64 {
@@ -378,7 +432,7 @@ fn send_sigterm(pid: u32) {
 fn spawn_log_listener(
     ws: String,
     program: Pubkey,
-    tx: mpsc::Sender<String>,
+    tx: mpsc::SyncSender<String>,
     shutdown: Arc<AtomicBool>,
     status: Arc<Status>,
 ) {
@@ -395,7 +449,7 @@ fn spawn_log_listener(
             let (mut client, receiver) = match sub {
                 Ok(v) => v,
                 Err(e) => {
-                    bump(&status.stream_reconnects);
+                    gap(&status, &status.stream_reconnects);
                     tracing::warn!(target: "discovery", error = %e, backoff, "logsSubscribe failed — retrying");
                     std::thread::sleep(Duration::from_secs(backoff));
                     backoff = (backoff * 2).min(60);
@@ -415,13 +469,18 @@ fn spawn_log_listener(
                         if v.err.is_none() && logs_contain_create_pool(&v.logs) {
                             bump(&status.create_pool_seen);
                             tracing::info!(target: "discovery", signature = %v.signature, "CreatePool seen");
-                            if tx.send(v.signature).is_err() {
-                                return;
+                            match tx.try_send(v.signature) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    gap(&status, &status.signatures_evicted);
+                                    tracing::warn!(target: "discovery", "signature channel full — CreatePool dropped");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => return,
                             }
                         }
                     }
                     Err(e) => {
-                        bump(&status.stream_reconnects);
+                        gap(&status, &status.stream_reconnects);
                         tracing::warn!(target: "discovery", error = %e, "log stream ended — reconnecting");
                         break;
                     }
@@ -632,12 +691,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let rpc = RpcClient::new_with_commitment(args.rpc.clone(), CommitmentConfig::confirmed());
-    let (sig_tx, sig_rx) = mpsc::channel::<String>();
+    let (sig_tx, sig_rx) = mpsc::sync_channel::<String>(SIGNATURE_CHANNEL_CAP);
     let status = Arc::new(Status::default());
     status.loop_ms.store(now_ms(), Ordering::SeqCst);
     if !args.health_addr.trim().is_empty() {
         spawn_health_server(args.health_addr.trim(), status.clone())?;
-        tracing::info!(target: "discovery", addr = %args.health_addr, "health server listening (/health, /metrics)");
+        tracing::info!(target: "discovery", addr = %args.health_addr, "health server listening (/health, /ready, /metrics)");
     }
     spawn_log_listener(
         args.ws.clone(),
@@ -653,7 +712,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.watch_secs * 1000,
         args.recheck_secs * 1000,
     );
-    let mut daily = DailyCap::default();
+    // Restart-safe discovery state; a corrupt file refuses to start (it
+    // would silently reset the daily pool cap).
+    let state_path = args.data_dir.join(DiscoveryState::FILE);
+    let mut disc_state = match std::fs::read_to_string(&state_path) {
+        Ok(raw) => DiscoveryState::parse(&raw)
+            .map_err(|e| format!("{e} ({}) — fix or remove it", state_path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DiscoveryState::default(),
+        Err(e) => return Err(format!("cannot read {}: {e}", state_path.display()).into()),
+    };
+    for p in &disc_state.traded_pools {
+        if let Ok(pk) = Pubkey::from_str(p) {
+            watch.mark_seen(pk);
+        }
+    }
+    tracing::info!(target: "discovery", traded_pools = disc_state.traded_pools.len(), started_today = disc_state.daily.count(now_ms()), "discovery state restored");
     let mut running: Option<Running> = None;
     let mut risk_blocked_until: Option<Instant> = None;
     // A process that runs longer than this is stopped (SIGTERM; a live
@@ -666,7 +739,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status.watched.store(watch.len() as u64, Ordering::SeqCst);
         status
             .started_today
-            .store(daily.count(now) as u64, Ordering::SeqCst);
+            .store(disc_state.daily.count(now) as u64, Ordering::SeqCst);
         status
             .child_running
             .store(running.is_some(), Ordering::SeqCst);
@@ -720,7 +793,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 2) New CreatePool signatures → watch list.
         while let Ok(sig) = sig_rx.try_recv() {
             if pending.push(sig) {
-                bump(&status.signatures_evicted);
+                gap(&status, &status.signatures_evicted);
                 tracing::warn!(target: "discovery", "pending signature queue full — oldest CreatePool dropped");
             }
         }
@@ -746,13 +819,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(None) => {
                     if !pending.retry(sig) {
-                        bump(&status.signatures_unresolved);
+                        gap(&status, &status.signatures_unresolved);
                     }
                 }
                 Err(e) => {
                     tracing::warn!(target: "discovery", signature = %sig, error = %e, "CreatePool transaction fetch failed");
                     if !pending.retry(sig) {
-                        bump(&status.signatures_unresolved);
+                        gap(&status, &status.signatures_unresolved);
                     }
                 }
             }
@@ -801,8 +874,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
 
-            let blocked = risk_blocked_until.is_some_and(|t| Instant::now() < t);
-            if !blocked && !daily.reached(now, args.max_pools_per_day) {
+            let blocked = risk_blocked_until.is_some_and(|t| Instant::now() < t)
+                || status.state_persist_failed.load(Ordering::SeqCst);
+            if !blocked && !disc_state.daily.reached(now, args.max_pools_per_day) {
                 match risk_allows_entry(&args) {
                     Err(e) => {
                         tracing::warn!(target: "discovery", reason = %e, "risk limits reached — no new pools for now");
@@ -827,7 +901,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &c.token_mint.to_string(),
                                     ) {
                                         Ok(r) => {
-                                            daily.record(now_ms());
+                                            disc_state.record_start(&pool, now_ms());
+                                            if let Err(e) =
+                                                save_discovery_state(&args.data_dir, &disc_state)
+                                            {
+                                                status
+                                                    .state_persist_failed
+                                                    .store(true, Ordering::SeqCst);
+                                                tracing::error!(target: "discovery", error = %e, "cannot persist discovery state — no further pools will be started");
+                                            }
                                             bump(&status.children_started);
                                             running = Some(r);
                                         }
@@ -922,6 +1004,28 @@ mod tests {
         let out = render_status(&st, now);
         assert!(out.contains("pool_sniper_watch_list 3"));
         assert!(out.contains("pool_sniper_ws_last_message_age_ms -1"));
+    }
+
+    #[test]
+    fn ready_reports_gaps_and_persist_failures() {
+        let st = Status::default();
+        let now = now_ms();
+        st.loop_ms.store(now, Ordering::SeqCst);
+        st.ws_ms.store(now, Ordering::SeqCst);
+        assert!(ready_verdict(&st, now).is_ok());
+        gap(&st, &st.stream_reconnects);
+        assert!(ready_verdict(&st, now_ms()).is_err(), "fresh gap");
+        // Once the window has passed (with a live loop and stream) it is ready.
+        let later = now_ms() + GAP_READY_WINDOW_MS;
+        st.loop_ms.store(later, Ordering::SeqCst);
+        st.ws_ms.store(later, Ordering::SeqCst);
+        assert!(ready_verdict(&st, later).is_ok());
+        let st2 = Status::default();
+        st2.loop_ms.store(now, Ordering::SeqCst);
+        st2.ws_ms.store(now, Ordering::SeqCst);
+        st2.state_persist_failed.store(true, Ordering::SeqCst);
+        assert!(ready_verdict(&st2, now).is_err());
+        assert!(render_status(&st2, now).contains("pool_sniper_ready 0"));
     }
 
     #[test]
