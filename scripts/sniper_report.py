@@ -32,6 +32,8 @@ pnl_by_mode = collections.Counter()
 # Closed trades in log order: (mode, ts_ms, gross, net or None, cost, hold_ms)
 closed = []
 quoted_edges = []
+entry_conf = {}  # pool -> signal confidence of its last entry
+conf_trades = collections.defaultdict(list)  # confidence bucket -> nets
 latencies = collections.defaultdict(list)
 lines = bad = 0
 
@@ -63,6 +65,7 @@ with f:
             reasons[(mode, str(reason)[:90])] += 1
         if action == "enter":
             p["enter"] += 1
+            entry_conf[r.get("pool_id", "")] = ctx.get("signal_confidence")
         pnl = None
         lat = ctx.get("latency_ms") if isinstance(ctx, dict) else None
         if isinstance(lat, dict):
@@ -75,6 +78,10 @@ with f:
             pnl = ctx.get("realized_simulated_pnl_lamports")
             if pnl is not None:
                 cost = ctx.get("cost") or {}
+                conf = entry_conf.pop(r.get("pool_id", ""), None)
+                if isinstance(conf, (int, float)):
+                    net = ctx.get("net_pnl_lamports")
+                    conf_trades[int(conf) // 10 * 10].append(net if net is not None else pnl)
                 closed.append((mode, r.get("decision_time_ms", 0), pnl,
                                ctx.get("net_pnl_lamports"),
                                cost.get("total_lamports", 0) if isinstance(cost, dict) else 0,
@@ -158,3 +165,9 @@ if latencies:
     print("\nLatency (ms):")
     for stage, v in sorted(latencies.items()):
         print(f"  {stage:14} n={len(v):5} p50={pct(v, 50):8.0f} p95={pct(v, 95):8.0f} p99={pct(v, 99):8.0f}")
+
+if conf_trades:
+    print("\nPaper outcome by entry signal confidence (score, not a probability):")
+    for b in sorted(conf_trades):
+        v = conf_trades[b]
+        print(f"  {b:3}-{b + 9:<3} n={len(v):3}  win rate={sum(1 for x in v if x > 0) / len(v):.0%}  net={sol(sum(v))}")

@@ -14,8 +14,19 @@
 //! - volatility: standard deviation of log returns (veto above a cap),
 //! - liquidity momentum: change of the pay-side vault over the window.
 //!
-//! No profitability is claimed for this model; it is a quality filter whose
-//! effect must be measured (paper first).
+//! Sampling and warm-up: one sample per `SNIPER_SIGNAL_SAMPLE_MS` (default
+//! 2 s, closer samples are refused); the gate needs
+//! [`SignalConfig::warmup_samples`] samples (34 with the defaults, ~70 s).
+//! A timestamp going backwards, a non-finite or non-positive price is
+//! refused; a gap above 30 s restarts the series (indicators over a hole
+//! are meaningless); a newest sample older than `max_sample_age_ms` is
+//! `stale_data`. Missing liquidity history is `liquidity_unavailable`,
+//! never neutral.
+//!
+//! The confidence is a 0-100 *score*, not a probability of profit. No
+//! profitability is claimed for this model; it is a quality filter whose
+//! effect must be measured: entries record `signal_confidence` and
+//! `scripts/sniper_report.py` groups paper outcomes by it.
 
 use std::collections::VecDeque;
 

@@ -1138,6 +1138,14 @@ fn signal_gate_rejects(
     }
 }
 
+/// The signal score (0-100) at this moment, when the gate would trade.
+fn signal_confidence(series: &signal::Series, cfg: &signal::SignalConfig) -> Option<u32> {
+    match signal::evaluate_at(series, cfg, marketdata::now_ms() as u64) {
+        signal::SignalDecision::Trade { confidence } => Some(confidence),
+        signal::SignalDecision::NoTrade { .. } => None,
+    }
+}
+
 /// Exact quote of a swap: the spot-price quote (reference for the price
 /// impact) and the output the deployed program actually delivers for this
 /// very swap, from an on-chain simulation (see `sim_quote`). Fail-closed:
@@ -2456,6 +2464,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.context = serde_json::json!({
                         "action": "enter",
                         "would_execute": true,
+                        // Recorded so the score can be checked against
+                        // outcomes (sniper_report.py groups by it).
+                        "signal_confidence": signal_confidence(&price_series, &signal_cfg),
                         "entry_sqrt": entry_sqrt.to_string(),
                         "position_size_lamports": signal.position_size_lamports,
                         "slippage_bps": signal.slippage_bps,
@@ -3073,6 +3084,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     rec.context = serde_json::json!({
                         "action": "quoted",
+                        "signal_confidence": signal_confidence(&price_series, &signal_cfg),
                         "latency_ms": { "quote_sim": quote_ms as u64 },
                         "spot_out": spot.expected_output,
                         "exact_out": sim.amount_out,
