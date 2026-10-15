@@ -35,6 +35,7 @@ pub enum RejectReason {
     OpenPositionCapExceeded,
     ExposureCapExceeded,
     UnverifiableRestartState,
+    ClockSkew,
 }
 
 impl RejectReason {
@@ -57,6 +58,7 @@ impl RejectReason {
             RejectReason::OpenPositionCapExceeded => "open_position_cap_exceeded",
             RejectReason::ExposureCapExceeded => "exposure_cap_exceeded",
             RejectReason::UnverifiableRestartState => "unverifiable_restart_state",
+            RejectReason::ClockSkew => "clock_skew",
         }
     }
 }
@@ -78,8 +80,29 @@ pub fn check_price_staleness(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let age_ms = now_ms.saturating_sub(price_timestamp_ms);
-    if age_ms > max_age_ms as u128 {
+    price_freshness(price_timestamp_ms, now_ms, max_age_ms)
+}
+
+/// Pure freshness rule (see [`check_price_staleness`]):
+/// - a timestamp in the future (`ts > now`) is `ClockSkew`. Every price
+///   timestamp is taken from this host's own clock (WS receive time, or
+///   now minus the RPC feed's age), so a future one means the clock
+///   stepped back or the data is not what it claims — never "very fresh".
+///   There is deliberately no tolerance;
+/// - a zero timestamp, or an unreadable clock (`now == 0`), is `StalePrice`;
+/// - older than `max_age_ms` is `StalePrice`; exactly `max_age_ms` passes.
+pub fn price_freshness(
+    price_timestamp_ms: u128,
+    now_ms: u128,
+    max_age_ms: u64,
+) -> Result<(), RejectReason> {
+    if price_timestamp_ms == 0 || now_ms == 0 {
+        return Err(RejectReason::StalePrice);
+    }
+    if price_timestamp_ms > now_ms {
+        return Err(RejectReason::ClockSkew);
+    }
+    if now_ms - price_timestamp_ms > max_age_ms as u128 {
         return Err(RejectReason::StalePrice);
     }
     Ok(())
@@ -494,7 +517,8 @@ impl RiskManager {
             return Err(RejectReason::SlippageExceeded);
         }
         let daily = self.daily_loss.lock().unwrap();
-        if daily.loss_lamports > self.config.daily_loss_limit_lamports {
+        // At the limit is already "reached": no new entry may add risk.
+        if daily.loss_lamports >= self.config.daily_loss_limit_lamports {
             return Err(RejectReason::DailyLossLimit);
         }
         drop(daily);
@@ -544,7 +568,8 @@ impl RiskManager {
         trades.count
     }
 
-    /// Record a loss and potentially trigger circuit breaker.
+    /// Record a loss. Reaching the daily limit (`>=`) triggers the kill
+    /// switch: no new entries; exits are not gated by it.
     pub fn record_loss(&self, lamports: u64) -> Result<(), String> {
         let mut daily = self.daily_loss.lock().unwrap();
         let today = Self::today();
@@ -553,15 +578,15 @@ impl RiskManager {
             daily.loss_lamports = 0;
         }
         daily.loss_lamports = daily.loss_lamports.saturating_add(lamports);
-        let exceeded = daily.loss_lamports > self.config.daily_loss_limit_lamports;
+        let reached = daily.loss_lamports >= self.config.daily_loss_limit_lamports;
         drop(daily);
         self.persist_state();
-        if exceeded {
+        if reached {
             self.trigger_kill_switch(&format!(
-                "daily loss limit exceeded (> {})",
+                "daily loss limit reached (>= {})",
                 self.config.daily_loss_limit_lamports
             ));
-            return Err("daily loss limit exceeded — kill switch triggered".into());
+            return Err("daily loss limit reached — kill switch triggered".into());
         }
         Ok(())
     }
@@ -674,6 +699,44 @@ mod tests {
     }
 
     #[test]
+    fn daily_loss_at_exactly_the_limit_rejects_entries() {
+        // daily_loss_limit = 5 SOL.
+        let rm = RiskManager::new(test_config());
+        assert!(rm.record_loss(4_999_999_999).is_ok());
+        assert!(!rm.is_kill_switch_active());
+        assert!(rm.pre_trade_check(500_000_000, 50).is_ok());
+        // One more lamport: exactly at the limit = reached.
+        assert!(rm.record_loss(1).is_err());
+        assert!(rm.is_kill_switch_active());
+        assert_eq!(rm.current_daily_loss(), 5_000_000_000);
+        assert!(rm.pre_trade_check(500_000_000, 50).is_err());
+    }
+
+    #[test]
+    fn pre_trade_check_rejects_daily_loss_at_the_limit() {
+        // Restored state exactly at the limit (no kill switch from this
+        // process): the >= check alone must reject.
+        let cfg = test_config();
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        let state = PersistedRiskState {
+            date: RiskManager::today(),
+            daily_loss_lamports: cfg.daily_loss_limit_lamports,
+            ..Default::default()
+        };
+        std::fs::write(
+            cfg.data_dir.join("risk_state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+        let rm = RiskManager::new(cfg);
+        assert!(!rm.is_kill_switch_active());
+        assert_eq!(
+            rm.pre_trade_check(500_000_000, 50),
+            Err(RejectReason::DailyLossLimit)
+        );
+    }
+
+    #[test]
     fn daily_loss_triggers_kill_switch() {
         let rm = RiskManager::new(test_config());
         // daily_loss_limit = 5 SOL; record 6 SOL loss -> kill switch.
@@ -731,6 +794,39 @@ mod tests {
             check_price_staleness(now_ms.saturating_sub(10_000), 5_000),
             Err(RejectReason::StalePrice)
         );
+        assert_eq!(
+            check_price_staleness(now_ms + 60_000, 5_000),
+            Err(RejectReason::ClockSkew)
+        );
+    }
+
+    #[test]
+    fn freshness_rejects_future_zero_and_old_timestamps() {
+        let now = 1_700_000_000_000u128;
+        assert_eq!(price_freshness(now, now, 5_000), Ok(()));
+        assert_eq!(price_freshness(now - 5_000, now, 5_000), Ok(()), "boundary");
+        assert_eq!(
+            price_freshness(now - 5_001, now, 5_000),
+            Err(RejectReason::StalePrice)
+        );
+        // Any future timestamp is clock skew — even 1 ms, even huge.
+        assert_eq!(
+            price_freshness(now + 1, now, 5_000),
+            Err(RejectReason::ClockSkew)
+        );
+        assert_eq!(
+            price_freshness(u128::MAX, now, u64::MAX),
+            Err(RejectReason::ClockSkew)
+        );
+        assert_eq!(
+            price_freshness(0, now, u64::MAX),
+            Err(RejectReason::StalePrice)
+        );
+        assert_eq!(
+            price_freshness(now, 0, 5_000),
+            Err(RejectReason::StalePrice)
+        );
+        assert_eq!(RejectReason::ClockSkew.code(), "clock_skew");
     }
 
     #[test]

@@ -17,11 +17,22 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Tests
         run: cargo test --workspace
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Release build
+        run: cargo build --release
 
       - name: Check deploy scripts
         run: |
@@ -41,10 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release -p solana-sniper -p tools-hsm-server
-
-      - name: Run benchmarks (best-effort)
-        run: cargo bench -p hft-core || true
+        run: cargo build --release
 
       - name: Package (and publish to S3 when configured)
         env:

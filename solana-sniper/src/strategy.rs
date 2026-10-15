@@ -164,30 +164,16 @@ impl SimpleSnipeStrategy {
     /// Decide whether to exit an open position given the current price.
     ///
     /// `current_sqrt_price` and `entry_sqrt_price` are Q64.64 fixed-point.
-    /// Price ratio = (current/entry)^2. We compare the squared ratio against
-    /// the bps thresholds. f64 is used for the threshold comparison; the
-    /// magnitudes involved (Q64.64 sqrt prices) are far from f64 precision
-    /// limits, so this is exact enough for stop-loss/take-profit bands.
+    /// The price ratio `(current/entry)^2` comes from [`price_ratio_scaled`]
+    /// (integer, overflow-checked; the paper P&L uses the very same value)
+    /// and is compared exactly against the bps thresholds. A zero entry or a
+    /// ratio too large to represent (corrupt data) is `Hold`: no decision is
+    /// taken on data that cannot be evaluated.
     pub fn should_exit(&self, entry_sqrt_price: u128, current_sqrt_price: u128) -> ExitDecision {
-        if entry_sqrt_price == 0 {
-            return ExitDecision::Hold;
+        match price_ratio_scaled(entry_sqrt_price, current_sqrt_price) {
+            Some(ratio) => self.exit_on_ratio(ratio),
+            None => ExitDecision::Hold,
         }
-        let entry = entry_sqrt_price as f64;
-        let current = current_sqrt_price as f64;
-        // price_ratio = (current/entry)^2
-        let price_ratio = (current / entry) * (current / entry);
-        if price_ratio >= 1.0 {
-            let profit_bps = (price_ratio - 1.0) * 10_000.0;
-            if profit_bps >= self.config.take_profit_bps as f64 {
-                return ExitDecision::TakeProfit;
-            }
-        } else {
-            let loss_bps = (1.0 - price_ratio) * 10_000.0;
-            if loss_bps >= self.config.stop_loss_bps as f64 {
-                return ExitDecision::StopLoss;
-            }
-        }
-        ExitDecision::Hold
     }
 
     /// Value-based exit decision for a REAL position: `cost` is what the
@@ -195,20 +181,111 @@ impl SimpleSnipeStrategy {
     /// would return right now (both in input-token units, e.g. lamports).
     /// Unlike `should_exit` this is direction-independent — it does not
     /// matter whether the bought token is the pool's token0 or token1 — and
-    /// it includes the pool fee on the way out.
+    /// it includes the pool fee on the way out. Same integer threshold rule.
     pub fn should_exit_value(&self, cost: u64, current_value: u64) -> ExitDecision {
-        if cost == 0 {
-            return ExitDecision::Hold;
+        match mul_div_floor(current_value as u128, RATIO_SCALE, cost as u128) {
+            Some(ratio) => self.exit_on_ratio(ratio),
+            None => ExitDecision::Hold, // cost == 0
         }
-        let ratio = current_value as f64 / cost as f64;
-        if ratio >= 1.0 {
-            if (ratio - 1.0) * 10_000.0 >= self.config.take_profit_bps as f64 {
+    }
+
+    /// Thresholds on a ratio scaled by [`RATIO_SCALE`]: take-profit when the
+    /// gain is >= `take_profit_bps`, stop-loss when the loss is >=
+    /// `stop_loss_bps`.
+    fn exit_on_ratio(&self, ratio: u128) -> ExitDecision {
+        let tp = bps_to_scaled(self.config.take_profit_bps);
+        let sl = bps_to_scaled(self.config.stop_loss_bps);
+        if ratio >= RATIO_SCALE {
+            if ratio - RATIO_SCALE >= tp {
                 return ExitDecision::TakeProfit;
             }
-        } else if (1.0 - ratio) * 10_000.0 >= self.config.stop_loss_bps as f64 {
+        } else if RATIO_SCALE - ratio >= sl {
             return ExitDecision::StopLoss;
         }
         ExitDecision::Hold
+    }
+}
+
+/// Fixed-point scale of price ratios: 1.0 == 10^12 (1 bp == 10^8).
+pub const RATIO_SCALE: u128 = 1_000_000_000_000;
+
+fn bps_to_scaled(bps: u64) -> u128 {
+    bps as u128 * (RATIO_SCALE / 10_000)
+}
+
+/// `floor(a * b / d)` with a full 256-bit intermediate product. `None` when
+/// `d == 0` or the quotient does not fit in a u128. Never panics.
+pub fn mul_div_floor(a: u128, b: u128, d: u128) -> Option<u128> {
+    mul_div(a, b, d).map(|(q, _)| q)
+}
+
+/// `ceil(a * b / d)`, same contract as [`mul_div_floor`].
+pub fn mul_div_ceil(a: u128, b: u128, d: u128) -> Option<u128> {
+    let (q, r) = mul_div(a, b, d)?;
+    if r == 0 {
+        Some(q)
+    } else {
+        q.checked_add(1)
+    }
+}
+
+/// (quotient, remainder) of `a * b / d` via 256-bit schoolbook arithmetic.
+fn mul_div(a: u128, b: u128, d: u128) -> Option<(u128, u128)> {
+    if d == 0 {
+        return None;
+    }
+    const M: u128 = u64::MAX as u128;
+    let (a0, a1, b0, b1) = (a & M, a >> 64, b & M, b >> 64);
+    let (p00, p01, p10, p11) = (a0 * b0, a0 * b1, a1 * b0, a1 * b1);
+    let mid = (p00 >> 64) + (p01 & M) + (p10 & M);
+    let lo = (p00 & M) | (mid << 64);
+    let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+    if hi >= d {
+        return None; // quotient >= 2^128
+    }
+    if hi == 0 {
+        return Some((lo / d, lo % d));
+    }
+    // Long division of (hi, lo) by d, one bit at a time; hi < d keeps the
+    // quotient within 128 bits.
+    let (mut rem, mut q) = (hi, 0u128);
+    for i in (0..128).rev() {
+        let carry = rem >> 127;
+        rem = (rem << 1) | ((lo >> i) & 1);
+        q <<= 1;
+        if carry == 1 || rem >= d {
+            rem = rem.wrapping_sub(d);
+            q |= 1;
+        }
+    }
+    Some((q, rem))
+}
+
+/// Price ratio `(current_sqrt / entry_sqrt)^2` scaled by [`RATIO_SCALE`],
+/// in integer arithmetic. `None` for a zero entry or a ratio that does not
+/// fit (more than ~3.4e14 x — only corrupt data gets there). The rounding
+/// error is below 10^-11 relative, far under one basis point.
+pub fn price_ratio_scaled(entry_sqrt_price: u128, current_sqrt_price: u128) -> Option<u128> {
+    let sqrt_ratio = mul_div_floor(current_sqrt_price, RATIO_SCALE, entry_sqrt_price)?;
+    mul_div_floor(sqrt_ratio, sqrt_ratio, RATIO_SCALE)
+}
+
+/// P&L (lamports) of `position_lamports` when the price moved by `ratio`
+/// (scaled by [`RATIO_SCALE`]). Gains round down, losses round up (away
+/// from zero): never optimistic. Saturates at `i64::MAX`; a loss can never
+/// exceed the position.
+pub fn pnl_from_ratio(ratio: u128, position_lamports: u64) -> i64 {
+    let pos = position_lamports as u128;
+    if ratio >= RATIO_SCALE {
+        let gain = mul_div_floor(pos, ratio - RATIO_SCALE, RATIO_SCALE).unwrap_or(u128::MAX);
+        i64::try_from(gain).unwrap_or(i64::MAX)
+    } else {
+        // (SCALE - ratio) <= SCALE, so the loss is <= pos (a u64); above
+        // i64::MAX it saturates instead of wrapping.
+        let loss = mul_div_ceil(pos, RATIO_SCALE - ratio, RATIO_SCALE)
+            .unwrap_or(pos)
+            .min(pos);
+        -i64::try_from(loss).unwrap_or(i64::MAX)
     }
 }
 
@@ -322,8 +399,10 @@ mod tests {
     fn should_exit_take_profit_at_10pct() {
         let s = SimpleSnipeStrategy::new(StrategyConfig::default());
         let entry = 1u128 << 64;
-        // 10% price increase => sqrt_price * sqrt(1.10)
-        let sqrt_110 = (1.10f64).sqrt();
+        // Just above +10% (an exactly-10% fixture built with f64 sqrt lands
+        // a hair below the boundary; the boundary itself is tested exactly
+        // in exit_thresholds_are_exact_at_the_boundaries).
+        let sqrt_110 = (1.1001f64).sqrt();
         let current = ((entry as f64) * sqrt_110) as u128;
         assert_eq!(s.should_exit(entry, current), ExitDecision::TakeProfit);
     }
@@ -392,5 +471,102 @@ mod tests {
         assert!(liquidity_dropped(100, 0));
         assert!(!liquidity_dropped(100, 500), "rising liquidity is fine");
         assert!(liquidity_dropped(u64::MAX, 1));
+    }
+
+    // ── Integer price-ratio math ──
+
+    #[test]
+    fn mul_div_matches_exact_arithmetic_and_never_panics() {
+        for (a, b, d) in [
+            (0u128, 5u128, 3u128),
+            (7, 9, 4),
+            (u64::MAX as u128, u64::MAX as u128, 3),
+            (1 << 100, 1 << 27, 1 << 30),
+        ] {
+            let exact = a * b;
+            assert_eq!(mul_div_floor(a, b, d), Some(exact / d));
+            assert_eq!(
+                mul_div_ceil(a, b, d),
+                Some(exact / d + u128::from(exact % d != 0))
+            );
+        }
+        // 256-bit intermediates.
+        assert_eq!(
+            mul_div_floor(u128::MAX, u128::MAX, u128::MAX),
+            Some(u128::MAX)
+        );
+        assert_eq!(
+            mul_div_floor(u128::MAX, 1 << 64, 1 << 65),
+            Some(u128::MAX >> 1)
+        );
+        assert_eq!(mul_div_floor(1 << 127, 6, 3), None, "2^128 does not fit");
+        assert_eq!(mul_div_floor(u128::MAX, 2, 1), None);
+        assert_eq!(mul_div_floor(1, 1, 0), None);
+        assert_eq!(mul_div_ceil(u128::MAX, 1, 1), Some(u128::MAX));
+        assert_eq!(mul_div_ceil(u128::MAX, 3, 2), None);
+    }
+
+    #[test]
+    fn price_ratio_handles_zero_huge_and_overflowing_prices() {
+        let one = 1u128 << 64;
+        assert_eq!(price_ratio_scaled(one, one), Some(RATIO_SCALE));
+        assert_eq!(price_ratio_scaled(one, 2 * one), Some(4 * RATIO_SCALE));
+        assert_eq!(price_ratio_scaled(2 * one, one), Some(RATIO_SCALE / 4));
+        assert_eq!(price_ratio_scaled(0, one), None, "zero entry");
+        assert_eq!(price_ratio_scaled(one, 0), Some(0), "price went to zero");
+        // Near-maximal Q64.64 values on both sides stay exact.
+        assert_eq!(price_ratio_scaled(u128::MAX, u128::MAX), Some(RATIO_SCALE));
+        assert_eq!(
+            price_ratio_scaled(u128::MAX, u128::MAX / 2),
+            Some(RATIO_SCALE / 4 - 1), // floor
+        );
+        // Absurd ratios do not fit: None, never a panic or a wrap.
+        assert_eq!(price_ratio_scaled(1, u128::MAX), None);
+        assert_eq!(price_ratio_scaled(1, 1 << 80), None);
+    }
+
+    #[test]
+    fn pnl_from_ratio_is_signed_bounded_and_conservative() {
+        assert_eq!(pnl_from_ratio(RATIO_SCALE, 1_000_000_000), 0);
+        assert_eq!(
+            pnl_from_ratio(4 * RATIO_SCALE, 1_000_000_000),
+            3_000_000_000
+        );
+        assert_eq!(pnl_from_ratio(RATIO_SCALE / 4, 1_000_000_000), -750_000_000);
+        assert_eq!(
+            pnl_from_ratio(0, 1_000_000_000),
+            -1_000_000_000,
+            "total loss"
+        );
+        // Losses round away from zero, gains toward zero.
+        assert_eq!(pnl_from_ratio(RATIO_SCALE - 1, 1), -1);
+        assert_eq!(pnl_from_ratio(RATIO_SCALE + 1, 1), 0);
+        // Saturation instead of overflow.
+        assert_eq!(pnl_from_ratio(u128::MAX, u64::MAX), i64::MAX);
+        assert_eq!(pnl_from_ratio(0, u64::MAX), -i64::MAX, "no sign wrap");
+        assert_eq!(pnl_from_ratio(RATIO_SCALE / 2, u64::MAX), -i64::MAX);
+    }
+
+    #[test]
+    fn exit_thresholds_are_exact_at_the_boundaries() {
+        let s = SimpleSnipeStrategy::new(StrategyConfig::default());
+        let one = RATIO_SCALE;
+        let bp = RATIO_SCALE / 10_000;
+        // take-profit 1000 bps, stop-loss 500 bps (defaults).
+        assert_eq!(s.exit_on_ratio(one + 1_000 * bp), ExitDecision::TakeProfit);
+        assert_eq!(s.exit_on_ratio(one + 1_000 * bp - 1), ExitDecision::Hold);
+        assert_eq!(s.exit_on_ratio(one - 500 * bp), ExitDecision::StopLoss);
+        assert_eq!(s.exit_on_ratio(one - 500 * bp + 1), ExitDecision::Hold);
+        // should_exit and the paper P&L read the same ratio.
+        let (e, c) = (3u128 << 70, 7u128 << 69);
+        let r = price_ratio_scaled(e, c).unwrap();
+        assert_eq!(s.should_exit(e, c), s.exit_on_ratio(r));
+        assert_eq!(
+            s.should_exit(1, u128::MAX),
+            ExitDecision::Hold,
+            "unrepresentable"
+        );
+        assert_eq!(s.should_exit_value(0, 5), ExitDecision::Hold);
+        assert_eq!(s.should_exit_value(u64::MAX, u64::MAX), ExitDecision::Hold);
     }
 }
