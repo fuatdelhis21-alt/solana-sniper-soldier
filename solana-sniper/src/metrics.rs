@@ -25,6 +25,8 @@ pub struct ReadinessSnapshot {
     pub state_verified: bool,
     pub reconcile_required: bool,
     pub exit_blocked: bool,
+    /// Consecutive failed exit attempts of the open live position.
+    pub consecutive_exit_failures: u32,
     pub breaker_state: u8,
     pub kill_switch_active: bool,
     pub live_armed: bool,
@@ -272,11 +274,32 @@ impl Metrics {
     pub fn render(&self) -> String {
         let encoder = TextEncoder::new();
         let mut buf = Vec::new();
-        if encoder.encode(&self.registry.gather(), &mut buf).is_ok() {
+        let mut out = if encoder.encode(&self.registry.gather(), &mut buf).is_ok() {
             String::from_utf8_lossy(&buf).into_owned()
         } else {
             String::new()
+        };
+        // Readiness gauges (the names the alert rules use).
+        let r = self.readiness.lock().unwrap().clone();
+        let ready = if r.mode == "live" {
+            r.ready_live()
+        } else {
+            r.ready_paper_dry_run()
+        };
+        for (name, v) in [
+            ("ready", ready as u64),
+            ("state_verified", r.state_verified as u64),
+            ("exit_blocked", r.exit_blocked as u64),
+            ("reconcile_required", r.reconcile_required as u64),
+            ("breaker_state", r.breaker_state as u64),
+            (
+                "consecutive_exit_failures",
+                r.consecutive_exit_failures as u64,
+            ),
+        ] {
+            out.push_str(&format!("# TYPE {name} gauge\n{name} {v}\n"));
         }
+        out
     }
 }
 
@@ -328,6 +351,7 @@ pub async fn spawn_metrics_server(addr: &str, metrics: Arc<Metrics>) -> Result<(
                         "state_verified": snapshot.state_verified,
                         "reconcile_required": snapshot.reconcile_required,
                         "exit_blocked": snapshot.exit_blocked,
+                        "consecutive_exit_failures": snapshot.consecutive_exit_failures,
                         "breaker_state": snapshot.breaker_state,
                         "kill_switch_active": snapshot.kill_switch_active,
                         "live_armed": snapshot.live_armed,
@@ -487,6 +511,35 @@ pub fn set_readiness(metrics: &Metrics, snapshot: ReadinessSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_gauges_are_exported_and_exit_block_fails_live_ready() {
+        let m = Metrics::new();
+        let mut snap = ReadinessSnapshot {
+            process_alive: true,
+            state_verified: true,
+            live_armed: true,
+            hsm_ready: Some(true),
+            rpc_ready: Some(true),
+            market_data_ready: Some(true),
+            mode: "live".into(),
+            ..Default::default()
+        };
+        assert!(snap.ready_live());
+        snap.exit_blocked = true;
+        snap.consecutive_exit_failures = 3;
+        assert!(!snap.ready_live());
+        set_readiness(&m, snap);
+        let out = m.render();
+        for line in [
+            "ready 0",
+            "exit_blocked 1",
+            "consecutive_exit_failures 3",
+            "state_verified 1",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} missing");
+        }
+    }
 
     #[test]
     fn stage_latency_is_exported_with_bounded_labels() {

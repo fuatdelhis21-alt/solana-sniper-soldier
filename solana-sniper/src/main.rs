@@ -1210,6 +1210,10 @@ fn entry_economics(
     Ok(edge)
 }
 
+/// Consecutive failed exit attempts after which the position is reported
+/// as `exit_blocked` (retries continue).
+const EXIT_BLOCKED_AFTER: u32 = 3;
+
 /// Result of an RPC `simulateTransaction`.
 struct SimulationResult {
     err: Option<String>,
@@ -2045,7 +2049,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 process_alive: true,
                 state_verified: risk_manager.is_state_verified(),
                 reconcile_required: false,
-                exit_blocked: false,
+                // Exits are retried every iteration and never gated by the
+                // entry limits; after this many consecutive failures the
+                // operator must look (alert + /ready 503).
+                exit_blocked: live_position.is_some() && exit_failures >= EXIT_BLOCKED_AFTER,
+                consecutive_exit_failures: exit_failures,
                 breaker_state,
                 kill_switch_active: risk_manager.is_kill_switch_active(),
                 live_armed: risk_manager.is_live_armed(),

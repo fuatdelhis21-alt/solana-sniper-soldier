@@ -58,18 +58,53 @@ Bitişe 30 günden az kaldıysa rotation planlanmalıdır.
 
 ---
 
-## 5. Certificate Rotation Prosedürü
+## 5. Sertifika Yenileme (Rotation) ve İptal (Revocation)
 
-Devnet/test için `tools/hsm_server/certs/generate_certs.ps1` kullanılır.
-Production rotation için ayrı, operatör onaylı prosedür gerekir (bu görev
-kapsamında gerçek production cert üretilmez).
+Özel CA (`generate_certs.sh`): CA 10 yıl, server/client 825 gün geçerli.
+HSM sunucusu (warp 0.3 / rustls) **CRL veya OCSP kontrol etmez**: CA'nın
+imzaladığı her geçerli client sertifikası kabul edilir. Bu yüzden tek bir
+sertifikayı "iptal etmek" mümkün değildir — iptal = **yeni CA ile tüm PKI'yi
+yeniden üretmek**. Bu sertifikalar imza anahtarı değildir: HSM'deki Solana
+anahtarı (`HSM_KEY_B64`) rotation'dan etkilenmez ve hiçbir adımda
+loglanmaz/kopyalanmaz.
 
-Rotation adımları (devnet/test):
-1. Yeni cert seti üret.
-2. HSM servisini durdur, yeni cert'leri kopyala (0600, `solana-hsm` sahipli).
-3. HSM'i başlat, `GET /pubkey` ile doğrula.
-4. Bot'un mTLS client identity'sini güncelle.
-5. Bot'u restart et, `/ready` ile live readiness'i doğrula.
+**Planlı yenileme** (bitişe < 30 gün, bkz. §4) ve **iptal** (client
+sertifikası veya `ca.key` sızdı / şüphe var) aynı prosedürü izler:
+
+```bash
+# 0. Açık live pozisyon varsa önce kapanmasını bekle ya da paper/dry-run'a geç.
+#    Bot HSM'siz kalırsa yeni giriş yapmaz; açık pozisyonun exit'i HSM ister.
+# 1. Yeni PKI (yeni CA dahil) — eski dizinin üzerine YAZMA:
+/opt/solana-hft/generate_certs.sh /root/hft-pki-$(date +%Y%m%d)
+# 2. Servisleri durdur
+systemctl stop solana-hft solana-hft-sniper solana-hsm
+# 3. Yeni dosyaları yerleştir (eski CA güven listesinden tamamen çıkar)
+cp /root/hft-pki-YYYYMMDD/{server.pem,server.key,ca.pem} /etc/solana-hft/hsm-certs/
+cp /root/hft-pki-YYYYMMDD/{ca.pem,client_all.pem}       /etc/solana-hft/client-certs/
+chown -R solana-hsm: /etc/solana-hft/hsm-certs   && chmod 600 /etc/solana-hft/hsm-certs/*
+chown -R solana:     /etc/solana-hft/client-certs && chmod 600 /etc/solana-hft/client-certs/*
+# 4. Başlat ve doğrula
+systemctl start solana-hsm
+openssl x509 -in /etc/solana-hft/hsm-certs/server.pem -noout -enddate
+curl -s --cacert /etc/solana-hft/client-certs/ca.pem \
+     --cert /etc/solana-hft/client-certs/client_all.pem https://127.0.0.1:8443/pubkey
+#    → pubkey SNIPER_EXPECTED_SIGNER ile aynı olmalı
+# 5. Eski sertifikayla bağlanılamadığını doğrula (iptalin kanıtı):
+curl -s --cacert /etc/solana-hft/client-certs/ca.pem \
+     --cert /root/hft-pki-ESKI/client_all.pem https://127.0.0.1:8443/pubkey \
+  && echo "HATA: eski client sertifikası hâlâ kabul ediliyor" || echo "eski sertifika reddedildi"
+# 6. Botu başlat, /ready kontrol et
+systemctl start solana-hft-sniper   # veya solana-hft
+# 7. ca.key'i sunucudan kaldır (çevrimdışı sakla) ve eski PKI dizinini güvenle sil:
+shred -u /root/hft-pki-ESKI/*.key && rm -rf /root/hft-pki-ESKI
+```
+
+Notlar:
+- Bot HSM'e bağlanamazsa **yedek imzacıya düşmez** (yerel anahtar fallback'i
+  yoktur); breaker açılır, yeni giriş durur.
+- `ca.key` sunucuda kaldığı sürece onu ele geçiren yeni client sertifikası
+  üretebilir; yenilemeden sonra çevrimdışı tutulmalıdır.
+- HSM yalnızca 127.0.0.1:8443'te dinler; mTLS ikinci savunma hattıdır.
 
 ---
 
