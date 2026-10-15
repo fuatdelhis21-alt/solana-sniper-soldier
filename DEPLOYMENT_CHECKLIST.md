@@ -1,58 +1,69 @@
 # Solana HFT Platform — Deployment Checklist
 
-Ayrıntılı adımlar: [`README_DEPLOY.md`](README_DEPLOY.md). Mainnet onay
-listesi: [`docs/mainnet_checklist.md`](docs/mainnet_checklist.md).
+Ayrıntılı adımlar: [`README_DEPLOY.md`](README_DEPLOY.md). Kanıta dayalı durum:
+[`docs/READINESS.md`](docs/READINESS.md). Mainnet onay listesi:
+[`docs/mainnet_checklist.md`](docs/mainnet_checklist.md). Arıza prosedürleri:
+[`docs/VPS_RUNBOOK.md`](docs/VPS_RUNBOOK.md) §9.
 
-## Kod tarafında giderilen canlıya geçiş engelleri
+Durum: **paper için hazır, live için değil.** Live'a geçiş kararı operatöre aittir.
 
-- [x] Swap talimatı yanlış Raydium CLMM program ID'sine gidiyordu
-      (`CAMMCzo5YLJbYF7r5...` hiçbir mainnet havuzuna ait değil) → tek kaynak
-      `account_resolver::RAYDIUM_CLMM_PROGRAM_ID`, adapter'a cluster'a göre set ediliyor;
-      WebSocket `programSubscribe` da düzeltildi.
-- [x] Live çıkış (exit) yolu yoktu: pozisyon açılıyor ama hiç satılmıyordu ve
-      `max_open_positions=1` yüzünden ilk işlemden sonra bot duruyordu → stop-loss /
-      take-profit ters swap, kalıcı `live_position.json`, gerçek bakiye farkıyla P&L.
-- [x] Swap tx'i sendable değildi (çıkış ATA'sı yok, SOL wrap yok, priority fee yok)
-      → idempotent ATA oluşturma, wSOL wrap/unwrap, compute budget.
-- [x] HSM imzası doğrulanmıyordu (sunucu hata durumunda HTTP 200 + sıfır imza dönüyordu)
-      → istemci Ed25519 doğrulaması, `--expected-signer` pin (live'da zorunlu), sunucu 400 +
-      `HSM_REQUIRE_KEY=1`.
-- [x] Prometheus `/metrics` + `/health` sunucusu hiç başlatılmıyordu → `--metrics-addr`.
-- [x] Sürekli çalışma yoktu (30 iterasyon sonra çıkış) → `--iterations 0`, SIGTERM ile
-      graceful stop; geçici circuit breaker artık servisi sonlandırmıyor.
-- [x] Config bağlı değildi → her flag `SNIPER_*` env değişkeniyle, `.env` otomatik yüklenir.
-- [x] systemd unit'i olmayan binary'yi (`solana-hft --config`) çalıştırıyordu; install
-      script `set -u` ile `$2` yüzünden çöküyordu; paket tüm `target/` dizinini içeriyordu;
-      Ansible `remote_src` hatalıydı → hepsi yeniden yazıldı, HSM için ayrı unit, rollback.
-- [x] CI: deprecated `actions-rs/toolchain`, kırmızı `risk::tests::audit_log_written_on_kill_switch`.
+## 1. Sürüm (CI)
 
-- [x] Swap ücreti %0.05 sabitti → havuzun gerçek ücret kademesi AmmConfig'ten okunuyor.
-- [x] Yalnızca mevcut tick'in dizisi veriliyordu → swap yönündeki ilk başlatılmış 3 tick
-      array seçiliyor (boş dizi / sınır geçişi zincirde hata vermez).
-- [x] Jito bahşişi hiç eklenmiyordu → tip hesapları Block Engine'den canlı okunuyor,
-      bahşiş transferi imzadan önce işleme ekleniyor; bahşişsiz Jito live'da reddediliyor.
-- [x] `getTokenLargestAccounts` her turda çağrılıyordu → 60 sn önbellek.
+Her PR ve `main` push'unda `.github/workflows/ci-cd.yml` şunları çalıştırır;
+hepsi yeşil olmadan sürüm kullanılmaz:
 
-- [x] Onay 3 sn sonra bırakılıyordu → blockhash geçerli olduğu sürece beklenir; belirsiz
-      sonuç gerçek bakiyeden uzlaştırılır. Girişten önce boyut + 0.006 SOL rezerv kontrolü.
-- [x] Stop-loss satışı hızlı düşüşte %1 kaymaya takılabiliyordu → çıkış her denemede
-      zincir simülasyonuyla kesin kotalanır; tolerans artırma artık isteğe bağlıdır
-      (`SNIPER_EXIT_SLIPPAGE_ESCALATION`, varsayılan kapalı).
-- [x] Kotasyon spot fiyattan `f64` ile yapılıyordu (fiyat etkisi / tick geçişi yok) →
-      giriş ve çıkış `sim_quote` ile zincir simülasyonundan kesin kotalanır,
-      `min_amount_out` tamsayı aritmetiğiyle; fiyat etkisi ve net kenar kapısı.
-- [x] Pozisyon süresiz açık kalabiliyordu → `SNIPER_MAX_HOLD_SECS` (varsayılan 24 saat).
-- [x] Uç fiyat aralığındaki havuzlar için tick-array bitmap extension desteği.
-- [x] Dry-run giriş ve çıkış swap'ını zincirde simüle eder (`SNIPER_SIMULATE_PAYER` ile
-      fonsuz doğrulama).
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --workspace`
+- [ ] `cargo build --release` (workspace: bot, pool-sniper, HSM sunucusu)
+- [ ] Deploy script'leri için `bash -n`
+- [ ] HSM mTLS smoke test (`hsm-mtls-smoke-test.yml`)
+- [ ] `main` üzerinde: paket (`scripts/build_and_publish.sh`) + artifact
 
-## Operatörün yapması gerekenler (kodla çözülemez)
+## 2. Kurulum (VPS)
 
-- [ ] Ücretli mainnet RPC (Helius/Triton/QuickNode) → `SNIPER_RPC`, `SNIPER_WS`
-- [ ] Sunucu + SSH erişimi, `inventory.ini`
-- [ ] Gerçek cüzdan anahtarı → `hsm.env` (`HSM_KEY_B64`), pubkey → `SNIPER_EXPECTED_SIGNER`
-- [ ] Cüzdanı fonlama (işlem başı 0.01 SOL + ücretler + ATA rent ≈ 0.003 SOL)
-- [ ] Hedef havuz: `SNIPER_POOL_ID`, `SNIPER_OUTPUT_MINT` (mint/freeze authority'si
-      kaldırılmış token; aksi halde risk kapısı reddeder)
-- [ ] Paper → dry-run → live sırası; live için `SNIPER_LIVE=true` + `SNIPER_CONFIRM_LIVE=true`
+- [ ] `deploy/install_release.sh` ile kurulum; `REVISION` ve `SHA256SUMS` doğrulandı.
+- [ ] mTLS sertifikaları üretildi ve yerleştirildi (`README_DEPLOY.md`);
+      `ca.key` sunucudan kaldırıldı. Yenileme/iptal: `docs/HSM_MTLS_OPS.md` §5.
+- [ ] `hsm.env` yalnızca root/`solana-hsm` okuyabilir (0600). HSM, `HSM_KEY_B64`
+      olmadan **başlamaz** — üretilmiş/geçici anahtar ya da yedek imzacı yoktur.
+- [ ] `.env` `.env.example`'dan; yeni ayarlar dahil (`SNIPER_EXIT_IMPACT_PCT`,
+      `SNIPER_FAILED_TX_RESERVE`, `SNIPER_MAX_POSITION_LIQUIDITY_BPS`,
+      `SNIPER_PAPER_LATENCY_BPS`, `SNIPER_SIGNAL_MAX_AGE_MS`).
+- [ ] `SNIPER_LIVE_RISK_DATA=true` (dry-run'da da: aksi halde likidite
+      doğrulanamaz ve her giriş `liquidity_unverified` ile reddedilir).
+- [ ] Prometheus kuralları `deploy/prometheus/solana-hft-alerts.yml` yüklendi;
+      `/health` ve `/ready` (bot ve pool-sniper `127.0.0.1:9091`) izleniyor.
+
+## 3. Koddaki sabit risk sınırları (`RiskConfig::production_defaults`)
+
+| Sınır | Değer | Davranış |
+|---|---|---|
+| İşlem başı | 0.05 SOL (strateji 0.01 SOL kullanır, `SNIPER_MAX_SPEND_SOL`) | Üstü reddedilir |
+| Günlük işlem | 5 | Aşılırsa kill switch |
+| Günlük zarar | 0.20 SOL | **Limite ulaşınca (`>=`)** yeni giriş yok + kill switch |
+| Açık pozisyon / toplam maruziyet | 1 / 0.05 SOL | Üstü reddedilir |
+| Kayma | ≤ 2 % (varsayılan istek 1 %) | Üstü reddedilir |
+| Fiyat tazeliği | 5 s (`PRICE_STALENESS_MS`) | Eski = `stale_price`, gelecek zaman damgası = `clock_skew` |
+
+Çıkışlar (stop-loss -5 %, take-profit +10 %, max hold, likidite düşüşü) bu
+sınırlardan ve kill switch'ten **etkilenmez**.
+
+## 4. Mod sırası
+
+- [ ] **Paper** (varsayılan): ≥ 15–20 kapanmış işlem, `sniper_report.py` ile
+      READINESS.md kabul listesi. Bu bir duman testidir, kârlılık kanıtı değildir.
+- [ ] **Dry-run**: likit havuzda ve bir launch havuzunda giriş + çıkış simülasyonu OK
+      (`exact entry quote`, `EXIT simulation … OK`).
+- [ ] **Live** (yalnızca operatör kararıyla): `SNIPER_LIVE=true`,
+      `SNIPER_CONFIRM_LIVE=true`, `SNIPER_EXPECTED_SIGNER`, HSM + mTLS; ≤ 0.1 SOL fon;
+      `SolanaHftExitBlocked` alarmında dur ve runbook'u uygula.
+
+## 5. Operatörün yapması gerekenler (kodla çözülemez)
+
+- [ ] Ücretli mainnet RPC/WS → `SNIPER_RPC`, `SNIPER_WS`
+- [ ] Gerçek imza anahtarı yalnızca `hsm.env` içinde (`HSM_KEY_B64`); pubkey →
+      `SNIPER_EXPECTED_SIGNER`. Anahtar hiçbir zaman repoya, loga veya sohbete girmez.
+- [ ] Cüzdan fonlama (işlem + ücretler + ATA rent ≈ 0.003 SOL + 0.006 SOL rezerv)
 - [ ] (CI'da S3 yüklemesi istenirse) `S3_ENDPOINT`, `S3_BUCKET`, `AWS_*` secret'ları
+- [ ] Geri dönüş: `deploy/rollback.sh`
