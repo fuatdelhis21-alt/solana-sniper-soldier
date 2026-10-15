@@ -263,6 +263,10 @@ pub struct RiskManager {
     /// file existed but could not be parsed (corrupt/unreadable): the caller
     /// MUST refuse to enter live mode in that case.
     state_verified: bool,
+    /// Set when the risk state could not be persisted: a restart would
+    /// forget today's counters, so new entries are refused (exits are not
+    /// gated by this). Sticky until the process restarts.
+    persist_failed: std::sync::atomic::AtomicBool,
 }
 
 impl RiskManager {
@@ -284,6 +288,7 @@ impl RiskManager {
             open_positions: Mutex::new(state.open_positions),
             open_exposure_lamports: Mutex::new(state.open_exposure_lamports),
             state_verified: verified,
+            persist_failed: std::sync::atomic::AtomicBool::new(false),
             config,
         };
         if !verified {
@@ -313,10 +318,10 @@ impl RiskManager {
         }
     }
 
-    /// Best-effort persistence of the current in-memory state. Safety-critical
-    /// state (daily counters, open positions) is written after every mutation
-    /// so that a restart can recover it; a write failure does not panic, but
-    /// it is audited so operators can detect a broken data directory.
+    /// Persistence of the current in-memory state. Safety-critical state
+    /// (daily counters, open positions) is written durably after every
+    /// mutation so that a restart can recover it; a write failure does not
+    /// panic, it is audited and blocks new entries (see `persist_failed`).
     fn persist_state(&self) {
         let (date, daily_trades) = {
             let t = self.daily_trades.lock().unwrap();
@@ -336,23 +341,30 @@ impl RiskManager {
             if std::fs::create_dir_all(&self.config.data_dir).is_ok() {
                 let path = self.config.data_dir.join("risk_state.json");
                 let tmp = self.config.data_dir.join("risk_state.json.tmp");
-                let write_ok =
-                    std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+                let write_ok = crate::position::write_atomic(&path, &tmp, json.as_bytes()).is_ok();
                 if !write_ok {
                     let _ = std::fs::remove_file(&tmp);
+                    self.persist_failed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     self.write_audit(
                         "state_persist_failed",
-                        "failed to atomically write risk_state.json — restart safety degraded",
+                        "failed to atomically write risk_state.json — new entries blocked",
                     );
                 }
+                return;
             }
         }
+        self.persist_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether restart-safe state was verified at startup (see `new`). Callers
     /// MUST refuse to run the live trading loop when this is `false`.
     pub fn is_state_verified(&self) -> bool {
         self.state_verified
+            && !self
+                .persist_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Explicitly arm the live trading loop (manual kill switch, fail-closed
@@ -865,5 +877,23 @@ mod tests {
         restored.record_position_open(10_000_000);
         assert!(!tmp_path.exists());
         assert_eq!(RiskManager::new(cfg).open_position_count(), 2);
+    }
+
+    #[test]
+    fn unpersistable_state_blocks_new_entries() {
+        let mut cfg = test_config();
+        // A regular file where the data directory should be: every write fails.
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        let file = cfg.data_dir.join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        cfg.data_dir = file.join("sub");
+        let rm = RiskManager::new(cfg);
+        assert!(rm.pre_trade_check(1_000, 10).is_ok());
+        rm.record_trade();
+        assert!(!rm.is_state_verified());
+        assert_eq!(
+            rm.pre_trade_check(1_000, 10),
+            Err(RejectReason::UnverifiableRestartState)
+        );
     }
 }

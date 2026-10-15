@@ -97,6 +97,23 @@ struct PaperSimulator {
     exits_forced: u64,
     /// Liquidity seen by the last tick (recorded on confirm_entry).
     last_liquidity_lamports: u64,
+    /// Cost estimate applied to every close (fees, impact, latency, network).
+    cost_model: sim_quote::PaperCostModel,
+    /// Sum of the gross P&L minus the estimated costs.
+    net_pnl_lamports: i64,
+    /// Sum of the estimated costs.
+    costs_lamports: u64,
+    /// The last close: (gross, net, cost breakdown, hold time ms).
+    last_close: Option<PaperClose>,
+}
+
+/// One closed paper position.
+#[derive(Debug, Clone, Copy)]
+struct PaperClose {
+    gross_pnl_lamports: i64,
+    net_pnl_lamports: i64,
+    cost: sim_quote::PaperCost,
+    hold_ms: u64,
 }
 
 impl PaperSimulator {
@@ -120,7 +137,36 @@ impl PaperSimulator {
             max_hold_ms: 0,
             exits_forced: 0,
             last_liquidity_lamports: 0,
+            cost_model: sim_quote::PaperCostModel {
+                fee_rate_ppm: 0,
+                exit_impact_pct: 100,
+                latency_bps_per_leg: 0,
+                network_cost_per_tx_lamports: 0,
+            },
+            net_pnl_lamports: 0,
+            costs_lamports: 0,
+            last_close: None,
         }
+    }
+
+    /// Book a close: gross from the spot move, net after the cost estimate.
+    fn book_close(&mut self, pos: &PaperPosition, gross: i64, exit_liquidity: u64) {
+        let cost = sim_quote::paper_round_trip_cost(
+            &self.cost_model,
+            pos.position_size_lamports,
+            pos.entry_liquidity_lamports,
+            exit_liquidity,
+        );
+        let net = gross.saturating_sub(i64::try_from(cost.total_lamports).unwrap_or(i64::MAX));
+        self.simulated_pnl_lamports = self.simulated_pnl_lamports.saturating_add(gross);
+        self.net_pnl_lamports = self.net_pnl_lamports.saturating_add(net);
+        self.costs_lamports = self.costs_lamports.saturating_add(cost.total_lamports);
+        self.last_close = Some(PaperClose {
+            gross_pnl_lamports: gross,
+            net_pnl_lamports: net,
+            cost,
+            hold_ms: self.now_ms.saturating_sub(pos.opened_at_ms),
+        });
     }
 
     fn has_open_position(&self) -> bool {
@@ -175,7 +221,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::MaxHoldTime | strategy::ExitDecision::LiquidityDrop => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_forced += 1;
                     self.position = None;
                     PaperTick::ClosedForced(exit, pnl)
@@ -183,7 +229,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::StopLoss => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_stop_loss += 1;
                     self.position = None;
                     PaperTick::ClosedStopLoss(pnl)
@@ -191,7 +237,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::TakeProfit => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_take_profit += 1;
                     self.position = None;
                     PaperTick::ClosedTakeProfit(pnl)
@@ -253,6 +299,8 @@ struct PaperMarketSnapshot {
     source: &'static str,
     /// True when the input (pay-side) mint is the pool's token0.
     input_is_token0: bool,
+    /// The pool's trade fee (ppm) from its AmmConfig.
+    trade_fee_ppm: u64,
 }
 
 /// Paper market-data failure. Data that could not be fetched at all is
@@ -442,6 +490,8 @@ fn resolve_paper_market_data(
         is_blocklisted,
         source,
         input_is_token0: accounts.input_vault == pool.token_vault_0,
+        // Unknown fee = the highest CLMM tier (never underestimate costs).
+        trade_fee_ppm: pool.trade_fee_rate.map(u64::from).unwrap_or(10_000),
     })
 }
 
@@ -607,6 +657,28 @@ struct Args {
     #[arg(long, env = "SNIPER_MIN_NET_EDGE_BPS", default_value_t = 300)]
     min_net_edge_bps: i64,
 
+    /// Exit price impact estimate, as a percentage of the measured entry
+    /// impact (min 100). The exit cannot be simulated before the tokens are
+    /// held, so it is costed conservatively instead of assumed equal.
+    #[arg(long, env = "SNIPER_EXIT_IMPACT_PCT", default_value_t = 200)]
+    exit_impact_pct: u64,
+
+    /// Failed transactions budgeted per round trip in the net edge (each
+    /// costs one network fee).
+    #[arg(long, env = "SNIPER_FAILED_TX_RESERVE", default_value_t = 1)]
+    failed_tx_reserve: u64,
+
+    /// Paper only: adverse price move per leg (bps) charged for the delay
+    /// between the decision and a real fill. Paper fills are otherwise at
+    /// the observed spot price, which a live order never gets.
+    #[arg(long, env = "SNIPER_PAPER_LATENCY_BPS", default_value_t = 50)]
+    paper_latency_bps: u64,
+
+    /// Max position size relative to the pool's SOL-side liquidity (bps).
+    /// Unknown liquidity is a rejection.
+    #[arg(long, env = "SNIPER_MAX_POSITION_LIQUIDITY_BPS", default_value_t = 200)]
+    max_position_liquidity_bps: u64,
+
     /// Widen the exit slippage after failed exit attempts (up to 5%). Off by
     /// default: each exit attempt is quoted exactly by simulation, so a
     /// wider tolerance only buys a worse price.
@@ -626,6 +698,11 @@ struct Args {
     /// Minimum spacing of the price samples (ms).
     #[arg(long, env = "SNIPER_SIGNAL_SAMPLE_MS", default_value_t = 2000)]
     signal_sample_ms: u64,
+
+    /// The newest price sample must be at most this old (ms) for the signal
+    /// gate to pass; older data is `stale_data` (no trade).
+    #[arg(long, env = "SNIPER_SIGNAL_MAX_AGE_MS", default_value_t = 30_000)]
+    signal_max_age_ms: u64,
 
     /// Max spend in SOL for a single trade (security cap).
     #[arg(long, env = "SNIPER_MAX_SPEND_SOL", default_value_t = 0.01)]
@@ -1055,9 +1132,17 @@ fn signal_gate_rejects(
     if !args.signal_gate {
         return None;
     }
-    match signal::evaluate(series, cfg) {
+    match signal::evaluate_at(series, cfg, marketdata::now_ms() as u64) {
         signal::SignalDecision::Trade { .. } => None,
         signal::SignalDecision::NoTrade { reason, .. } => Some(reason),
+    }
+}
+
+/// The signal score (0-100) at this moment, when the gate would trade.
+fn signal_confidence(series: &signal::Series, cfg: &signal::SignalConfig) -> Option<u32> {
+    match signal::evaluate_at(series, cfg, marketdata::now_ms() as u64) {
+        signal::SignalDecision::Trade { confidence } => Some(confidence),
+        signal::SignalDecision::NoTrade { .. } => None,
     }
 }
 
@@ -1087,8 +1172,11 @@ fn exact_quote(
     Ok((spot, sim))
 }
 
-/// Entry economics gate on an exact quote: price impact and expected net
-/// edge after round-trip fees. `Err(code)` names the rejection.
+/// Entry economics gate on an exact quote: price impact, position size
+/// against the pool's SOL-side liquidity, and the expected net edge after
+/// both legs' fees, the measured entry impact, a conservative exit-impact
+/// estimate, network fees and a failed-transaction reserve. `Err(code)`
+/// names the rejection; unknown inputs reject.
 fn entry_economics(
     args: &Args,
     spot_out: u64,
@@ -1096,27 +1184,43 @@ fn entry_economics(
     fee_ppm: u64,
     position_lamports: u64,
     jito_tip_lamports: u64,
-) -> Result<(u64, i64), &'static str> {
+    liquidity_lamports: Option<u64>,
+) -> Result<sim_quote::EdgeBreakdown, &'static str> {
     let impact = sim_quote::price_impact_bps(spot_out, exact_out);
-    let network = sim_quote::tx_network_cost_lamports(
-        args.compute_unit_limit,
-        args.priority_fee_micro_lamports,
-    ) + jito_tip_lamports;
-    let edge = sim_quote::net_edge_bps(
-        strategy_config(args).take_profit_bps,
-        fee_ppm,
-        impact,
-        network,
-        position_lamports,
-    );
     if impact > args.max_price_impact_bps {
         return Err("price_impact_exceeded");
     }
-    if edge < args.min_net_edge_bps {
+    let ratio =
+        sim_quote::position_liquidity_bps(position_lamports, liquidity_lamports.unwrap_or(0))
+            .ok_or("liquidity_unverified")?;
+    if ratio > args.max_position_liquidity_bps {
+        return Err("position_too_large_for_liquidity");
+    }
+    let network = sim_quote::tx_network_cost_lamports(
+        args.compute_unit_limit,
+        args.priority_fee_micro_lamports,
+    )
+    .saturating_add(jito_tip_lamports);
+    let edge = sim_quote::edge_breakdown(&sim_quote::EdgeInputs {
+        take_profit_bps: strategy_config(args).take_profit_bps,
+        fee_rate_ppm: fee_ppm,
+        entry_impact_bps: impact,
+        exit_impact_pct: args.exit_impact_pct,
+        network_cost_per_tx_lamports: network,
+        failed_tx_reserve: args.failed_tx_reserve,
+        exit_slippage_bps: args.max_slippage_bps,
+        position_lamports,
+    })
+    .ok_or("net_edge_too_small")?;
+    if edge.net_edge_bps < args.min_net_edge_bps {
         return Err("net_edge_too_small");
     }
-    Ok((impact, edge))
+    Ok(edge)
 }
+
+/// Consecutive failed exit attempts after which the position is reported
+/// as `exit_blocked` (retries continue).
+const EXIT_BLOCKED_AFTER: u32 = 3;
 
 /// Result of an RPC `simulateTransaction`.
 struct SimulationResult {
@@ -1175,11 +1279,9 @@ async fn sign_and_verify(
     ) {
         let start = std::time::Instant::now();
         let res = hsm_sign(ep, ca, id, tx).await.map_err(|e| format!("{e}"));
-        metrics::record_hsm(
-            metrics_registry,
-            res.is_ok(),
-            start.elapsed().as_secs_f64() * 1000.0,
-        );
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_hsm(metrics_registry, res.is_ok(), ms);
+        metrics::observe_stage(metrics_registry, metrics::Stage::Sign, ms);
         res?
     } else if let Some(kp) = local_signer {
         tx.sign(&[kp], tx.message.recent_blockhash);
@@ -1573,6 +1675,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         strategy::StrategyConfig::default().max_trade_size_lamports,
         risk_cfg.max_trade_size_lamports,
     )?;
+    // One live process per data dir, taken BEFORE the risk state is read so
+    // no other process can change it underneath this one.
+    let _instance_lock = if args.live {
+        Some(position::InstanceLock::acquire(&args.data_dir)?)
+    } else {
+        None
+    };
     let risk_manager = Arc::new(risk::RiskManager::new(risk_cfg.clone()));
     tracing::info!(
         target: "main",
@@ -1807,6 +1916,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trade nor a success — it is rejected with its real reason.
     let mut paper_sim = PaperSimulator::with_config(strategy_config(&args));
     paper_sim.max_hold_ms = args.max_hold_secs.saturating_mul(1000);
+    paper_sim.cost_model = sim_quote::PaperCostModel {
+        fee_rate_ppm: 10_000, // replaced by the pool's real fee each tick
+        exit_impact_pct: args.exit_impact_pct,
+        latency_bps_per_leg: args.paper_latency_bps,
+        network_cost_per_tx_lamports: sim_quote::tx_network_cost_lamports(
+            args.compute_unit_limit,
+            args.priority_fee_micro_lamports,
+        ),
+    };
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -1892,6 +2010,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Genuine, timestamped pool-price observations for the signal gate.
     let signal_cfg = signal::SignalConfig {
         min_confidence: args.signal_min_confidence.min(100),
+        max_sample_age_ms: args.signal_max_age_ms,
         ..signal::SignalConfig::default()
     };
     let mut price_series = signal::Series::new(240, args.signal_sample_ms);
@@ -1938,7 +2057,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 process_alive: true,
                 state_verified: risk_manager.is_state_verified(),
                 reconcile_required: false,
-                exit_blocked: false,
+                // Exits are retried every iteration and never gated by the
+                // entry limits; after this many consecutive failures the
+                // operator must look (alert + /ready 503).
+                exit_blocked: live_position.is_some() && exit_failures >= EXIT_BLOCKED_AFTER,
+                consecutive_exit_failures: exit_failures,
                 breaker_state,
                 kill_switch_active: risk_manager.is_kill_switch_active(),
                 live_armed: risk_manager.is_live_armed(),
@@ -1973,6 +2096,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
+                let exit_start = std::time::Instant::now();
                 let outcome = manage_open_position(
                     &args,
                     &rpc_client,
@@ -1985,6 +2109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exit_failures,
                 )
                 .await;
+                let exit_ms = exit_start.elapsed().as_secs_f64() * 1000.0;
+                if !matches!(outcome, ExitOutcome::Hold) {
+                    metrics::observe_stage(&metrics_registry, metrics::Stage::Exit, exit_ms);
+                }
                 exit_failures = match &outcome {
                     ExitOutcome::Failed(_) => exit_failures.saturating_add(1),
                     _ => 0,
@@ -2029,6 +2157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.context = serde_json::json!({
                         "action": "exit",
                         "outcome": format!("{outcome:?}"),
+                        "latency_ms": { "exit": exit_ms as u64 },
                         "cost_input_units": pos.cost_input_units,
                         "token_amount": pos.token_amount,
                     });
@@ -2081,6 +2210,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             paper_data_fetch_ms =
                 paper_data_fetch_ms.saturating_add(data_start.elapsed().as_millis());
+            metrics::observe_stage(
+                &metrics_registry,
+                metrics::Stage::MarketData,
+                data_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             // A real decision record is written every iteration so audit and
             // replay reflect exactly what happened (including rejections).
@@ -2160,6 +2294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
             paper_sim.input_is_token0 = snapshot.input_is_token0;
+            paper_sim.cost_model.fee_rate_ppm = snapshot.trade_fee_ppm;
             paper_sim.now_ms = marketdata::now_ms() as u64;
             price_series.push(signal::Observation {
                 ts_ms: paper_sim.now_ms,
@@ -2201,9 +2336,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         _ => "exit_max_hold",
                     };
+                    let close = paper_sim.last_close;
                     rec.context = serde_json::json!({
                         "action": action,
                         "realized_simulated_pnl_lamports": pnl,
+                        "gross_pnl_lamports": close.map(|c| c.gross_pnl_lamports),
+                        "net_pnl_lamports": close.map(|c| c.net_pnl_lamports),
+                        "cost": close.map(|c| c.cost),
+                        "hold_ms": close.map(|c| c.hold_ms),
+                        "cost_model": "estimate: fee x2 + constant-product impact (exit x exit_impact_pct) + latency bps x2 + network x2",
+                        "exit_liquidity_lamports": snapshot.liquidity_lamports,
                         "entry_sqrt": open_pos.map(|(s, _)| s.to_string()),
                         "position_size_lamports": open_pos.map(|(_, sz)| sz),
                         "current_sqrt": snapshot.current_sqrt_price.to_string(),
@@ -2211,16 +2353,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "simulated": true,
                     });
                     rec.save(&args.data_dir)?;
-                    metrics::set_paper_simulated_pnl(
-                        &metrics_registry,
-                        paper_sim.simulated_pnl_lamports,
-                    );
+                    metrics::set_paper_simulated_pnl(&metrics_registry, paper_sim.net_pnl_lamports);
                     single_trade_done = true;
                     tracing::info!(
                         target: "paper",
                         iteration = i + 1,
                         action = action,
-                        pnl_lamports = pnl,
+                        gross_pnl_lamports = pnl,
+                        net_pnl_lamports = close.map(|c| c.net_pnl_lamports),
                         "paper simulated EXIT on real price (no on-chain tx)"
                     );
                 }
@@ -2324,6 +2464,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.context = serde_json::json!({
                         "action": "enter",
                         "would_execute": true,
+                        // Recorded so the score can be checked against
+                        // outcomes (sniper_report.py groups by it).
+                        "signal_confidence": signal_confidence(&price_series, &signal_cfg),
                         "entry_sqrt": entry_sqrt.to_string(),
                         "position_size_lamports": signal.position_size_lamports,
                         "slippage_bps": signal.slippage_bps,
@@ -2347,7 +2490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
 
             // Periodic metrics snapshot (paper included; mode-labeled).
-            if total_trades > 0 && total_trades % 10 == 0 {
+            if total_trades > 0 && total_trades.is_multiple_of(10) {
                 let avg_latency = total_latency_ms / paper_iterations.max(1) as u128;
                 use std::io::Write;
                 let metrics_path = args.data_dir.join("metrics.jsonl");
@@ -2646,9 +2789,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Advisory only — never gates the trade. A blocking HTTP call,
                 // so at most once a minute and off the async worker.
                 if args.dexscreener_check
-                    && dexscreener_last.map_or(true, |t: std::time::Instant| {
-                        t.elapsed() >= Duration::from_secs(60)
-                    })
+                    && dexscreener_last
+                        .is_none_or(|t: std::time::Instant| t.elapsed() >= Duration::from_secs(60))
                 {
                     dexscreener_last = Some(std::time::Instant::now());
                     match tokio::task::block_in_place(|| discovery::fetch_snapshot(pool_id_str)) {
@@ -2865,14 +3007,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Exact quote from an on-chain simulation of this very
                     // swap (price impact and tick crossings included), then
                     // the economics gate. Any failure: no trade.
-                    let (spot, sim) = match exact_quote(
+                    let quote_start = std::time::Instant::now();
+                    let quoted = exact_quote(
                         &rpc_client,
                         adapter,
                         entry_signal.position_size_lamports,
                         args.max_slippage_bps,
                         &from,
                         &opts,
-                    ) {
+                    );
+                    let quote_ms = quote_start.elapsed().as_secs_f64() * 1000.0;
+                    metrics::observe_stage(&metrics_registry, metrics::Stage::QuoteSim, quote_ms);
+                    let (spot, sim) = match quoted {
                         Ok(v) => v,
                         Err(e) => {
                             metrics::record_trade_rejected(
@@ -2898,8 +3044,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         adapter.trade_fee_ppm(),
                         entry_signal.position_size_lamports,
                         jito_tip.map(|(_, l)| l).unwrap_or(0),
+                        live_liquidity,
                     );
-                    let (impact_bps, edge_bps) = match economics {
+                    let edge = match economics {
                         Ok(v) => v,
                         Err(code) => {
                             metrics::record_trade_rejected(&metrics_registry, mode_label, code);
@@ -2915,6 +3062,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "reject_reason": code,
                                 "spot_out": spot.expected_output,
                                 "exact_out": sim.amount_out,
+                                "liquidity_lamports": live_liquidity,
                             });
                             rec.save(&args.data_dir)?;
                             sleep(loop_interval).await;
@@ -2925,11 +3073,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mode = mode_target,
                         spot_out = spot.expected_output,
                         exact_out = sim.amount_out,
-                        impact_bps,
-                        edge_bps,
+                        impact_bps = edge.entry_impact_bps,
+                        exit_impact_est_bps = edge.exit_impact_bps,
+                        exit_cost_bps = edge.exit_cost_bps,
+                        expected_return_bps = edge.expected_return_bps,
+                        edge_bps = edge.net_edge_bps,
+                        worst_case_edge_bps = edge.worst_case_edge_bps,
                         compute_units = ?sim.compute_units,
                         "exact entry quote (on-chain simulation)"
                     );
+                    rec.context = serde_json::json!({
+                        "action": "quoted",
+                        "signal_confidence": signal_confidence(&price_series, &signal_cfg),
+                        "latency_ms": { "quote_sim": quote_ms as u64 },
+                        "spot_out": spot.expected_output,
+                        "exact_out": sim.amount_out,
+                        "liquidity_lamports": live_liquidity,
+                        "edge": edge,
+                    });
+                    rec.save(&args.data_dir)?;
                     let mut exact = spot;
                     exact.expected_output = sim.amount_out;
                     let intent = adapter
@@ -3064,6 +3226,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 i + 1
                             ),
                         }
+                        // The payer usually holds none of a fresh launch
+                        // token, so its exit simulation cannot pass. Run the
+                        // same exit once more as an existing wallet holder
+                        // of the token (read-only simulation, nothing is
+                        // signed): a pass shows the exit path itself works
+                        // on this pool.
+                        let held =
+                            Pubkey::from_str(args.output_mint.as_deref().unwrap_or_default());
+                        if let Ok(held) = held {
+                            match onchain_risk::find_simulation_holder(
+                                &rpc_client,
+                                &held,
+                                swap_min_output,
+                            ) {
+                                Ok(Some(holder)) => match build_exit_tx(
+                                    &args,
+                                    &rpc_client,
+                                    &holder,
+                                    swap_min_output,
+                                    blockhash,
+                                    jito_tip,
+                                )
+                                .and_then(|t| simulate_on_chain(&rpc_client, &t))
+                                {
+                                    Ok(sim) => {
+                                        let ok = sim.err.is_none();
+                                        println!(
+                                            "[DRY-RUN] iter {}: EXIT simulation as token holder {holder}: {} (compute units {:?}){}",
+                                            i + 1,
+                                            if ok { "OK" } else { "FAILED" },
+                                            sim.units,
+                                            sim.err.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+                                        );
+                                        if !ok {
+                                            for line in sim.logs.iter().rev().take(8).rev() {
+                                                println!("    {line}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!(
+                                        "[DRY-RUN] iter {}: EXIT simulation as token holder unavailable: {e}",
+                                        i + 1
+                                    ),
+                                },
+                                Ok(None) => println!(
+                                    "[DRY-RUN] iter {}: no wallet holds >= {swap_min_output} of the token in its ATA — exit path unverified on this pool",
+                                    i + 1
+                                ),
+                                Err(e) => println!(
+                                    "[DRY-RUN] iter {}: token holder lookup failed: {e}",
+                                    i + 1
+                                ),
+                            }
+                        }
                     }
                     tracing::info!(
                         target: "dry_run",
@@ -3146,7 +3362,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sleep(loop_interval).await;
                         continue;
                     }
+                    let submit_start = std::time::Instant::now();
                     let submitted = submit_live_tx(&args, &rpc_client, &tx).await;
+                    metrics::observe_stage(
+                        &metrics_registry,
+                        metrics::Stage::SubmitConfirm,
+                        submit_start.elapsed().as_secs_f64() * 1000.0,
+                    );
                     // An Err may mean "outcome unknown" (e.g. confirmation
                     // timeout). Reconcile from the real token balance before
                     // concluding nothing happened, so a swap that landed late
@@ -3257,7 +3479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_latency_ms = total_latency_ms.saturating_add(elapsed_ms);
         total_trades += 1;
 
-        if total_trades % 10 == 0 {
+        if total_trades.is_multiple_of(10) {
             let avg_latency = if total_trades > 0 {
                 total_latency_ms / total_trades as u128
             } else {
@@ -3357,9 +3579,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!(
-            "  Simulated P&L:         {} lamports ({:.6} SOL)",
+            "  Gross P&L (spot move): {} lamports ({:.6} SOL)",
             paper_sim.simulated_pnl_lamports,
             paper_sim.simulated_pnl_lamports as f64 / 1e9
+        );
+        println!(
+            "  Est. costs:            {} lamports (fees, impact, latency, network — estimate)",
+            paper_sim.costs_lamports
+        );
+        println!(
+            "  Net P&L (estimate):    {} lamports ({:.6} SOL)",
+            paper_sim.net_pnl_lamports,
+            paper_sim.net_pnl_lamports as f64 / 1e9
         );
     }
     if risk_manager.is_circuit_breaker_active() {
@@ -3646,6 +3877,35 @@ mod tests {
 
     // ── AŞAMA 4/5: quote-based simulated P&L (same (current/entry)^2 ratio
     //    formula SimpleSnipeStrategy::should_exit uses — pure, no I/O) ──
+    #[test]
+    fn paper_close_books_net_after_costs() {
+        let mut sim = PaperSimulator::new();
+        sim.cost_model = sim_quote::PaperCostModel {
+            fee_rate_ppm: 2_500,
+            exit_impact_pct: 200,
+            latency_bps_per_leg: 50,
+            network_cost_per_tx_lamports: 10_000,
+        };
+        let pos = PaperPosition {
+            entry_sqrt_price: 1,
+            position_size_lamports: 50_000_000,
+            entry_liquidity_lamports: 20_000_000_000,
+            opened_at_ms: 1_000,
+        };
+        sim.now_ms = 61_000;
+        sim.book_close(&pos, 5_000_000, 20_000_000_000);
+        let c = sim.last_close.unwrap();
+        assert_eq!(c.gross_pnl_lamports, 5_000_000);
+        assert_eq!(c.cost.total_lamports, 1_144_064);
+        assert_eq!(c.net_pnl_lamports, 5_000_000 - 1_144_064);
+        assert_eq!(c.hold_ms, 60_000);
+        assert_eq!(sim.simulated_pnl_lamports, 5_000_000);
+        assert_eq!(sim.net_pnl_lamports, 5_000_000 - 1_144_064);
+        // A small spot gain can be a net loss.
+        sim.book_close(&pos, 1_000_000, 20_000_000_000);
+        assert!(sim.last_close.unwrap().net_pnl_lamports < 0);
+    }
+
     #[test]
     fn simulated_pnl_lamports_zero_at_entry_price_or_zero_entry() {
         assert_eq!(
@@ -4121,27 +4381,53 @@ mod tests {
         .unwrap();
         assert_eq!(args.max_price_impact_bps, 300);
         assert_eq!(args.min_net_edge_bps, 300);
+        assert_eq!(args.exit_impact_pct, 200);
+        assert_eq!(args.max_position_liquidity_bps, 200);
         assert!(!args.exit_slippage_escalation);
-        // 1% impact, 0.25% fee: 10% target - 0.5% - 2% - network ~1.6% ≈ 5.9%.
-        let (impact, edge) =
-            entry_economics(&args, 1_000_000, 990_000, 2_500, 10_000_000, 0).unwrap();
-        assert_eq!(impact, 100);
-        assert!(edge > 300, "{edge}");
+        let liq = Some(20_000_000_000); // 20 SOL
+                                        // 1% entry impact, 2% estimated exit impact, 0.25% fee per leg,
+                                        // 8 bps network per tx + 1 failed tx: 1000-50-100-200-16-8 = 626.
+        let e = entry_economics(&args, 1_000_000, 990_000, 2_500, 10_000_000, 0, liq).unwrap();
+        assert_eq!(e.entry_impact_bps, 100);
+        assert_eq!(e.exit_impact_bps, 200);
+        assert_eq!(e.net_edge_bps, 626);
+        assert_eq!(e.worst_case_edge_bps, 626 - 100);
         // 4% impact > 3% cap.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 960_000, 2_500, 10_000_000, 0),
+            entry_economics(&args, 1_000_000, 960_000, 2_500, 10_000_000, 0, liq),
             Err("price_impact_exceeded")
         );
         // 2.9% impact passes the cap but leaves too little edge after a 1% fee.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 971_000, 10_000, 10_000_000, 0),
+            entry_economics(&args, 1_000_000, 971_000, 10_000, 10_000_000, 0, liq),
             Err("net_edge_too_small")
         );
         // A huge Jito tip on a tiny position kills the edge too.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000),
+            entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000, liq),
             Err("net_edge_too_small")
         );
+        // Unknown or zero liquidity, or a position too large for it, rejects.
+        for l in [None, Some(0)] {
+            assert_eq!(
+                entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 0, l),
+                Err("liquidity_unverified")
+            );
+        }
+        assert_eq!(
+            entry_economics(
+                &args,
+                1_000_000,
+                1_000_000,
+                2_500,
+                50_000_000,
+                0,
+                Some(1_000_000_000)
+            ),
+            Err("position_too_large_for_liquidity")
+        );
+        // Zero position never trades.
+        assert!(entry_economics(&args, 1_000_000, 1_000_000, 2_500, 0, 0, liq).is_err());
     }
 
     #[test]
@@ -4173,5 +4459,38 @@ mod tests {
                 .to_string();
             assert!(err.contains("broadcast refused"), "{argv:?}: {err}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_exit_keeps_the_position_and_ignores_entry_gates() {
+        let (dir, p) = pending_fixture();
+        let pos = p.position.clone();
+        pos.save(&dir).unwrap();
+        let args = Args::try_parse_from(["solana-sniper", "--live"]).unwrap();
+        let rpc = Arc::new(RpcClient::new_mock("fails".to_string()));
+        let rm =
+            risk::RiskManager::new(risk::RiskConfig::production_defaults(dir.clone()).unwrap());
+        // Entry gates closed: the exit must still be attempted.
+        rm.trigger_kill_switch("test");
+        let m = metrics::Metrics::new();
+        let bh = std::sync::Mutex::new(retry::BlockhashManager::new(rpc.clone()));
+        let out = manage_open_position(
+            &args,
+            &rpc,
+            &rm,
+            &m,
+            &bh,
+            &Pubkey::new_unique(),
+            &pos,
+            None,
+            0,
+        )
+        .await;
+        match out {
+            ExitOutcome::Failed(e) => assert!(!e.contains("kill"), "{e}"),
+            other => panic!("expected a failed exit, got {other:?}"),
+        }
+        // The position record is untouched: the next iteration retries.
+        assert!(position::LivePosition::load(&dir).unwrap().is_some());
     }
 }

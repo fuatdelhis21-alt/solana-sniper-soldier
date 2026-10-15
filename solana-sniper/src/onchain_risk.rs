@@ -202,6 +202,50 @@ pub fn fetch_holder_stats_cached(
     Ok(stats)
 }
 
+/// Pick a wallet that can stand in as the payer of an exit SIMULATION
+/// (dry-run only; nothing is signed or sent): an on-curve owner whose
+/// associated token account holds at least `min_amount` of `mint`, so the
+/// exit swap built for that owner is the same one the bot would send. Pure.
+pub fn pick_simulation_holder(
+    mint: &Pubkey,
+    accounts: &[(Pubkey, Option<Vec<u8>>)],
+    min_amount: u64,
+) -> Option<Pubkey> {
+    accounts.iter().find_map(|(addr, data)| {
+        let data = data.as_ref()?;
+        let owner = token_account_owner(data)?;
+        let amount = crate::sim_quote::token_amount(data)?;
+        (owner.is_on_curve()
+            && amount >= min_amount
+            && *addr == crate::amm::account_resolver::resolve_user_ata(&owner, mint))
+        .then_some(owner)
+    })
+}
+
+/// `pick_simulation_holder` over the mint's largest token accounts.
+pub fn find_simulation_holder(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    min_amount: u64,
+) -> Result<Option<Pubkey>, String> {
+    let largest = rpc
+        .get_token_largest_accounts(mint)
+        .map_err(|e| format!("failed to fetch largest accounts for {mint}: {e}"))?;
+    let addrs: Vec<Pubkey> = largest
+        .iter()
+        .filter_map(|e| Pubkey::from_str(&e.address).ok())
+        .collect();
+    let accs = rpc
+        .get_multiple_accounts(&addrs)
+        .map_err(|e| format!("failed to fetch token accounts for {mint}: {e}"))?;
+    let pairs: Vec<(Pubkey, Option<Vec<u8>>)> = addrs
+        .into_iter()
+        .zip(accs)
+        .map(|(a, acc)| (a, acc.map(|x| x.data)))
+        .collect();
+    Ok(pick_simulation_holder(mint, &pairs, min_amount))
+}
+
 /// Owner field of an SPL token account (bytes 32..64), if the data is long
 /// enough to be one.
 fn token_account_owner(data: &[u8]) -> Option<Pubkey> {
@@ -287,30 +331,49 @@ pub fn fetch_mint_authority_risk(
     let account = rpc
         .get_account(mint)
         .map_err(|e| format!("failed to fetch mint account {mint}: {e}"))?;
-    // The swap path derives classic SPL Token ATAs and passes the classic
-    // token program: a Token-2022 mint (transfer fees, hooks, ...) cannot be
-    // traded safely here — reject it explicitly (fail-closed).
-    let spl_token = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    if account.owner != spl_token {
+    classify_mint(mint, &account.owner, &account.data)
+}
+
+/// Classic SPL Token program id.
+pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+/// Classify a mint account (pure). The swap path derives classic SPL Token
+/// ATAs and passes the classic token program: a Token-2022 mint (transfer
+/// fees, hooks, ...) or any other owner cannot be traded safely here and is
+/// rejected (the error text contains "Token-2022", which discovery treats
+/// as a permanent rejection). A malformed, wrong-size or uninitialized mint
+/// is an error too — never "safe".
+pub fn classify_mint(
+    mint: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+) -> Result<MintAuthorityRisk, String> {
+    let spl_token = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+    if *owner != spl_token {
         return Err(format!(
-            "mint {mint} is owned by {} — only classic SPL Token mints are supported (Token-2022 rejected)",
-            account.owner
+            "mint {mint} is owned by {owner} — only classic SPL Token mints are supported (Token-2022 rejected)"
         ));
     }
-    // SPL Token Mint account is exactly 82 bytes (Token-2022 mints are
-    // longer due to extensions, but the base Mint layout is a fixed prefix
-    // in both, so this parse is valid for both program versions).
-    if account.data.len() < 82 {
+    // Classic SPL Mint: exactly 82 bytes — COption<Pubkey> mint authority
+    // (0..36), supply (36..44), decimals (44), is_initialized (45),
+    // COption<Pubkey> freeze authority (46..82).
+    if data.len() != 82 {
         return Err(format!(
-            "mint {mint} account data too short ({} bytes) to be a valid SPL Mint",
-            account.data.len()
+            "mint {mint} account data is {} bytes, not an SPL Mint (82)",
+            data.len()
         ));
     }
-    let mint_authority_tag = u32::from_le_bytes(account.data[0..4].try_into().unwrap());
-    let freeze_authority_tag = u32::from_le_bytes(account.data[46..50].try_into().unwrap());
+    if data[45] != 1 {
+        return Err(format!("mint {mint} is not initialized"));
+    }
+    let tag = |r: std::ops::Range<usize>| u32::from_le_bytes(data[r].try_into().unwrap());
+    let (mint_tag, freeze_tag) = (tag(0..4), tag(46..50));
+    if mint_tag > 1 || freeze_tag > 1 {
+        return Err(format!("mint {mint} has a malformed authority option"));
+    }
     Ok(MintAuthorityRisk {
-        mint_authority_present: mint_authority_tag != 0,
-        freeze_authority_present: freeze_authority_tag != 0,
+        mint_authority_present: mint_tag != 0,
+        freeze_authority_present: freeze_tag != 0,
     })
 }
 
@@ -583,4 +646,76 @@ fn token_account_owner_parses_spl_layout_and_curve_check() {
         assert_eq!(parsed.is_on_curve(), on_curve);
     }
     assert!(token_account_owner(&[0u8; 40]).is_none());
+}
+
+#[test]
+fn classify_mint_rejects_token_2022_and_malformed_mints() {
+    let mint = Pubkey::new_unique();
+    let spl = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let mut clean = vec![0u8; 82];
+    clean[45] = 1;
+    let r = classify_mint(&mint, &spl, &clean).unwrap();
+    assert!(!r.is_risky());
+
+    // Token-2022 (and any other owner) is rejected with the marker text
+    // discovery relies on, even when the base layout looks clean.
+    let mut ext = clean.clone();
+    ext.resize(200, 0);
+    for owner in [token_2022, Pubkey::new_unique()] {
+        let e = classify_mint(&mint, &owner, &ext).unwrap_err();
+        assert!(e.contains("Token-2022"), "{e}");
+    }
+
+    let mut auth = clean.clone();
+    auth[0] = 1;
+    assert!(
+        classify_mint(&mint, &spl, &auth)
+            .unwrap()
+            .mint_authority_present
+    );
+    let mut frz = clean.clone();
+    frz[46] = 1;
+    assert!(
+        classify_mint(&mint, &spl, &frz)
+            .unwrap()
+            .freeze_authority_present
+    );
+
+    // Wrong size, uninitialized, malformed option tags: errors, never safe.
+    assert!(classify_mint(&mint, &spl, &clean[..81]).is_err());
+    assert!(classify_mint(&mint, &spl, &ext).is_err());
+    let mut uninit = clean.clone();
+    uninit[45] = 0;
+    assert!(classify_mint(&mint, &spl, &uninit).is_err());
+    let mut bad = clean.clone();
+    bad[0] = 7;
+    assert!(classify_mint(&mint, &spl, &bad).is_err());
+}
+
+#[test]
+fn simulation_holder_must_be_an_on_curve_ata_with_enough_tokens() {
+    use solana_sdk::signature::Signer;
+    let mint = Pubkey::new_unique();
+    let wallet = solana_sdk::signature::Keypair::new().pubkey();
+    let (pda, _) = Pubkey::find_program_address(&[b"v"], &Pubkey::new_unique());
+    let acct = |owner: &Pubkey, amount: u64| {
+        let mut d = vec![0u8; 165];
+        d[0..32].copy_from_slice(mint.as_ref());
+        d[32..64].copy_from_slice(owner.as_ref());
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        Some(d)
+    };
+    let ata = |o: &Pubkey| crate::amm::account_resolver::resolve_user_ata(o, &mint);
+    // PDA vault, non-ATA account, too-small balance, missing data: skipped.
+    let accounts = vec![
+        (Pubkey::new_unique(), acct(&pda, 1_000)),
+        (Pubkey::new_unique(), acct(&wallet, 1_000)),
+        (ata(&wallet), acct(&wallet, 10)),
+        (Pubkey::new_unique(), None),
+    ];
+    assert_eq!(pick_simulation_holder(&mint, &accounts, 100), None);
+    let mut ok = accounts.clone();
+    ok.push((ata(&wallet), acct(&wallet, 500)));
+    assert_eq!(pick_simulation_holder(&mint, &ok, 100), Some(wallet));
 }

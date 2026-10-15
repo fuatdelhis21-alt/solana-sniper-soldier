@@ -162,8 +162,12 @@ curl -s http://127.0.0.1:9898/ready   # -> ready:true (200)
 
 | Durum | Eylem |
 |-------|-------|
-| `/ready` 503, `reconcile_required:1` | Operatör on-chain state'i doğrular, `clear_reconcile_required` sonrası restart. Otomatik satış YOK. |
-| `/ready` 503, `exit_blocked:1` | Exit retry bütçesi tükendi; pozisyon açık. Operatör müdahalesi gerekir. |
+| `exit_blocked:1` / alert `SolanaHftExitBlocked` (≥ 3 ardışık başarısız exit) | Pozisyon açık; bot her iterasyonda exit'i **yeniden dener** (günlük limit / kill switch exit'i engellemez). Bakılacaklar: `journalctl` içinde `exit iteration failed` hatası (RPC, HSM, `exit quote failed`, havuz likiditesi). RPC/HSM'i düzelt; servisi **durdurma** (durdurursan pozisyon `live_position.json`'da kalır, sonraki süreç yönetimi devralır). Kayma toleransı otomatik genişlemez (`SNIPER_EXIT_SLIPPAGE_ESCALATION=false`); havuz çok inceldiyse operatör bilinçli olarak açabilir. Manuel satış yapılırsa bot token'ı cüzdanda bulamaz ve kaydı `ClosedExternally` olarak kapatır. |
+| Kill switch (`hft_kill_switch_active 1`) | Yeni giriş yok, exit devam eder. Tetikleyiciyi audit logda bul (ör. "entry outcome unknown" → cüzdanı explorer'da kontrol et, `pending_entry.json` bir sonraki başlangıçta zincirden uzlaştırılır). |
+| `state_verified 0` | risk_state.json okunamadı ya da yazılamadı (disk dolu / izin). Yeni giriş yok. Disk/izni düzelt, dosyayı incele, sonra restart. |
+| `another trading process holds …/trading.lock` | Aynı data dir için ikinci live süreç. İkinci servisi durdur (`solana-hft` ve `solana-hft-sniper` aynı anda çalışmaz). |
+| pool-sniper `/ready` 503 ("possible discovery gap") | WS yeniden bağlandı / kuyruk taştı / CreatePool çözülemedi: o pencerede yeni havuz kaçmış olabilir (backfill yok). 5 dk sonra kendiliğinden düzelir; sürekli tekrarlıyorsa WS/RPC sağlayıcısını kontrol et. |
+| pool-sniper "corrupt discovery state" ile başlamıyor | `/var/lib/solana-hft/discovery_state.json` bozuk: incele, sil (günlük havuz sayacı sıfırlanır — bilinçli karar). |
 | Breaker Open | Cooldown + probe akışını bekle; probe başarısızsa RPC/HSM'i kontrol et. |
 | HSM down | `systemctl start solana-hsm`; bot live'da pubkey'i yeniden doğrular. |
 | risk_state.json bozuk | Live startup reddedilir. Yedekten restore etme otomatik değildir; operatör doğrular. |

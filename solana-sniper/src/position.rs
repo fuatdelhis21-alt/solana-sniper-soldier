@@ -22,6 +22,60 @@ use crate::amm::account_resolver::resolve_user_ata;
 use crate::amm::raydium_v4::NATIVE_MINT;
 
 const POSITION_FILE: &str = "live_position.json";
+const LOCK_FILE: &str = "trading.lock";
+
+/// Exclusive, process-wide lock on a data directory: at most one live
+/// trading process may own the risk state, the position and the pending
+/// entry. The OS releases it when the process exits (also on a crash), so
+/// a stale lock file never blocks a restart.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    pub fn acquire(data_dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+        let path = data_dir.join(LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+                "another trading process holds {} — refusing to start (one live process per data dir)",
+                path.display()
+            )),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("cannot lock {}: {e}", path.display()))
+            }
+        }
+    }
+}
+
+/// Crash-safe file replacement: write `tmp`, fsync it, rename it over
+/// `path`, then fsync the directory so the rename itself is durable. A
+/// crash leaves either the old or the new content, never a torn file.
+pub fn write_atomic(path: &Path, tmp: &Path, body: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut f =
+        std::fs::File::create(tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    f.write_all(body)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(tmp, path).map_err(|e| format!("cannot rename to {}: {e}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
 
 /// One open live position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,9 +125,7 @@ impl LivePosition {
         let path = Self::path(data_dir);
         let tmp = data_dir.join(format!("{POSITION_FILE}.tmp"));
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("cannot rename to {}: {e}", path.display()))
+        write_atomic(&path, &tmp, body.as_bytes())
     }
 
     /// Remove the record after a confirmed exit.
@@ -136,9 +188,7 @@ impl PendingEntry {
         let path = Self::path(data_dir);
         let tmp = data_dir.join(format!("{PENDING_FILE}.tmp"));
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("cannot rename to {}: {e}", path.display()))
+        write_atomic(&path, &tmp, body.as_bytes())
     }
 
     pub fn clear(data_dir: &Path) -> Result<(), String> {
@@ -304,5 +354,16 @@ mod tests {
     fn realized_pnl_sign() {
         assert_eq!(realized_pnl(10_000, 11_000), 1_000);
         assert_eq!(realized_pnl(10_000, 9_000), -1_000);
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive_and_released_on_drop() {
+        let d = std::env::temp_dir().join(format!("lock-{}", std::process::id()));
+        let a = InstanceLock::acquire(&d).unwrap();
+        let err = InstanceLock::acquire(&d).unwrap_err();
+        assert!(err.contains("another trading process"), "{err}");
+        drop(a);
+        assert!(InstanceLock::acquire(&d).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

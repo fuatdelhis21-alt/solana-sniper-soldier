@@ -305,13 +305,15 @@ impl RaydiumV4ClmmAdapter {
         Ok(tx)
     }
 
-    /// The pool's trade fee (ppm) from its AmmConfig; 500 when unresolved.
+    /// The pool's trade fee (ppm) from its AmmConfig. Unresolved = the
+    /// highest Raydium CLMM fee tier (1%), so an unknown fee never makes an
+    /// entry look cheaper than it is.
     pub fn trade_fee_ppm(&self) -> u64 {
         self.pool
             .as_ref()
             .and_then(|p| p.trade_fee_rate)
             .map(u64::from)
-            .unwrap_or(500)
+            .unwrap_or(10_000)
     }
 
     /// The swap's output token account (where a simulation reads the

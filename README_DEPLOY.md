@@ -125,7 +125,10 @@ Giriş kararı (live/dry-run) sırası: on-chain risk kapıları → strateji �
 kendi fiyat örneklerini toplar, ~34 örnek ısınma — `SNIPER_SIGNAL_*`) →
 **kesin kotasyon** (swap'ın kendisi `simulateTransaction` ile simüle edilir,
 çıktı programın kendi hesabıdır) → fiyat etkisi ≤ `SNIPER_MAX_PRICE_IMPACT_BPS`
-ve net kenar ≥ `SNIPER_MIN_NET_EDGE_BPS` → tamsayı `min_amount_out` → imza →
+→ pozisyon / SOL likidite ≤ `SNIPER_MAX_POSITION_LIQUIDITY_BPS` → net kenar ≥
+`SNIPER_MIN_NET_EDGE_BPS` (iki bacak ücreti, giriş etkisi, **ayrı ve muhafazakâr
+çıkış etkisi tahmini** `SNIPER_EXIT_IMPACT_PCT`, ağ ücretleri, başarısız tx
+rezervi; kayıtta `"action":"quoted"` dökümü) → tamsayı `min_amount_out` → imza →
 gönderim. Simülasyon başarısızsa işlem yapılmaz. Paper modu imzalı işlem
 kurmaz; kotasyonu spot fiyat tahminidir. Durum ve kanıtlar:
 [docs/READINESS.md](docs/READINESS.md).
