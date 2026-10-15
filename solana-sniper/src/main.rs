@@ -267,22 +267,21 @@ impl PaperSimulator {
 }
 
 /// Quote-based simulated P&L for a closed paper position (no real swap): the
-/// price ratio `(current/entry)^2` — the SAME formula
-/// `SimpleSnipeStrategy::should_exit` uses — applied to the position size.
-/// Negative on stop-loss, positive on take-profit. Always reported/labeled as
-/// simulated, never mixed with realized on-chain P&L.
+/// price ratio `(current/entry)^2` from `strategy::price_ratio_scaled` — the
+/// SAME integer value `SimpleSnipeStrategy::should_exit` compares against
+/// the stop-loss / take-profit thresholds — applied to the position size by
+/// `strategy::pnl_from_ratio` (overflow-checked, losses rounded away from
+/// zero). A zero entry or an unrepresentable ratio yields 0: `should_exit`
+/// never closes on such data either. Always reported/labeled as simulated,
+/// never mixed with realized on-chain P&L.
 fn simulated_pnl_lamports(
     entry_sqrt_price: u128,
     current_sqrt_price: u128,
     position_size_lamports: u64,
 ) -> i64 {
-    if entry_sqrt_price == 0 {
-        return 0;
-    }
-    let entry = entry_sqrt_price as f64;
-    let current = current_sqrt_price as f64;
-    let price_ratio = (current / entry) * (current / entry);
-    ((price_ratio - 1.0) * position_size_lamports as f64) as i64
+    strategy::price_ratio_scaled(entry_sqrt_price, current_sqrt_price).map_or(0, |ratio| {
+        strategy::pnl_from_ratio(ratio, position_size_lamports)
+    })
 }
 
 /// Real market snapshot for one paper iteration — the SAME sources and
@@ -3927,6 +3926,28 @@ mod tests {
             simulated_pnl_lamports(2_000_000_000, 1_000_000_000, 1_000_000_000),
             -750_000_000
         );
+    }
+
+    #[test]
+    fn simulated_pnl_edge_cases_never_overflow() {
+        let one = 1u128 << 64;
+        // Zero entry, zero current, huge and unrepresentable prices.
+        assert_eq!(simulated_pnl_lamports(0, one, 1_000_000_000), 0);
+        assert_eq!(
+            simulated_pnl_lamports(one, 0, 1_000_000_000),
+            -1_000_000_000
+        );
+        assert_eq!(simulated_pnl_lamports(u128::MAX, u128::MAX, u64::MAX), 0);
+        assert_eq!(simulated_pnl_lamports(1, u128::MAX, 1_000_000_000), 0);
+        assert_eq!(simulated_pnl_lamports(one, one * 1_000, u64::MAX), i64::MAX);
+        assert_eq!(simulated_pnl_lamports(one * 2, one, u64::MAX), -i64::MAX);
+        // Negative P&L is exact and rounded away from zero.
+        assert_eq!(simulated_pnl_lamports(one * 2, one, 3), -3);
+        // Same math as the exit decision: a closed stop-loss is never a gain.
+        let s = strategy::SimpleSnipeStrategy::new(strategy::StrategyConfig::default());
+        let (e, c) = (one * 1_000, one * 970);
+        assert_eq!(s.should_exit(e, c), strategy::ExitDecision::StopLoss);
+        assert!(simulated_pnl_lamports(e, c, 10_000_000) < -500_000 + 1);
     }
 
     // ── AŞAMA 3/5: entries increment ONLY on confirm_entry; a rejected /
