@@ -56,32 +56,106 @@ pub fn price_impact_bps(spot_out: u64, exact_out: u64) -> u64 {
     ((spot_out - exact_out) as u128 * 10_000 / spot_out as u128) as u64
 }
 
-/// Expected net edge (bps of the position) of a round trip that reaches the
-/// take-profit: the target gain minus the trading fee on both legs, the
-/// price impact on both legs (the exit is assumed to cost what the entry
-/// did) and the network / priority fees of both transactions. Negative when
-/// the costs eat the target.
-pub fn net_edge_bps(
-    take_profit_bps: u64,
-    fee_rate_ppm: u64,
-    entry_impact_bps: u64,
-    network_cost_lamports: u64,
-    position_lamports: u64,
-) -> i64 {
-    let fee_bps = (fee_rate_ppm / 100) as i64; // ppm -> bps
-    let network_bps = if position_lamports == 0 {
-        i64::MAX / 4
-    } else {
-        (network_cost_lamports as u128 * 10_000 / position_lamports as u128) as i64
-    };
-    take_profit_bps as i64 - 2 * fee_bps - 2 * entry_impact_bps as i64 - 2 * network_bps
+/// Inputs of the round-trip edge estimate. All amounts are integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeInputs {
+    /// Gain targeted by the take-profit (bps of the position).
+    pub take_profit_bps: u64,
+    /// Pool trade fee (ppm), paid on BOTH legs.
+    pub fee_rate_ppm: u64,
+    /// Measured price impact of the entry (exact simulation vs spot).
+    pub entry_impact_bps: u64,
+    /// Exit impact estimate as a percentage of the entry impact (>= 100).
+    /// The exit cannot be simulated before the tokens are held, and a thin
+    /// launch pool usually loses liquidity after the entry, so the exit is
+    /// assumed to cost MORE than the entry, never less.
+    pub exit_impact_pct: u64,
+    /// Base + priority fee (+ tip) of ONE swap transaction, lamports.
+    pub network_cost_per_tx_lamports: u64,
+    /// Extra failed transactions budgeted for (each costs one network fee):
+    /// a failed exit still pays its fees.
+    pub failed_tx_reserve: u64,
+    /// Exit slippage tolerance (bps). Kept apart from impact: it is the
+    /// worst accepted execution, not the expected one.
+    pub exit_slippage_bps: u64,
+    /// Position size, lamports.
+    pub position_lamports: u64,
+}
+
+/// Round-trip edge breakdown (bps of the position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EdgeBreakdown {
+    pub expected_return_bps: i64,
+    pub fee_cost_bps: i64,
+    pub entry_impact_bps: i64,
+    /// Estimated (not simulated) exit impact.
+    pub exit_impact_bps: i64,
+    pub network_cost_bps: i64,
+    pub failed_tx_reserve_bps: i64,
+    /// Everything the exit leg is expected to cost: its fee, impact and
+    /// network fee (+ the failed-tx reserve).
+    pub exit_cost_bps: i64,
+    /// Expected return minus all expected costs.
+    pub net_edge_bps: i64,
+    /// Net edge if the exit also fills at the slippage limit.
+    pub worst_case_edge_bps: i64,
+}
+
+fn bps_of(lamports: u128, position_lamports: u128) -> i128 {
+    (lamports.saturating_mul(10_000) / position_lamports).min(i64::MAX as u128) as i128
+}
+
+/// Expected net edge of a round trip that reaches the take-profit, with the
+/// exit costed separately and conservatively. `None` (= never trade) for a
+/// zero-size position. Integer math in i128, clamped into i64: no input can
+/// overflow it.
+pub fn edge_breakdown(i: &EdgeInputs) -> Option<EdgeBreakdown> {
+    if i.position_lamports == 0 {
+        return None;
+    }
+    let pos = i.position_lamports as u128;
+    let fee_leg = (i.fee_rate_ppm / 100) as i128; // ppm -> bps
+    let entry_impact = i.entry_impact_bps as i128;
+    let exit_impact = entry_impact.saturating_mul(i.exit_impact_pct.max(100) as i128) / 100;
+    let net_leg = bps_of(i.network_cost_per_tx_lamports as u128, pos);
+    let reserve = bps_of(
+        (i.network_cost_per_tx_lamports as u128).saturating_mul(i.failed_tx_reserve as u128),
+        pos,
+    );
+    let expected = i.take_profit_bps as i128;
+    let exit_cost = fee_leg + exit_impact + net_leg + reserve;
+    let net = expected - (fee_leg + entry_impact + net_leg) - exit_cost;
+    let worst = net - i.exit_slippage_bps as i128;
+    let c = |v: i128| v.clamp(i64::MIN as i128 / 2, i64::MAX as i128 / 2) as i64;
+    Some(EdgeBreakdown {
+        expected_return_bps: c(expected),
+        fee_cost_bps: c(2 * fee_leg),
+        entry_impact_bps: c(entry_impact),
+        exit_impact_bps: c(exit_impact),
+        network_cost_bps: c(2 * net_leg),
+        failed_tx_reserve_bps: c(reserve),
+        exit_cost_bps: c(exit_cost),
+        net_edge_bps: c(net),
+        worst_case_edge_bps: c(worst),
+    })
+}
+
+/// Position size relative to the pool's SOL-side liquidity (bps). `None`
+/// when the liquidity is unknown or zero: the caller must not trade.
+pub fn position_liquidity_bps(position_lamports: u64, liquidity_lamports: u64) -> Option<u64> {
+    if liquidity_lamports == 0 {
+        return None;
+    }
+    let r = position_lamports as u128 * 10_000 / liquidity_lamports as u128;
+    Some(r.min(u64::MAX as u128) as u64)
 }
 
 /// Network cost of one swap transaction in lamports: the base signature fee
 /// plus the priority fee (`cu_price` micro-lamports per CU × CU limit).
 pub fn tx_network_cost_lamports(cu_limit: u32, cu_price_micro_lamports: u64) -> u64 {
     const BASE_FEE_LAMPORTS: u64 = 5_000;
-    BASE_FEE_LAMPORTS + (cu_limit as u128 * cu_price_micro_lamports as u128 / 1_000_000) as u64
+    let priority = cu_limit as u128 * cu_price_micro_lamports as u128 / 1_000_000;
+    (BASE_FEE_LAMPORTS as u128 + priority).min(u64::MAX as u128) as u64
 }
 
 /// Simulate `tx` (a swap built WITHOUT unwrapping the output and with
@@ -173,20 +247,91 @@ mod tests {
         assert_eq!(price_impact_bps(u64::MAX, u64::MAX / 2), 5_000);
     }
 
+    fn inputs() -> EdgeInputs {
+        EdgeInputs {
+            take_profit_bps: 1_000,
+            fee_rate_ppm: 2_500,
+            entry_impact_bps: 100,
+            exit_impact_pct: 100,
+            network_cost_per_tx_lamports: 13_000,
+            failed_tx_reserve: 0,
+            exit_slippage_bps: 0,
+            position_lamports: 10_000_000,
+        }
+    }
+
     #[test]
-    fn net_edge_subtracts_round_trip_costs() {
-        // 10% target, 0.25% fee (2500 ppm), 1% impact, 13 000 lamports per
-        // tx on a 0.01 SOL position (1.3%).
+    fn edge_subtracts_both_legs_separately() {
         let cost = tx_network_cost_lamports(300_000, 26_666);
         assert_eq!(cost, 5_000 + 7_999);
-        let edge = net_edge_bps(1_000, 2_500, 100, 13_000, 10_000_000);
-        assert_eq!(edge, 1_000 - 50 - 200 - 26);
+        // 10% target, 0.25% fee per leg, 1% impact per leg, 13 000 lamports
+        // per tx on 0.01 SOL (13 bps per tx).
+        let b = edge_breakdown(&inputs()).unwrap();
+        assert_eq!(b.fee_cost_bps, 50);
+        assert_eq!(b.network_cost_bps, 26);
+        assert_eq!(b.exit_cost_bps, 25 + 100 + 13);
+        assert_eq!(b.net_edge_bps, 1_000 - 50 - 200 - 26);
+        assert_eq!(b.worst_case_edge_bps, b.net_edge_bps);
+    }
+
+    #[test]
+    fn exit_is_costed_conservatively_and_slippage_separately() {
+        let b = edge_breakdown(&EdgeInputs {
+            exit_impact_pct: 200,
+            failed_tx_reserve: 1,
+            exit_slippage_bps: 100,
+            ..inputs()
+        })
+        .unwrap();
+        assert_eq!(b.exit_impact_bps, 200);
+        assert_eq!(b.failed_tx_reserve_bps, 13);
+        assert_eq!(b.net_edge_bps, 1_000 - 50 - 100 - 200 - 26 - 13);
+        assert_eq!(b.worst_case_edge_bps, b.net_edge_bps - 100);
+        // An exit multiplier below 100% is never applied.
+        let low = edge_breakdown(&EdgeInputs {
+            exit_impact_pct: 10,
+            ..inputs()
+        })
+        .unwrap();
+        assert_eq!(low.exit_impact_bps, 100);
         // Impact alone can erase the target.
-        assert!(net_edge_bps(1_000, 2_500, 600, 13_000, 10_000_000) < 0);
-        assert!(
-            net_edge_bps(1_000, 0, 0, 1, 0) < 0,
-            "zero size never trades"
+        let big = edge_breakdown(&EdgeInputs {
+            entry_impact_bps: 600,
+            ..inputs()
+        })
+        .unwrap();
+        assert!(big.net_edge_bps < 0);
+    }
+
+    #[test]
+    fn edge_never_overflows_and_zero_size_never_trades() {
+        assert_eq!(
+            edge_breakdown(&EdgeInputs {
+                position_lamports: 0,
+                ..inputs()
+            }),
+            None
         );
+        let b = edge_breakdown(&EdgeInputs {
+            take_profit_bps: 0,
+            fee_rate_ppm: u64::MAX,
+            entry_impact_bps: u64::MAX,
+            exit_impact_pct: u64::MAX,
+            network_cost_per_tx_lamports: u64::MAX,
+            failed_tx_reserve: u64::MAX,
+            exit_slippage_bps: u64::MAX,
+            position_lamports: 1,
+        })
+        .unwrap();
+        assert!(b.net_edge_bps < 0 && b.worst_case_edge_bps < 0);
+        assert!(tx_network_cost_lamports(u32::MAX, u64::MAX) > 0);
+    }
+
+    #[test]
+    fn position_liquidity_ratio() {
+        assert_eq!(position_liquidity_bps(50_000_000, 20_000_000_000), Some(25));
+        assert_eq!(position_liquidity_bps(1, 0), None);
+        assert_eq!(position_liquidity_bps(u64::MAX, 1), Some(u64::MAX));
     }
 
     #[test]

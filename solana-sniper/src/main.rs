@@ -607,6 +607,22 @@ struct Args {
     #[arg(long, env = "SNIPER_MIN_NET_EDGE_BPS", default_value_t = 300)]
     min_net_edge_bps: i64,
 
+    /// Exit price impact estimate, as a percentage of the measured entry
+    /// impact (min 100). The exit cannot be simulated before the tokens are
+    /// held, so it is costed conservatively instead of assumed equal.
+    #[arg(long, env = "SNIPER_EXIT_IMPACT_PCT", default_value_t = 200)]
+    exit_impact_pct: u64,
+
+    /// Failed transactions budgeted per round trip in the net edge (each
+    /// costs one network fee).
+    #[arg(long, env = "SNIPER_FAILED_TX_RESERVE", default_value_t = 1)]
+    failed_tx_reserve: u64,
+
+    /// Max position size relative to the pool's SOL-side liquidity (bps).
+    /// Unknown liquidity is a rejection.
+    #[arg(long, env = "SNIPER_MAX_POSITION_LIQUIDITY_BPS", default_value_t = 200)]
+    max_position_liquidity_bps: u64,
+
     /// Widen the exit slippage after failed exit attempts (up to 5%). Off by
     /// default: each exit attempt is quoted exactly by simulation, so a
     /// wider tolerance only buys a worse price.
@@ -1092,8 +1108,11 @@ fn exact_quote(
     Ok((spot, sim))
 }
 
-/// Entry economics gate on an exact quote: price impact and expected net
-/// edge after round-trip fees. `Err(code)` names the rejection.
+/// Entry economics gate on an exact quote: price impact, position size
+/// against the pool's SOL-side liquidity, and the expected net edge after
+/// both legs' fees, the measured entry impact, a conservative exit-impact
+/// estimate, network fees and a failed-transaction reserve. `Err(code)`
+/// names the rejection; unknown inputs reject.
 fn entry_economics(
     args: &Args,
     spot_out: u64,
@@ -1101,26 +1120,38 @@ fn entry_economics(
     fee_ppm: u64,
     position_lamports: u64,
     jito_tip_lamports: u64,
-) -> Result<(u64, i64), &'static str> {
+    liquidity_lamports: Option<u64>,
+) -> Result<sim_quote::EdgeBreakdown, &'static str> {
     let impact = sim_quote::price_impact_bps(spot_out, exact_out);
-    let network = sim_quote::tx_network_cost_lamports(
-        args.compute_unit_limit,
-        args.priority_fee_micro_lamports,
-    ) + jito_tip_lamports;
-    let edge = sim_quote::net_edge_bps(
-        strategy_config(args).take_profit_bps,
-        fee_ppm,
-        impact,
-        network,
-        position_lamports,
-    );
     if impact > args.max_price_impact_bps {
         return Err("price_impact_exceeded");
     }
-    if edge < args.min_net_edge_bps {
+    let ratio =
+        sim_quote::position_liquidity_bps(position_lamports, liquidity_lamports.unwrap_or(0))
+            .ok_or("liquidity_unverified")?;
+    if ratio > args.max_position_liquidity_bps {
+        return Err("position_too_large_for_liquidity");
+    }
+    let network = sim_quote::tx_network_cost_lamports(
+        args.compute_unit_limit,
+        args.priority_fee_micro_lamports,
+    )
+    .saturating_add(jito_tip_lamports);
+    let edge = sim_quote::edge_breakdown(&sim_quote::EdgeInputs {
+        take_profit_bps: strategy_config(args).take_profit_bps,
+        fee_rate_ppm: fee_ppm,
+        entry_impact_bps: impact,
+        exit_impact_pct: args.exit_impact_pct,
+        network_cost_per_tx_lamports: network,
+        failed_tx_reserve: args.failed_tx_reserve,
+        exit_slippage_bps: args.max_slippage_bps,
+        position_lamports,
+    })
+    .ok_or("net_edge_too_small")?;
+    if edge.net_edge_bps < args.min_net_edge_bps {
         return Err("net_edge_too_small");
     }
-    Ok((impact, edge))
+    Ok(edge)
 }
 
 /// Result of an RPC `simulateTransaction`.
@@ -2904,8 +2935,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         adapter.trade_fee_ppm(),
                         entry_signal.position_size_lamports,
                         jito_tip.map(|(_, l)| l).unwrap_or(0),
+                        live_liquidity,
                     );
-                    let (impact_bps, edge_bps) = match economics {
+                    let edge = match economics {
                         Ok(v) => v,
                         Err(code) => {
                             metrics::record_trade_rejected(&metrics_registry, mode_label, code);
@@ -2921,6 +2953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "reject_reason": code,
                                 "spot_out": spot.expected_output,
                                 "exact_out": sim.amount_out,
+                                "liquidity_lamports": live_liquidity,
                             });
                             rec.save(&args.data_dir)?;
                             sleep(loop_interval).await;
@@ -2931,11 +2964,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mode = mode_target,
                         spot_out = spot.expected_output,
                         exact_out = sim.amount_out,
-                        impact_bps,
-                        edge_bps,
+                        impact_bps = edge.entry_impact_bps,
+                        exit_impact_est_bps = edge.exit_impact_bps,
+                        exit_cost_bps = edge.exit_cost_bps,
+                        expected_return_bps = edge.expected_return_bps,
+                        edge_bps = edge.net_edge_bps,
+                        worst_case_edge_bps = edge.worst_case_edge_bps,
                         compute_units = ?sim.compute_units,
                         "exact entry quote (on-chain simulation)"
                     );
+                    rec.context = serde_json::json!({
+                        "action": "quoted",
+                        "spot_out": spot.expected_output,
+                        "exact_out": sim.amount_out,
+                        "liquidity_lamports": live_liquidity,
+                        "edge": edge,
+                    });
+                    rec.save(&args.data_dir)?;
                     let mut exact = spot;
                     exact.expected_output = sim.amount_out;
                     let intent = adapter
@@ -4127,27 +4172,53 @@ mod tests {
         .unwrap();
         assert_eq!(args.max_price_impact_bps, 300);
         assert_eq!(args.min_net_edge_bps, 300);
+        assert_eq!(args.exit_impact_pct, 200);
+        assert_eq!(args.max_position_liquidity_bps, 200);
         assert!(!args.exit_slippage_escalation);
-        // 1% impact, 0.25% fee: 10% target - 0.5% - 2% - network ~1.6% ≈ 5.9%.
-        let (impact, edge) =
-            entry_economics(&args, 1_000_000, 990_000, 2_500, 10_000_000, 0).unwrap();
-        assert_eq!(impact, 100);
-        assert!(edge > 300, "{edge}");
+        let liq = Some(20_000_000_000); // 20 SOL
+                                        // 1% entry impact, 2% estimated exit impact, 0.25% fee per leg,
+                                        // 8 bps network per tx + 1 failed tx: 1000-50-100-200-16-8 = 626.
+        let e = entry_economics(&args, 1_000_000, 990_000, 2_500, 10_000_000, 0, liq).unwrap();
+        assert_eq!(e.entry_impact_bps, 100);
+        assert_eq!(e.exit_impact_bps, 200);
+        assert_eq!(e.net_edge_bps, 626);
+        assert_eq!(e.worst_case_edge_bps, 626 - 100);
         // 4% impact > 3% cap.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 960_000, 2_500, 10_000_000, 0),
+            entry_economics(&args, 1_000_000, 960_000, 2_500, 10_000_000, 0, liq),
             Err("price_impact_exceeded")
         );
         // 2.9% impact passes the cap but leaves too little edge after a 1% fee.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 971_000, 10_000, 10_000_000, 0),
+            entry_economics(&args, 1_000_000, 971_000, 10_000, 10_000_000, 0, liq),
             Err("net_edge_too_small")
         );
         // A huge Jito tip on a tiny position kills the edge too.
         assert_eq!(
-            entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000),
+            entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 400_000, liq),
             Err("net_edge_too_small")
         );
+        // Unknown or zero liquidity, or a position too large for it, rejects.
+        for l in [None, Some(0)] {
+            assert_eq!(
+                entry_economics(&args, 1_000_000, 1_000_000, 2_500, 10_000_000, 0, l),
+                Err("liquidity_unverified")
+            );
+        }
+        assert_eq!(
+            entry_economics(
+                &args,
+                1_000_000,
+                1_000_000,
+                2_500,
+                50_000_000,
+                0,
+                Some(1_000_000_000)
+            ),
+            Err("position_too_large_for_liquidity")
+        );
+        // Zero position never trades.
+        assert!(entry_economics(&args, 1_000_000, 1_000_000, 2_500, 0, 0, liq).is_err());
     }
 
     #[test]
