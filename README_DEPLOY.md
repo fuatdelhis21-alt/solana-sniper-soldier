@@ -16,6 +16,10 @@ cargo test --workspace
 Paket içeriği: `bin/{solana-sniper,pool-sniper,hsm_server,send_transfer}`, `systemd/*.service`,
 `install_release.sh`, `rollback.sh`, `solana-hft.env.example`, `hsm.env.example`,
 `generate_certs.sh`, `SHA256SUMS`, `REVISION`.
+`REVISION` paketin derlendiği commit'tir (çalışma ağacında commit'lenmemiş
+değişiklik varsa sonuna `-dirty` eklenir). Kurulumdan sonra çalışan sürüm:
+`cat /opt/solana-hft/REVISION` (`bin/REVISION`'a bağlantı; `rollback.sh` ile
+birlikte geri döner).
 CI (`.github/workflows/ci-cd.yml`) `main`'e her push'ta aynı paketi üretir ve
 Actions artifact'ı olarak yükler (S3 secret'ları varsa S3'e de).
 

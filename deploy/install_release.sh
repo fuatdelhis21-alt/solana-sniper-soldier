@@ -61,6 +61,16 @@ if [ -n "$(ls -A "$BIN_DIR" 2>/dev/null)" ]; then
   cp -a "$BIN_DIR" "$RELEASE_DIR/bin.prev"
 fi
 install -m 0755 "$TMPDIR"/bin/* "$BIN_DIR"/
+# The commit the binaries were built from lives next to them, so bin.prev and
+# rollback.sh carry it along; /opt/solana-hft/REVISION always points at the
+# active one.
+if [ -f "$TMPDIR/REVISION" ]; then
+  install -m 0644 "$TMPDIR/REVISION" "$BIN_DIR/REVISION"
+else
+  echo "unknown (artifact has no REVISION)" > "$BIN_DIR/REVISION"
+fi
+ln -sfn bin/REVISION "$RELEASE_DIR/REVISION"
+echo "installing revision: $(cat "$BIN_DIR/REVISION")"
 for f in README_DEPLOY.md solana-hft.env.example hsm.env.example generate_certs.sh rollback.sh \
   sniper_report.py screen_candidates.py; do
   [ -f "$TMPDIR/$f" ] && install -m 0644 "$TMPDIR/$f" "$RELEASE_DIR/$f"

@@ -18,4 +18,6 @@ mv "$RELEASE_DIR/bin.prev" "$RELEASE_DIR/bin"
 rm -rf "$RELEASE_DIR/bin.failed"
 systemctl restart solana-hsm.service || true
 systemctl start "$BOT_UNIT"
-echo "rolled back; journalctl -u ${BOT_UNIT%.service} -f"
+# A bin.prev from an install older than the REVISION file has none.
+echo "rolled back to revision: $(cat "$RELEASE_DIR/bin/REVISION" 2>/dev/null || echo unknown)"
+echo "journalctl -u ${BOT_UNIT%.service} -f"
