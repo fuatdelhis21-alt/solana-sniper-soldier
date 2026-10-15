@@ -1267,11 +1267,9 @@ async fn sign_and_verify(
     ) {
         let start = std::time::Instant::now();
         let res = hsm_sign(ep, ca, id, tx).await.map_err(|e| format!("{e}"));
-        metrics::record_hsm(
-            metrics_registry,
-            res.is_ok(),
-            start.elapsed().as_secs_f64() * 1000.0,
-        );
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_hsm(metrics_registry, res.is_ok(), ms);
+        metrics::observe_stage(metrics_registry, metrics::Stage::Sign, ms);
         res?
     } else if let Some(kp) = local_signer {
         tx.sign(&[kp], tx.message.recent_blockhash);
@@ -2075,6 +2073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
+                let exit_start = std::time::Instant::now();
                 let outcome = manage_open_position(
                     &args,
                     &rpc_client,
@@ -2087,6 +2086,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exit_failures,
                 )
                 .await;
+                let exit_ms = exit_start.elapsed().as_secs_f64() * 1000.0;
+                if !matches!(outcome, ExitOutcome::Hold) {
+                    metrics::observe_stage(&metrics_registry, metrics::Stage::Exit, exit_ms);
+                }
                 exit_failures = match &outcome {
                     ExitOutcome::Failed(_) => exit_failures.saturating_add(1),
                     _ => 0,
@@ -2131,6 +2134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rec.context = serde_json::json!({
                         "action": "exit",
                         "outcome": format!("{outcome:?}"),
+                        "latency_ms": { "exit": exit_ms as u64 },
                         "cost_input_units": pos.cost_input_units,
                         "token_amount": pos.token_amount,
                     });
@@ -2183,6 +2187,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             paper_data_fetch_ms =
                 paper_data_fetch_ms.saturating_add(data_start.elapsed().as_millis());
+            metrics::observe_stage(
+                &metrics_registry,
+                metrics::Stage::MarketData,
+                data_start.elapsed().as_secs_f64() * 1000.0,
+            );
 
             // A real decision record is written every iteration so audit and
             // replay reflect exactly what happened (including rejections).
@@ -2973,14 +2982,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Exact quote from an on-chain simulation of this very
                     // swap (price impact and tick crossings included), then
                     // the economics gate. Any failure: no trade.
-                    let (spot, sim) = match exact_quote(
+                    let quote_start = std::time::Instant::now();
+                    let quoted = exact_quote(
                         &rpc_client,
                         adapter,
                         entry_signal.position_size_lamports,
                         args.max_slippage_bps,
                         &from,
                         &opts,
-                    ) {
+                    );
+                    let quote_ms = quote_start.elapsed().as_secs_f64() * 1000.0;
+                    metrics::observe_stage(&metrics_registry, metrics::Stage::QuoteSim, quote_ms);
+                    let (spot, sim) = match quoted {
                         Ok(v) => v,
                         Err(e) => {
                             metrics::record_trade_rejected(
@@ -3046,6 +3059,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     rec.context = serde_json::json!({
                         "action": "quoted",
+                        "latency_ms": { "quote_sim": quote_ms as u64 },
                         "spot_out": spot.expected_output,
                         "exact_out": sim.amount_out,
                         "liquidity_lamports": live_liquidity,
@@ -3268,7 +3282,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sleep(loop_interval).await;
                         continue;
                     }
+                    let submit_start = std::time::Instant::now();
                     let submitted = submit_live_tx(&args, &rpc_client, &tx).await;
+                    metrics::observe_stage(
+                        &metrics_registry,
+                        metrics::Stage::SubmitConfirm,
+                        submit_start.elapsed().as_secs_f64() * 1000.0,
+                    );
                     // An Err may mean "outcome unknown" (e.g. confirmation
                     // timeout). Reconcile from the real token balance before
                     // concluding nothing happened, so a swap that landed late

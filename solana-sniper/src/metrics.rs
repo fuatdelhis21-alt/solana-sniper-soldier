@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use prometheus::{
-    Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -93,6 +93,9 @@ pub struct Metrics {
     /// (negative = simulated loss). NEVER mixed with `daily_realized_pnl`
     /// which tracks real on-chain P&L only.
     pub paper_simulated_pnl: Gauge,
+    /// Per-stage latency (ms); the `stage` label only takes [`Stage`]
+    /// values, so its cardinality is fixed.
+    pub stage_latency_ms: HistogramVec,
     /// Unix ms of the last main-loop heartbeat (see [`Metrics::heartbeat`]);
     /// shared by clones like the prometheus handles.
     heartbeat_ms: Arc<AtomicU64>,
@@ -151,15 +154,25 @@ impl Metrics {
         let trades_failed = IntCounter::new("hft_trades_failed", "Failed trades").unwrap();
         let hsm_requests = IntCounter::new("hft_hsm_requests", "HSM sign requests").unwrap();
         let hsm_errors = IntCounter::new("hft_hsm_errors", "HSM sign errors").unwrap();
-        let latency_hist = Histogram::with_opts(HistogramOpts::new(
-            "hft_trade_latency_ms",
-            "Trade latency in milliseconds",
-        ))
+        // Millisecond buckets (the prometheus defaults are in seconds).
+        let latency_hist = Histogram::with_opts(
+            HistogramOpts::new("hft_trade_latency_ms", "Trade latency in milliseconds")
+                .buckets(MS_BUCKETS.to_vec()),
+        )
         .unwrap();
-        let hsm_latency_hist = Histogram::with_opts(HistogramOpts::new(
-            "hft_hsm_latency_ms",
-            "HSM sign latency in milliseconds",
-        ))
+        let hsm_latency_hist = Histogram::with_opts(
+            HistogramOpts::new("hft_hsm_latency_ms", "HSM sign latency in milliseconds")
+                .buckets(MS_BUCKETS.to_vec()),
+        )
+        .unwrap();
+        let stage_latency_ms = HistogramVec::new(
+            HistogramOpts::new(
+                "sniper_stage_latency_ms",
+                "Per-stage latency in milliseconds",
+            )
+            .buckets(MS_BUCKETS.to_vec()),
+            &["stage"],
+        )
         .unwrap();
         let kill_switch_active =
             Gauge::new("hft_kill_switch_active", "Kill switch state (1=active)").unwrap();
@@ -229,6 +242,7 @@ impl Metrics {
         registry
             .register(Box::new(paper_simulated_pnl.clone()))
             .ok();
+        registry.register(Box::new(stage_latency_ms.clone())).ok();
         Arc::new(Self {
             registry,
             readiness,
@@ -248,6 +262,7 @@ impl Metrics {
             daily_realized_pnl,
             open_position_count,
             paper_simulated_pnl,
+            stage_latency_ms,
             heartbeat_ms: Arc::new(AtomicU64::new(0)),
             health_max_age_ms: Arc::new(AtomicU64::new(0)),
         })
@@ -341,6 +356,51 @@ pub async fn spawn_metrics_server(addr: &str, metrics: Arc<Metrics>) -> Result<(
     }
 }
 
+/// Histogram buckets for millisecond latencies (1 ms .. 3 min).
+const MS_BUCKETS: [f64; 16] = [
+    1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+    30_000.0, 60_000.0, 180_000.0,
+];
+
+/// Pipeline stages with a latency histogram. A closed set: metric label
+/// cardinality cannot grow with pools, reasons or errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Market data fetch (pool state / vaults / risk data).
+    MarketData,
+    /// Strategy + signal + risk gates.
+    Decision,
+    /// Exact quote by on-chain simulation.
+    QuoteSim,
+    /// HSM signing round trip.
+    Sign,
+    /// Send + confirmation (until landed or given up).
+    SubmitConfirm,
+    /// Whole exit attempt (quote, sign, submit, confirm).
+    Exit,
+}
+
+impl Stage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::MarketData => "market_data",
+            Stage::Decision => "decision",
+            Stage::QuoteSim => "quote_sim",
+            Stage::Sign => "sign",
+            Stage::SubmitConfirm => "submit_confirm",
+            Stage::Exit => "exit",
+        }
+    }
+}
+
+/// Record one stage duration.
+pub fn observe_stage(metrics: &Metrics, stage: Stage, ms: f64) {
+    metrics
+        .stage_latency_ms
+        .with_label_values(&[stage.label()])
+        .observe(ms);
+}
+
 /// Convenience: record a trade outcome and latency.
 pub fn record_trade(metrics: &Metrics, success: bool, latency_ms: f64) {
     metrics.trades_total.inc();
@@ -430,6 +490,28 @@ pub fn set_readiness(metrics: &Metrics, snapshot: ReadinessSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_latency_is_exported_with_bounded_labels() {
+        let m = Metrics::new();
+        for st in [
+            Stage::MarketData,
+            Stage::Decision,
+            Stage::QuoteSim,
+            Stage::Sign,
+            Stage::SubmitConfirm,
+            Stage::Exit,
+        ] {
+            observe_stage(&m, st, 12.0);
+        }
+        let out = m.render();
+        assert!(out.contains("sniper_stage_latency_ms_bucket{stage=\"quote_sim\",le=\"25\"} 1"));
+        assert_eq!(out.matches("sniper_stage_latency_ms_count{").count(), 6);
+        record_hsm(&m, true, 40.0);
+        assert!(m
+            .render()
+            .contains("hft_hsm_latency_ms_bucket{le=\"50\"} 1"));
+    }
 
     #[test]
     fn metrics_render_contains_counters() {
