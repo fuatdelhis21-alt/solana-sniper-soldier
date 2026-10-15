@@ -97,6 +97,23 @@ struct PaperSimulator {
     exits_forced: u64,
     /// Liquidity seen by the last tick (recorded on confirm_entry).
     last_liquidity_lamports: u64,
+    /// Cost estimate applied to every close (fees, impact, latency, network).
+    cost_model: sim_quote::PaperCostModel,
+    /// Sum of the gross P&L minus the estimated costs.
+    net_pnl_lamports: i64,
+    /// Sum of the estimated costs.
+    costs_lamports: u64,
+    /// The last close: (gross, net, cost breakdown, hold time ms).
+    last_close: Option<PaperClose>,
+}
+
+/// One closed paper position.
+#[derive(Debug, Clone, Copy)]
+struct PaperClose {
+    gross_pnl_lamports: i64,
+    net_pnl_lamports: i64,
+    cost: sim_quote::PaperCost,
+    hold_ms: u64,
 }
 
 impl PaperSimulator {
@@ -120,7 +137,36 @@ impl PaperSimulator {
             max_hold_ms: 0,
             exits_forced: 0,
             last_liquidity_lamports: 0,
+            cost_model: sim_quote::PaperCostModel {
+                fee_rate_ppm: 0,
+                exit_impact_pct: 100,
+                latency_bps_per_leg: 0,
+                network_cost_per_tx_lamports: 0,
+            },
+            net_pnl_lamports: 0,
+            costs_lamports: 0,
+            last_close: None,
         }
+    }
+
+    /// Book a close: gross from the spot move, net after the cost estimate.
+    fn book_close(&mut self, pos: &PaperPosition, gross: i64, exit_liquidity: u64) {
+        let cost = sim_quote::paper_round_trip_cost(
+            &self.cost_model,
+            pos.position_size_lamports,
+            pos.entry_liquidity_lamports,
+            exit_liquidity,
+        );
+        let net = gross.saturating_sub(i64::try_from(cost.total_lamports).unwrap_or(i64::MAX));
+        self.simulated_pnl_lamports = self.simulated_pnl_lamports.saturating_add(gross);
+        self.net_pnl_lamports = self.net_pnl_lamports.saturating_add(net);
+        self.costs_lamports = self.costs_lamports.saturating_add(cost.total_lamports);
+        self.last_close = Some(PaperClose {
+            gross_pnl_lamports: gross,
+            net_pnl_lamports: net,
+            cost,
+            hold_ms: self.now_ms.saturating_sub(pos.opened_at_ms),
+        });
     }
 
     fn has_open_position(&self) -> bool {
@@ -175,7 +221,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::MaxHoldTime | strategy::ExitDecision::LiquidityDrop => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_forced += 1;
                     self.position = None;
                     PaperTick::ClosedForced(exit, pnl)
@@ -183,7 +229,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::StopLoss => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_stop_loss += 1;
                     self.position = None;
                     PaperTick::ClosedStopLoss(pnl)
@@ -191,7 +237,7 @@ impl PaperSimulator {
                 strategy::ExitDecision::TakeProfit => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
-                    self.simulated_pnl_lamports += pnl;
+                    self.book_close(&pos, pnl, candidate.liquidity_lamports);
                     self.exits_take_profit += 1;
                     self.position = None;
                     PaperTick::ClosedTakeProfit(pnl)
@@ -253,6 +299,8 @@ struct PaperMarketSnapshot {
     source: &'static str,
     /// True when the input (pay-side) mint is the pool's token0.
     input_is_token0: bool,
+    /// The pool's trade fee (ppm) from its AmmConfig.
+    trade_fee_ppm: u64,
 }
 
 /// Paper market-data failure. Data that could not be fetched at all is
@@ -442,6 +490,8 @@ fn resolve_paper_market_data(
         is_blocklisted,
         source,
         input_is_token0: accounts.input_vault == pool.token_vault_0,
+        // Unknown fee = the highest CLMM tier (never underestimate costs).
+        trade_fee_ppm: pool.trade_fee_rate.map(u64::from).unwrap_or(10_000),
     })
 }
 
@@ -617,6 +667,12 @@ struct Args {
     /// costs one network fee).
     #[arg(long, env = "SNIPER_FAILED_TX_RESERVE", default_value_t = 1)]
     failed_tx_reserve: u64,
+
+    /// Paper only: adverse price move per leg (bps) charged for the delay
+    /// between the decision and a real fill. Paper fills are otherwise at
+    /// the observed spot price, which a live order never gets.
+    #[arg(long, env = "SNIPER_PAPER_LATENCY_BPS", default_value_t = 50)]
+    paper_latency_bps: u64,
 
     /// Max position size relative to the pool's SOL-side liquidity (bps).
     /// Unknown liquidity is a rejection.
@@ -1843,6 +1899,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trade nor a success — it is rejected with its real reason.
     let mut paper_sim = PaperSimulator::with_config(strategy_config(&args));
     paper_sim.max_hold_ms = args.max_hold_secs.saturating_mul(1000);
+    paper_sim.cost_model = sim_quote::PaperCostModel {
+        fee_rate_ppm: 10_000, // replaced by the pool's real fee each tick
+        exit_impact_pct: args.exit_impact_pct,
+        latency_bps_per_leg: args.paper_latency_bps,
+        network_cost_per_tx_lamports: sim_quote::tx_network_cost_lamports(
+            args.compute_unit_limit,
+            args.priority_fee_micro_lamports,
+        ),
+    };
     let mut paper_iterations: u64 = 0;
     let mut paper_data_errors: u64 = 0;
     let mut paper_data_fetch_ms: u128 = 0;
@@ -2197,6 +2262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let open_pos = paper_sim.open_position();
             let strat_start = std::time::Instant::now();
             paper_sim.input_is_token0 = snapshot.input_is_token0;
+            paper_sim.cost_model.fee_rate_ppm = snapshot.trade_fee_ppm;
             paper_sim.now_ms = marketdata::now_ms() as u64;
             price_series.push(signal::Observation {
                 ts_ms: paper_sim.now_ms,
@@ -2238,9 +2304,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         _ => "exit_max_hold",
                     };
+                    let close = paper_sim.last_close;
                     rec.context = serde_json::json!({
                         "action": action,
                         "realized_simulated_pnl_lamports": pnl,
+                        "gross_pnl_lamports": close.map(|c| c.gross_pnl_lamports),
+                        "net_pnl_lamports": close.map(|c| c.net_pnl_lamports),
+                        "cost": close.map(|c| c.cost),
+                        "hold_ms": close.map(|c| c.hold_ms),
+                        "cost_model": "estimate: fee x2 + constant-product impact (exit x exit_impact_pct) + latency bps x2 + network x2",
+                        "exit_liquidity_lamports": snapshot.liquidity_lamports,
                         "entry_sqrt": open_pos.map(|(s, _)| s.to_string()),
                         "position_size_lamports": open_pos.map(|(_, sz)| sz),
                         "current_sqrt": snapshot.current_sqrt_price.to_string(),
@@ -2248,16 +2321,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "simulated": true,
                     });
                     rec.save(&args.data_dir)?;
-                    metrics::set_paper_simulated_pnl(
-                        &metrics_registry,
-                        paper_sim.simulated_pnl_lamports,
-                    );
+                    metrics::set_paper_simulated_pnl(&metrics_registry, paper_sim.net_pnl_lamports);
                     single_trade_done = true;
                     tracing::info!(
                         target: "paper",
                         iteration = i + 1,
                         action = action,
-                        pnl_lamports = pnl,
+                        gross_pnl_lamports = pnl,
+                        net_pnl_lamports = close.map(|c| c.net_pnl_lamports),
                         "paper simulated EXIT on real price (no on-chain tx)"
                     );
                 }
@@ -3408,9 +3479,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!(
-            "  Simulated P&L:         {} lamports ({:.6} SOL)",
+            "  Gross P&L (spot move): {} lamports ({:.6} SOL)",
             paper_sim.simulated_pnl_lamports,
             paper_sim.simulated_pnl_lamports as f64 / 1e9
+        );
+        println!(
+            "  Est. costs:            {} lamports (fees, impact, latency, network — estimate)",
+            paper_sim.costs_lamports
+        );
+        println!(
+            "  Net P&L (estimate):    {} lamports ({:.6} SOL)",
+            paper_sim.net_pnl_lamports,
+            paper_sim.net_pnl_lamports as f64 / 1e9
         );
     }
     if risk_manager.is_circuit_breaker_active() {
@@ -3697,6 +3777,35 @@ mod tests {
 
     // ── AŞAMA 4/5: quote-based simulated P&L (same (current/entry)^2 ratio
     //    formula SimpleSnipeStrategy::should_exit uses — pure, no I/O) ──
+    #[test]
+    fn paper_close_books_net_after_costs() {
+        let mut sim = PaperSimulator::new();
+        sim.cost_model = sim_quote::PaperCostModel {
+            fee_rate_ppm: 2_500,
+            exit_impact_pct: 200,
+            latency_bps_per_leg: 50,
+            network_cost_per_tx_lamports: 10_000,
+        };
+        let pos = PaperPosition {
+            entry_sqrt_price: 1,
+            position_size_lamports: 50_000_000,
+            entry_liquidity_lamports: 20_000_000_000,
+            opened_at_ms: 1_000,
+        };
+        sim.now_ms = 61_000;
+        sim.book_close(&pos, 5_000_000, 20_000_000_000);
+        let c = sim.last_close.unwrap();
+        assert_eq!(c.gross_pnl_lamports, 5_000_000);
+        assert_eq!(c.cost.total_lamports, 1_144_064);
+        assert_eq!(c.net_pnl_lamports, 5_000_000 - 1_144_064);
+        assert_eq!(c.hold_ms, 60_000);
+        assert_eq!(sim.simulated_pnl_lamports, 5_000_000);
+        assert_eq!(sim.net_pnl_lamports, 5_000_000 - 1_144_064);
+        // A small spot gain can be a net loss.
+        sim.book_close(&pos, 1_000_000, 20_000_000_000);
+        assert!(sim.last_close.unwrap().net_pnl_lamports < 0);
+    }
+
     #[test]
     fn simulated_pnl_lamports_zero_at_entry_price_or_zero_entry() {
         assert_eq!(

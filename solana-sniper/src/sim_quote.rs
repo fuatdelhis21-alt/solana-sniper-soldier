@@ -150,6 +150,70 @@ pub fn position_liquidity_bps(position_lamports: u64, liquidity_lamports: u64) -
     Some(r.min(u64::MAX as u128) as u64)
 }
 
+/// Estimated costs of a paper round trip (lamports). Paper mode never builds
+/// a transaction, so nothing here is measured: it is a deliberately
+/// pessimistic estimate so paper P&L is not the raw spot-price move.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PaperCost {
+    pub fee_lamports: u64,
+    pub entry_impact_lamports: u64,
+    pub exit_impact_lamports: u64,
+    /// Adverse fill from the decision-to-landing delay (both legs).
+    pub latency_lamports: u64,
+    pub network_lamports: u64,
+    pub total_lamports: u64,
+}
+
+/// Paper cost model inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaperCostModel {
+    pub fee_rate_ppm: u64,
+    /// Exit impact as a % of the constant-product estimate (min 100).
+    pub exit_impact_pct: u64,
+    /// Adverse price move per leg between decision and fill (bps).
+    pub latency_bps_per_leg: u64,
+    /// Base + priority (+ tip) of one transaction.
+    pub network_cost_per_tx_lamports: u64,
+}
+
+/// Constant-product impact estimate (lamports) of trading `amount` against
+/// `liquidity` on the SOL side: `amount^2 / (liquidity + amount)`. Unknown
+/// (zero) liquidity costs the whole amount.
+pub fn cp_impact_lamports(amount: u64, liquidity_lamports: u64) -> u64 {
+    if liquidity_lamports == 0 {
+        return amount;
+    }
+    let a = amount as u128;
+    (a * a / (liquidity_lamports as u128 + a)) as u64
+}
+
+/// Round-trip cost estimate of a paper position of `position_lamports`
+/// entered at `entry_liquidity` and exited at `exit_liquidity`.
+pub fn paper_round_trip_cost(
+    m: &PaperCostModel,
+    position_lamports: u64,
+    entry_liquidity_lamports: u64,
+    exit_liquidity_lamports: u64,
+) -> PaperCost {
+    let pos = position_lamports as u128;
+    let fee = 2 * pos * m.fee_rate_ppm.min(1_000_000) as u128 / 1_000_000;
+    let entry_impact = cp_impact_lamports(position_lamports, entry_liquidity_lamports) as u128;
+    let exit_impact = cp_impact_lamports(position_lamports, exit_liquidity_lamports) as u128
+        * m.exit_impact_pct.clamp(100, 10_000) as u128
+        / 100;
+    let latency = 2 * pos * m.latency_bps_per_leg.min(10_000) as u128 / 10_000;
+    let network = 2 * m.network_cost_per_tx_lamports as u128;
+    let sat = |v: u128| v.min(u64::MAX as u128) as u64;
+    PaperCost {
+        fee_lamports: sat(fee),
+        entry_impact_lamports: sat(entry_impact),
+        exit_impact_lamports: sat(exit_impact),
+        latency_lamports: sat(latency),
+        network_lamports: sat(network),
+        total_lamports: sat(fee + entry_impact + exit_impact + latency + network),
+    }
+}
+
 /// Network cost of one swap transaction in lamports: the base signature fee
 /// plus the priority fee (`cu_price` micro-lamports per CU × CU limit).
 pub fn tx_network_cost_lamports(cu_limit: u32, cu_price_micro_lamports: u64) -> u64 {
@@ -332,6 +396,43 @@ mod tests {
         assert_eq!(position_liquidity_bps(50_000_000, 20_000_000_000), Some(25));
         assert_eq!(position_liquidity_bps(1, 0), None);
         assert_eq!(position_liquidity_bps(u64::MAX, 1), Some(u64::MAX));
+    }
+
+    #[test]
+    fn paper_cost_is_pessimistic_and_bounded() {
+        let m = PaperCostModel {
+            fee_rate_ppm: 2_500,
+            exit_impact_pct: 200,
+            latency_bps_per_leg: 50,
+            network_cost_per_tx_lamports: 10_000,
+        };
+        // 0.05 SOL against 20 SOL on both legs.
+        let c = paper_round_trip_cost(&m, 50_000_000, 20_000_000_000, 20_000_000_000);
+        assert_eq!(c.fee_lamports, 250_000);
+        assert_eq!(c.entry_impact_lamports, 124_688);
+        assert_eq!(c.exit_impact_lamports, 2 * 124_688);
+        assert_eq!(c.latency_lamports, 500_000);
+        assert_eq!(c.network_lamports, 20_000);
+        assert_eq!(
+            c.total_lamports,
+            250_000 + 124_688 + 249_376 + 500_000 + 20_000
+        );
+        // Liquidity gone at exit: the exit costs the whole position (x2).
+        let gone = paper_round_trip_cost(&m, 50_000_000, 20_000_000_000, 0);
+        assert_eq!(gone.exit_impact_lamports, 100_000_000);
+        // Extreme inputs never overflow.
+        let x = paper_round_trip_cost(
+            &PaperCostModel {
+                fee_rate_ppm: u64::MAX,
+                exit_impact_pct: u64::MAX,
+                latency_bps_per_leg: u64::MAX,
+                network_cost_per_tx_lamports: u64::MAX,
+            },
+            u64::MAX,
+            1,
+            1,
+        );
+        assert_eq!(x.total_lamports, u64::MAX);
     }
 
     #[test]
