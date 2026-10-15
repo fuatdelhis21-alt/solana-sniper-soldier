@@ -627,6 +627,11 @@ struct Args {
     #[arg(long, env = "SNIPER_SIGNAL_SAMPLE_MS", default_value_t = 2000)]
     signal_sample_ms: u64,
 
+    /// The newest price sample must be at most this old (ms) for the signal
+    /// gate to pass; older data is `stale_data` (no trade).
+    #[arg(long, env = "SNIPER_SIGNAL_MAX_AGE_MS", default_value_t = 30_000)]
+    signal_max_age_ms: u64,
+
     /// Max spend in SOL for a single trade (security cap).
     #[arg(long, env = "SNIPER_MAX_SPEND_SOL", default_value_t = 0.01)]
     max_spend_sol: f64,
@@ -1055,7 +1060,7 @@ fn signal_gate_rejects(
     if !args.signal_gate {
         return None;
     }
-    match signal::evaluate(series, cfg) {
+    match signal::evaluate_at(series, cfg, marketdata::now_ms() as u64) {
         signal::SignalDecision::Trade { .. } => None,
         signal::SignalDecision::NoTrade { reason, .. } => Some(reason),
     }
@@ -1892,6 +1897,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Genuine, timestamped pool-price observations for the signal gate.
     let signal_cfg = signal::SignalConfig {
         min_confidence: args.signal_min_confidence.min(100),
+        max_sample_age_ms: args.signal_max_age_ms,
         ..signal::SignalConfig::default()
     };
     let mut price_series = signal::Series::new(240, args.signal_sample_ms);

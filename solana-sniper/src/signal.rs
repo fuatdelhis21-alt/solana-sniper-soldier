@@ -35,7 +35,17 @@ pub struct Series {
     samples: VecDeque<Observation>,
     cap: usize,
     min_interval_ms: u64,
+    /// A gap longer than this between two samples breaks continuity: the
+    /// series restarts (indicators across a gap would mix two regimes).
+    max_gap_ms: u64,
+    /// Samples refused (invalid price, too close, timestamp going back).
+    pub rejected: u64,
+    /// Restarts after a gap.
+    pub resets: u64,
 }
+
+/// Default continuity limit between two samples.
+pub const DEFAULT_MAX_GAP_MS: u64 = 30_000;
 
 impl Series {
     pub fn new(cap: usize, min_interval_ms: u64) -> Self {
@@ -43,18 +53,34 @@ impl Series {
             samples: VecDeque::with_capacity(cap),
             cap: cap.max(2),
             min_interval_ms,
+            max_gap_ms: DEFAULT_MAX_GAP_MS.max(min_interval_ms.saturating_mul(2)),
+            rejected: 0,
+            resets: 0,
         }
     }
 
-    /// Add an observation; ignored when too close to the previous one or
-    /// not a finite positive price. Returns whether it was stored.
+    pub fn with_max_gap(mut self, max_gap_ms: u64) -> Self {
+        self.max_gap_ms = max_gap_ms.max(self.min_interval_ms.saturating_mul(2));
+        self
+    }
+
+    /// Add an observation. Refused (counted in `rejected`): a non-finite or
+    /// non-positive price, a timestamp going back, or one closer than the
+    /// sampling interval. A gap longer than `max_gap_ms` clears the series
+    /// first (counted in `resets`). Returns whether it was stored.
     pub fn push(&mut self, obs: Observation) -> bool {
         if !(obs.price.is_finite() && obs.price > 0.0) {
+            self.rejected += 1;
             return false;
         }
         if let Some(last) = self.samples.back() {
-            if obs.ts_ms < last.ts_ms + self.min_interval_ms {
+            if obs.ts_ms < last.ts_ms.saturating_add(self.min_interval_ms) {
+                self.rejected += 1;
                 return false;
+            }
+            if obs.ts_ms - last.ts_ms > self.max_gap_ms {
+                self.samples.clear();
+                self.resets += 1;
             }
         }
         if self.samples.len() == self.cap {
@@ -196,6 +222,8 @@ pub struct SignalConfig {
     pub min_liquidity_change_bps: i64,
     /// Minimum confidence (0..=100) to trade.
     pub min_confidence: u32,
+    /// The newest sample must be at most this old (ms) at decision time.
+    pub max_sample_age_ms: u64,
 }
 
 impl Default for SignalConfig {
@@ -208,11 +236,26 @@ impl Default for SignalConfig {
             max_volatility_bps: 800.0,
             min_liquidity_change_bps: -1_000,
             min_confidence: 70,
+            max_sample_age_ms: 30_000,
         }
     }
 }
 
 impl SignalConfig {
+    /// A configuration the indicators can be computed with.
+    pub fn is_valid(&self) -> bool {
+        self.ema_fast >= 1
+            && self.ema_fast < self.ema_slow
+            && self.rsi_period >= 2
+            && self.rsi_max.is_finite()
+            && self.rsi_max > 0.0
+            && self.rsi_max <= 100.0
+            && self.max_volatility_bps.is_finite()
+            && self.max_volatility_bps > 0.0
+            && self.min_confidence <= 100
+            && self.max_sample_age_ms > 0
+    }
+
     /// Samples needed before every indicator is available (MACD 12/26/9).
     pub fn warmup_samples(&self) -> usize {
         self.ema_slow.max(26 + 9 - 1).max(self.rsi_period + 1)
@@ -240,10 +283,41 @@ impl SignalDecision {
     }
 }
 
-/// Evaluate the gate on the observed series. Vetoes first, then the score:
+/// Evaluate the gate at decision time `now_ms`. Fail-closed order: invalid
+/// configuration, no / stale / future-dated data, warm-up, unavailable
+/// indicators or liquidity momentum, then the hard vetoes, then the score:
 /// trend (EMA fast > slow) 40, MACD histogram > 0 30, RSI in 45..rsi_max 20,
-/// non-negative liquidity momentum 10.
+/// non-negative liquidity momentum 10. The score is a filter, not a
+/// probability of profit.
+pub fn evaluate_at(series: &Series, cfg: &SignalConfig, now_ms: u64) -> SignalDecision {
+    let no = |reason| SignalDecision::NoTrade {
+        reason,
+        confidence: 0,
+    };
+    if !cfg.is_valid() {
+        return no("invalid_config");
+    }
+    match series.last_ts_ms() {
+        None => return no("warming_up"),
+        // Allow small clock skew, never a sample from the future.
+        Some(last) if last > now_ms.saturating_add(5_000) => return no("clock_skew"),
+        Some(last) if now_ms.saturating_sub(last) > cfg.max_sample_age_ms => {
+            return no("stale_data")
+        }
+        Some(_) => {}
+    }
+    evaluate(series, cfg)
+}
+
+/// [`evaluate_at`] without the freshness check (the caller vouches that the
+/// newest sample is current).
 pub fn evaluate(series: &Series, cfg: &SignalConfig) -> SignalDecision {
+    if !cfg.is_valid() {
+        return SignalDecision::NoTrade {
+            reason: "invalid_config",
+            confidence: 0,
+        };
+    }
     if series.len() < cfg.warmup_samples() {
         return SignalDecision::NoTrade {
             reason: "warming_up",
@@ -263,7 +337,13 @@ pub fn evaluate(series: &Series, cfg: &SignalConfig) -> SignalDecision {
             confidence: 0,
         };
     };
-    let liq = series.liquidity_change_bps(cfg.ema_slow).unwrap_or(0);
+    // Unknown liquidity momentum is not neutral: no trade.
+    let Some(liq) = series.liquidity_change_bps(cfg.ema_slow) else {
+        return SignalDecision::NoTrade {
+            reason: "liquidity_unavailable",
+            confidence: 0,
+        };
+    };
     // Hard vetoes.
     if r >= cfg.rsi_max {
         return SignalDecision::NoTrade {
@@ -434,5 +514,94 @@ mod tests {
             evaluate(&series_from(&down, |_| 1_000), &cfg).code(),
             "low_confidence"
         );
+    }
+
+    #[test]
+    fn missing_liquidity_is_never_neutral() {
+        let cfg = SignalConfig::default();
+        let prices = zigzag(60, &[1.0, 1.0, -1.2]);
+        // Same trend that trades with real liquidity data...
+        assert!(matches!(
+            evaluate(&series_from(&prices, |_| 1_000), &cfg),
+            SignalDecision::Trade { .. }
+        ));
+        // ...is refused when the starting liquidity is 0 (no momentum).
+        assert_eq!(
+            evaluate(&series_from(&prices, |_| 0), &cfg).code(),
+            "liquidity_unavailable"
+        );
+    }
+
+    #[test]
+    fn stale_future_and_invalid_inputs_fail_closed() {
+        let cfg = SignalConfig::default();
+        let prices = zigzag(60, &[1.0, 1.0, -1.2]);
+        let s = series_from(&prices, |_| 1_000);
+        let last = s.last_ts_ms().unwrap();
+        assert!(matches!(
+            evaluate_at(&s, &cfg, last + 1_000),
+            SignalDecision::Trade { .. }
+        ));
+        assert_eq!(evaluate_at(&s, &cfg, last + 30_001).code(), "stale_data");
+        assert_eq!(
+            evaluate_at(&s, &cfg, last.saturating_sub(10_000)).code(),
+            "clock_skew"
+        );
+        assert_eq!(
+            evaluate_at(&Series::new(10, 1_000), &cfg, 0).code(),
+            "warming_up"
+        );
+        for bad in [
+            SignalConfig {
+                ema_fast: 20,
+                ..cfg.clone()
+            },
+            SignalConfig {
+                rsi_period: 0,
+                ..cfg.clone()
+            },
+            SignalConfig {
+                rsi_max: f64::NAN,
+                ..cfg.clone()
+            },
+            SignalConfig {
+                max_volatility_bps: 0.0,
+                ..cfg.clone()
+            },
+            SignalConfig {
+                min_confidence: 101,
+                ..cfg.clone()
+            },
+        ] {
+            assert_eq!(evaluate_at(&s, &bad, last).code(), "invalid_config");
+        }
+    }
+
+    #[test]
+    fn timestamps_never_overflow_and_gaps_restart_the_series() {
+        let o = |t, p| Observation {
+            ts_ms: t,
+            price: p,
+            liquidity: 1,
+        };
+        let mut s = Series::new(10, 1_000);
+        assert!(s.push(o(u64::MAX - 10, 1.0)));
+        // last + interval saturates instead of overflowing: no panic, and a
+        // sample inside the interval is still refused.
+        assert!(!s.push(o(u64::MAX - 5, 1.0)));
+        assert_eq!(s.rejected, 1);
+        s.push(o(u64::MAX, 1.0));
+
+        let mut s = Series::new(10, 1_000).with_max_gap(5_000);
+        s.push(o(0, 1.0));
+        s.push(o(1_000, 1.0));
+        assert!(!s.push(o(500, 1.0)), "timestamp going back");
+        assert!(
+            s.push(o(10_000, 1.0)),
+            "after a gap the sample starts a new series"
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.resets, 1);
+        assert_eq!(s.rejected, 1);
     }
 }
