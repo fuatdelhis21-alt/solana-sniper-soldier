@@ -24,6 +24,12 @@ pub struct StrategyConfig {
     pub stop_loss_bps: u64,
     /// Take-profit threshold (basis points above entry price).
     pub take_profit_bps: u64,
+    /// Trailing stop: exit when the price falls this many bps below the
+    /// best level reached since entry. 0 = off (default).
+    pub trailing_stop_bps: u64,
+    /// The trailing stop only arms once the position has been this many
+    /// bps in profit.
+    pub trailing_activation_bps: u64,
     /// Maximum number of trades per day (rolling).
     pub max_daily_trades: u64,
     /// Maximum market cap (lamports) — reject overvalued / already-pumped tokens.
@@ -48,6 +54,9 @@ impl Default for StrategyConfig {
             stop_loss_bps: 500,
             // 10% take-profit.
             take_profit_bps: 1_000,
+            // Trailing stop off; arms at +5% when enabled.
+            trailing_stop_bps: 0,
+            trailing_activation_bps: 500,
             // 20 trades/day cap.
             max_daily_trades: 20,
             // 1M SOL market cap ceiling.
@@ -102,6 +111,10 @@ pub enum ExitDecision {
     /// entry (liquidity being pulled — the classic new-pool rug). Set by the
     /// caller via [`liquidity_dropped`], never by the price checks.
     LiquidityDrop,
+    /// Exit because the price fell `trailing_stop_bps` below the best level
+    /// since entry, after the position had been in profit by at least
+    /// `trailing_activation_bps` (opt-in, see [`StrategyConfig`]).
+    TrailingStop,
 }
 
 /// SOL-side liquidity drop (bps of the entry level) that forces an exit.
@@ -189,6 +202,33 @@ impl SimpleSnipeStrategy {
         }
     }
 
+    /// Price exit for a position whose best ratio since entry is `peak`
+    /// (both scaled by [`RATIO_SCALE`]): stop-loss / take-profit first, then
+    /// the opt-in trailing stop. Paper and live call this same function.
+    pub fn exit_with_peak(&self, ratio: u128, peak: u128) -> ExitDecision {
+        match self.exit_on_ratio(ratio) {
+            ExitDecision::Hold if self.trailing_triggered(ratio, peak) => {
+                ExitDecision::TrailingStop
+            }
+            d => d,
+        }
+    }
+
+    /// True when the trailing stop is on, armed (`peak` reached the
+    /// activation level) and `ratio` fell `trailing_stop_bps` below `peak`.
+    fn trailing_triggered(&self, ratio: u128, peak: u128) -> bool {
+        let trail = self.config.trailing_stop_bps;
+        if trail == 0 || trail >= 10_000 {
+            return false;
+        }
+        let armed_at = RATIO_SCALE + bps_to_scaled(self.config.trailing_activation_bps);
+        if peak < armed_at {
+            return false;
+        }
+        let floor = mul_div_floor(peak, (10_000 - trail) as u128, 10_000).unwrap_or(0);
+        ratio <= floor
+    }
+
     /// Thresholds on a ratio scaled by [`RATIO_SCALE`]: take-profit when the
     /// gain is >= `take_profit_bps`, stop-loss when the loss is >=
     /// `stop_loss_bps`.
@@ -259,6 +299,23 @@ fn mul_div(a: u128, b: u128, d: u128) -> Option<(u128, u128)> {
         }
     }
     Some((q, rem))
+}
+
+/// Value ratio `current_value / cost` scaled by [`RATIO_SCALE`] (live
+/// positions, valued by an exit quote). `None` for a zero cost.
+pub fn value_ratio_scaled(cost: u64, current_value: u64) -> Option<u128> {
+    mul_div_floor(current_value as u128, RATIO_SCALE, cost as u128)
+}
+
+/// Signed bps of a scaled ratio relative to 1.0 (for records and reports),
+/// saturating.
+pub fn ratio_to_bps(ratio: u128) -> i64 {
+    let bp = RATIO_SCALE / 10_000;
+    if ratio >= RATIO_SCALE {
+        i64::try_from((ratio - RATIO_SCALE) / bp).unwrap_or(i64::MAX)
+    } else {
+        -(((RATIO_SCALE - ratio) / bp) as i64)
+    }
 }
 
 /// Price ratio `(current_sqrt / entry_sqrt)^2` scaled by [`RATIO_SCALE`],
@@ -568,5 +625,57 @@ mod tests {
         );
         assert_eq!(s.should_exit_value(0, 5), ExitDecision::Hold);
         assert_eq!(s.should_exit_value(u64::MAX, u64::MAX), ExitDecision::Hold);
+    }
+
+    #[test]
+    fn trailing_stop_is_off_by_default_and_arms_only_in_profit() {
+        let one = RATIO_SCALE;
+        let bp = RATIO_SCALE / 10_000;
+        let off = SimpleSnipeStrategy::new(StrategyConfig::default());
+        // Default: even a 9% drop from a +9% peak is just Hold.
+        assert_eq!(off.exit_with_peak(one, one + 900 * bp), ExitDecision::Hold);
+
+        let on = SimpleSnipeStrategy::new(StrategyConfig {
+            trailing_stop_bps: 300,
+            trailing_activation_bps: 500,
+            ..StrategyConfig::default()
+        });
+        // Not armed: peak +4% < +5% activation.
+        assert_eq!(
+            on.exit_with_peak(one - 200 * bp, one + 400 * bp),
+            ExitDecision::Hold
+        );
+        // Armed at +8%: floor = 1.08 * 0.97 = 1.0476.
+        let peak = one + 800 * bp;
+        let floor = mul_div_floor(peak, 9_700, 10_000).unwrap();
+        assert_eq!(on.exit_with_peak(floor + 1, peak), ExitDecision::Hold);
+        assert_eq!(on.exit_with_peak(floor, peak), ExitDecision::TrailingStop);
+        // Stop-loss and take-profit keep priority.
+        assert_eq!(
+            on.exit_with_peak(one - 500 * bp, peak),
+            ExitDecision::StopLoss
+        );
+        assert_eq!(
+            on.exit_with_peak(one + 1_000 * bp, peak),
+            ExitDecision::TakeProfit
+        );
+        // Out-of-range settings never trigger.
+        let bad = SimpleSnipeStrategy::new(StrategyConfig {
+            trailing_stop_bps: 10_000,
+            ..StrategyConfig::default()
+        });
+        assert_eq!(bad.exit_with_peak(one, u128::MAX), ExitDecision::Hold);
+    }
+
+    #[test]
+    fn ratio_helpers() {
+        let bp = RATIO_SCALE / 10_000;
+        assert_eq!(ratio_to_bps(RATIO_SCALE), 0);
+        assert_eq!(ratio_to_bps(RATIO_SCALE + 250 * bp), 250);
+        assert_eq!(ratio_to_bps(RATIO_SCALE - 500 * bp), -500);
+        assert_eq!(ratio_to_bps(0), -10_000);
+        assert_eq!(ratio_to_bps(u128::MAX), i64::MAX);
+        assert_eq!(value_ratio_scaled(0, 5), None);
+        assert_eq!(value_ratio_scaled(10, 11), Some(RATIO_SCALE + 1_000 * bp));
     }
 }
