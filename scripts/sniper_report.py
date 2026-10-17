@@ -32,6 +32,7 @@ pnl_by_mode = collections.Counter()
 # Closed trades in log order: (mode, ts_ms, gross, net or None, cost, hold_ms)
 closed = []
 quoted_edges = []
+excursions = []  # (mode, action, net, mfe_bps, mae_bps) of paper exits that record them
 entry_conf = {}  # pool -> signal confidence of its last entry
 conf_trades = collections.defaultdict(list)  # confidence bucket -> nets
 latencies = collections.defaultdict(list)
@@ -78,6 +79,10 @@ with f:
             pnl = ctx.get("realized_simulated_pnl_lamports")
             if pnl is not None:
                 cost = ctx.get("cost") or {}
+                if isinstance(ctx.get("mfe_bps"), int) and isinstance(ctx.get("mae_bps"), int):
+                    net = ctx.get("net_pnl_lamports")
+                    excursions.append((mode, action, net if net is not None else pnl,
+                                       ctx["mfe_bps"], ctx["mae_bps"]))
                 conf = entry_conf.pop(r.get("pool_id", ""), None)
                 if isinstance(conf, (int, float)):
                     net = ctx.get("net_pnl_lamports")
@@ -171,3 +176,13 @@ if conf_trades:
     for b in sorted(conf_trades):
         v = conf_trades[b]
         print(f"  {b:3}-{b + 9:<3} n={len(v):3}  win rate={sum(1 for x in v if x > 0) / len(v):.0%}  net={sol(sum(v))}")
+
+if excursions:
+    print("\nBest / worst move during each closed paper trade (MFE / MAE, bps):")
+    for mode, action, net, mfe, mae in excursions:
+        print(f"  {action:20} net={sol(net)}  best={mfe:+6d}  worst={mae:+6d}")
+    losers = [x for x in excursions if x[2] <= 0]
+    if losers:
+        went_up = sum(1 for x in losers if x[3] >= 300)
+        print(f"  losers that were >= +3% in profit before closing: {went_up}/{len(losers)}"
+              " (many = exits give back gains; few = entries go straight down)")

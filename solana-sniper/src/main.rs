@@ -51,6 +51,10 @@ struct PaperPosition {
     /// SOL-side liquidity at entry (liquidity-drop exit, as in live).
     entry_liquidity_lamports: u64,
     opened_at_ms: u64,
+    /// Best / worst price ratio (scaled, see `strategy::RATIO_SCALE`) seen
+    /// since entry: the trailing stop and the MFE/MAE of the record.
+    peak_ratio: u128,
+    trough_ratio: u128,
 }
 
 /// Outcome of one paper iteration against real market data.
@@ -60,8 +64,9 @@ enum PaperTick {
     ClosedStopLoss(i64),
     /// Simulated position closed at the simulated take-profit (realized pnl).
     ClosedTakeProfit(i64),
-    /// Simulated position closed by the max holding time or a SOL-side
-    /// liquidity drop — the same forced exits live applies.
+    /// Simulated position closed by the max holding time, a SOL-side
+    /// liquidity drop or the opt-in trailing stop — the same exits live
+    /// applies.
     ClosedForced(strategy::ExitDecision, i64),
     /// An open simulated position is held (no exit signal).
     Hold,
@@ -114,6 +119,10 @@ struct PaperClose {
     net_pnl_lamports: i64,
     cost: sim_quote::PaperCost,
     hold_ms: u64,
+    /// Best / worst move since entry (bps): did a loser go into profit
+    /// first (exit problem) or fall straight away (entry problem)?
+    mfe_bps: i64,
+    mae_bps: i64,
 }
 
 impl PaperSimulator {
@@ -166,6 +175,8 @@ impl PaperSimulator {
             net_pnl_lamports: net,
             cost,
             hold_ms: self.now_ms.saturating_sub(pos.opened_at_ms),
+            mfe_bps: strategy::ratio_to_bps(pos.peak_ratio),
+            mae_bps: strategy::ratio_to_bps(pos.trough_ratio),
         });
     }
 
@@ -191,7 +202,7 @@ impl PaperSimulator {
         current_sqrt_price: u128,
     ) -> PaperTick {
         self.last_liquidity_lamports = candidate.liquidity_lamports;
-        if let Some(pos) = self.position {
+        if let Some(mut pos) = self.position {
             // Orient the ratio so "up" always means the held token gained
             // value in input units: (current/entry)^2 for token1 input,
             // (entry/current)^2 for token0 input (args swapped).
@@ -200,7 +211,17 @@ impl PaperSimulator {
             } else {
                 (pos.entry_sqrt_price, current_sqrt_price)
             };
-            let mut exit = self.strategy.should_exit(from_sqrt, to_sqrt);
+            // Same integer ratio and exit rule as live (exit_with_peak); an
+            // unrepresentable ratio decides nothing (Hold).
+            let mut exit = match strategy::price_ratio_scaled(from_sqrt, to_sqrt) {
+                Some(ratio) => {
+                    pos.peak_ratio = pos.peak_ratio.max(ratio);
+                    pos.trough_ratio = pos.trough_ratio.min(ratio);
+                    self.position = Some(pos);
+                    self.strategy.exit_with_peak(ratio, pos.peak_ratio)
+                }
+                None => strategy::ExitDecision::Hold,
+            };
             if exit == strategy::ExitDecision::Hold {
                 if strategy::liquidity_dropped(
                     pos.entry_liquidity_lamports,
@@ -218,7 +239,9 @@ impl PaperSimulator {
                     self.holds += 1;
                     PaperTick::Hold
                 }
-                strategy::ExitDecision::MaxHoldTime | strategy::ExitDecision::LiquidityDrop => {
+                strategy::ExitDecision::MaxHoldTime
+                | strategy::ExitDecision::LiquidityDrop
+                | strategy::ExitDecision::TrailingStop => {
                     let pnl =
                         simulated_pnl_lamports(from_sqrt, to_sqrt, pos.position_size_lamports);
                     self.book_close(&pos, pnl, candidate.liquidity_lamports);
@@ -261,6 +284,8 @@ impl PaperSimulator {
             position_size_lamports: sig.position_size_lamports,
             entry_liquidity_lamports: self.last_liquidity_lamports,
             opened_at_ms: self.now_ms,
+            peak_ratio: strategy::RATIO_SCALE,
+            trough_ratio: strategy::RATIO_SCALE,
         });
         self.entries += 1;
     }
@@ -667,6 +692,15 @@ struct Args {
     #[arg(long, env = "SNIPER_FAILED_TX_RESERVE", default_value_t = 1)]
     failed_tx_reserve: u64,
 
+    /// Trailing stop (bps below the best price since entry; 0 = off). Same
+    /// rule in paper and live; evaluate it in paper before using it live.
+    #[arg(long, env = "SNIPER_TRAILING_STOP_BPS", default_value_t = 0)]
+    trailing_stop_bps: u64,
+
+    /// Profit (bps) a position must reach before the trailing stop arms.
+    #[arg(long, env = "SNIPER_TRAILING_ACTIVATION_BPS", default_value_t = 500)]
+    trailing_activation_bps: u64,
+
     /// Paper only: adverse price move per leg (bps) charged for the delay
     /// between the decision and a real fill. Paper fills are otherwise at
     /// the observed spot price, which a live order never gets.
@@ -1015,8 +1049,27 @@ const MIN_LIQUIDITY_FLOOR_SOL: f64 = 20.0;
 fn strategy_config(args: &Args) -> strategy::StrategyConfig {
     strategy::StrategyConfig {
         min_liquidity_lamports: sol_to_lamports(args.min_liquidity_sol),
+        trailing_stop_bps: args.trailing_stop_bps,
+        trailing_activation_bps: args.trailing_activation_bps,
         ..strategy::StrategyConfig::default()
     }
+}
+
+/// The trailing stop, when on, must be a sane band (< 50 %) that arms at a
+/// profit (> 0): an unarmed trailing stop could fire at a loss.
+fn validate_trailing_stop(trailing_bps: u64, activation_bps: u64) -> Result<(), String> {
+    if trailing_bps == 0 {
+        return Ok(());
+    }
+    if trailing_bps >= 5_000 {
+        return Err(format!(
+            "--trailing-stop-bps must be < 5000 (got {trailing_bps})"
+        ));
+    }
+    if activation_bps == 0 {
+        return Err("--trailing-activation-bps must be > 0 when the trailing stop is on".into());
+    }
+    Ok(())
 }
 
 fn validate_min_liquidity(min_liquidity_sol: f64) -> Result<(), String> {
@@ -1443,7 +1496,7 @@ async fn manage_open_position(
     metrics_registry: &metrics::Metrics,
     blockhash_mgr: &std::sync::Mutex<retry::BlockhashManager>,
     from: &Pubkey,
-    pos: &position::LivePosition,
+    pos: &mut position::LivePosition,
     jito_tip: Option<(Pubkey, u64)>,
     exit_failures: u32,
 ) -> ExitOutcome {
@@ -1535,7 +1588,21 @@ async fn manage_open_position(
     } else {
         pos.position_size_lamports
     };
-    let mut decision = strategy.should_exit_value(swapped_in, quote.expected_output);
+    // Same integer ratio and exit rule as paper (exit_with_peak). The best
+    // ratio since entry is persisted so the trailing stop survives restarts.
+    let mut decision = match strategy::value_ratio_scaled(swapped_in, quote.expected_output) {
+        Some(ratio) => {
+            let ratio64 = u64::try_from(ratio).unwrap_or(u64::MAX);
+            if ratio64 > pos.peak_value_ratio {
+                pos.peak_value_ratio = ratio64;
+                if let Err(e) = pos.save(&args.data_dir) {
+                    tracing::warn!(target: "live", error = %e, "could not persist the position's best price (trailing stop uses the in-memory value)");
+                }
+            }
+            strategy.exit_with_peak(ratio, pos.peak_value_ratio as u128)
+        }
+        None => strategy::ExitDecision::Hold,
+    };
     // Liquidity being pulled (rug): both vaults shrink while the price may
     // barely move, so the price exits never fire. The exit swap's output
     // vault is the entry-mint (SOL) side.
@@ -1662,6 +1729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Applied to every mode (paper/dry-run/live) for consistency — if the
     // config itself cannot be validated, refuse to start at all.
     validate_min_liquidity(args.min_liquidity_sol)?;
+    validate_trailing_stop(args.trailing_stop_bps, args.trailing_activation_bps)?;
     let risk_cfg = risk::RiskConfig::production_defaults(args.data_dir.clone())?;
     // Fail-closed cross-module invariant: the strategy's per-trade position
     // size must never exceed the risk manager's max_trade_size_lamports,
@@ -2077,7 +2145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (max_open_positions = 1), and exits are never blocked by the entry
         // risk gates.
         if args.live {
-            if let Some(pos) = live_position.clone() {
+            if let Some(mut pos) = live_position.clone() {
                 let from = match hsm_pubkey(
                     args.hsm_endpoint.as_deref().unwrap_or_default(),
                     args.hsm_ca.as_deref().unwrap_or(Path::new("")),
@@ -2103,11 +2171,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &metrics_registry,
                     &blockhash_mgr,
                     &from,
-                    &pos,
+                    &mut pos,
                     jito_tip,
                     exit_failures,
                 )
                 .await;
+                if matches!(outcome, ExitOutcome::Hold | ExitOutcome::Failed(_)) {
+                    // Keep the updated best price for the next iteration.
+                    live_position = Some(pos.clone());
+                }
                 let exit_ms = exit_start.elapsed().as_secs_f64() * 1000.0;
                 if !matches!(outcome, ExitOutcome::Hold) {
                     metrics::observe_stage(&metrics_registry, metrics::Stage::Exit, exit_ms);
@@ -2333,6 +2405,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         PaperTick::ClosedForced(strategy::ExitDecision::LiquidityDrop, _) => {
                             "exit_liquidity_drop"
                         }
+                        PaperTick::ClosedForced(strategy::ExitDecision::TrailingStop, _) => {
+                            "exit_trailing_stop"
+                        }
                         _ => "exit_max_hold",
                     };
                     let close = paper_sim.last_close;
@@ -2343,6 +2418,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "net_pnl_lamports": close.map(|c| c.net_pnl_lamports),
                         "cost": close.map(|c| c.cost),
                         "hold_ms": close.map(|c| c.hold_ms),
+                        "mfe_bps": close.map(|c| c.mfe_bps),
+                        "mae_bps": close.map(|c| c.mae_bps),
                         "cost_model": "estimate: fee x2 + constant-product impact (exit x exit_impact_pct) + latency bps x2 + network x2",
                         "exit_liquidity_lamports": snapshot.liquidity_lamports,
                         "entry_sqrt": open_pos.map(|(s, _)| s.to_string()),
@@ -3354,6 +3431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             entry_signature: tx.signatures[0].to_string(),
                             opened_at_ms: marketdata::now_ms() as u64,
                             entry_liquidity_lamports: live_liquidity.unwrap_or(0),
+                            peak_value_ratio: 0,
                         },
                     };
                     if let Err(e) = pending.save(&args.data_dir) {
@@ -3418,6 +3496,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 entry_signature: sig.to_string(),
                                 opened_at_ms: marketdata::now_ms() as u64,
                                 entry_liquidity_lamports: live_liquidity.unwrap_or(0),
+                                peak_value_ratio: 0,
                             };
                             // Persist the position BEFORE the counters so a
                             // crash in between is recoverable on restart.
@@ -3890,6 +3969,8 @@ mod tests {
             position_size_lamports: 50_000_000,
             entry_liquidity_lamports: 20_000_000_000,
             opened_at_ms: 1_000,
+            peak_ratio: strategy::RATIO_SCALE + strategy::RATIO_SCALE / 10,
+            trough_ratio: strategy::RATIO_SCALE - strategy::RATIO_SCALE / 50,
         };
         sim.now_ms = 61_000;
         sim.book_close(&pos, 5_000_000, 20_000_000_000);
@@ -3898,6 +3979,7 @@ mod tests {
         assert_eq!(c.cost.total_lamports, 1_144_064);
         assert_eq!(c.net_pnl_lamports, 5_000_000 - 1_144_064);
         assert_eq!(c.hold_ms, 60_000);
+        assert_eq!((c.mfe_bps, c.mae_bps), (1_000, -200));
         assert_eq!(sim.simulated_pnl_lamports, 5_000_000);
         assert_eq!(sim.net_pnl_lamports, 5_000_000 - 1_144_064);
         // A small spot gain can be a net loss.
@@ -4313,6 +4395,61 @@ mod tests {
         assert_eq!(sim.exits_forced, 1);
     }
 
+    #[test]
+    fn paper_trailing_stop_and_mfe_mae() {
+        let mut cand = rejected_candidate();
+        cand.liquidity_lamports = 100_000_000_000;
+        let e: u128 = 1 << 64;
+        let sqrt = |pct: f64| ((e as f64) * (1.0 + pct / 100.0).sqrt()) as u128;
+        let trailing = strategy::StrategyConfig {
+            trailing_stop_bps: 300,
+            trailing_activation_bps: 500,
+            ..strategy::StrategyConfig::default()
+        };
+        let mut sim = PaperSimulator::with_config(trailing);
+        sim.tick(&cand, e);
+        sim.confirm_entry(e, entry_signal(10_000_000));
+        // -2% then +8% (armed), then back to +6%: still above 1.08 * 0.97.
+        for pct in [-2.0, 8.0, 6.0] {
+            assert!(
+                matches!(sim.tick(&cand, sqrt(pct)), PaperTick::Hold),
+                "{pct}"
+            );
+        }
+        // +4.5% < 1.08 * 0.97 = 1.0476: trailing stop, in profit.
+        match sim.tick(&cand, sqrt(4.5)) {
+            PaperTick::ClosedForced(strategy::ExitDecision::TrailingStop, pnl) => assert!(pnl > 0),
+            other => panic!("{other:?}"),
+        }
+        let c = sim.last_close.unwrap();
+        assert!((799..=800).contains(&c.mfe_bps), "{}", c.mfe_bps);
+        assert!((-200..=-199).contains(&c.mae_bps), "{}", c.mae_bps);
+
+        // Same path with the default config (trailing off): no exit.
+        let mut off = PaperSimulator::new();
+        off.tick(&cand, e);
+        off.confirm_entry(e, entry_signal(10_000_000));
+        for pct in [-2.0, 8.0, 6.0, 4.5] {
+            assert!(
+                matches!(off.tick(&cand, sqrt(pct)), PaperTick::Hold),
+                "{pct}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_stop_settings_are_validated() {
+        assert!(validate_trailing_stop(0, 0).is_ok(), "off");
+        assert!(validate_trailing_stop(300, 500).is_ok());
+        assert!(validate_trailing_stop(5_000, 500).is_err());
+        assert!(validate_trailing_stop(300, 0).is_err());
+        let args = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert_eq!(
+            (args.trailing_stop_bps, args.trailing_activation_bps),
+            (0, 500)
+        );
+    }
+
     fn pending_fixture() -> (std::path::PathBuf, position::PendingEntry) {
         let dir = std::env::temp_dir().join(format!(
             "pending_{}_{}",
@@ -4339,6 +4476,7 @@ mod tests {
                 entry_signature: Signature::default().to_string(),
                 opened_at_ms: 1,
                 entry_liquidity_lamports: 0,
+                peak_value_ratio: 0,
             },
         };
         p.save(&dir).unwrap();
@@ -4485,7 +4623,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_exit_keeps_the_position_and_ignores_entry_gates() {
         let (dir, p) = pending_fixture();
-        let pos = p.position.clone();
+        let mut pos = p.position.clone();
         pos.save(&dir).unwrap();
         let args = Args::try_parse_from(["solana-sniper", "--live"]).unwrap();
         let rpc = Arc::new(RpcClient::new_mock("fails".to_string()));
@@ -4502,7 +4640,7 @@ mod tests {
             &m,
             &bh,
             &Pubkey::new_unique(),
-            &pos,
+            &mut pos,
             None,
             0,
         )
