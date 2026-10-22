@@ -1335,6 +1335,12 @@ fn entry_economics(
 /// as `exit_blocked` (retries continue).
 const EXIT_BLOCKED_AFTER: u32 = 3;
 
+/// `exit_blocked` readiness flag (alert + live /ready 503): an open live
+/// position whose last `EXIT_BLOCKED_AFTER` exit attempts all failed.
+fn exit_blocked(position_open: bool, consecutive_exit_failures: u32) -> bool {
+    position_open && consecutive_exit_failures >= EXIT_BLOCKED_AFTER
+}
+
 /// Result of an RPC `simulateTransaction`.
 struct SimulationResult {
     err: Option<String>,
@@ -2188,7 +2194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Exits are retried every iteration and never gated by the
                 // entry limits; after this many consecutive failures the
                 // operator must look (alert + /ready 503).
-                exit_blocked: live_position.is_some() && exit_failures >= EXIT_BLOCKED_AFTER,
+                exit_blocked: exit_blocked(live_position.is_some(), exit_failures),
                 consecutive_exit_failures: exit_failures,
                 breaker_state,
                 kill_switch_active: risk_manager.is_kill_switch_active(),
@@ -4509,6 +4515,57 @@ mod tests {
         assert_eq!(c.get(&2, 10_500), None, "other pool / mints");
         assert_eq!(c.get(&1, 9_000), None, "clock went back: no hit");
         assert_eq!(PAPER_ACCOUNTS_TTL_MS, 300_000);
+    }
+
+    #[test]
+    fn exit_blocked_needs_an_open_position_and_repeated_failures() {
+        assert!(!exit_blocked(false, 100), "no position: nothing to block");
+        assert!(!exit_blocked(true, EXIT_BLOCKED_AFTER - 1));
+        assert!(exit_blocked(true, EXIT_BLOCKED_AFTER));
+        assert!(exit_blocked(true, u32::MAX));
+    }
+
+    #[test]
+    fn paper_costs_are_booked_exactly_once() {
+        let mut cand = rejected_candidate();
+        cand.liquidity_lamports = 20_000_000_000;
+        let mut sim = PaperSimulator::new();
+        sim.cost_model = sim_quote::PaperCostModel {
+            fee_rate_ppm: 2_500,
+            exit_impact_pct: 200,
+            latency_bps_per_leg: 50,
+            network_cost_per_tx_lamports: 10_000,
+        };
+        let e: u128 = 1 << 64;
+        sim.tick(&cand, e);
+        sim.confirm_entry(e, entry_signal(10_000_000));
+        // -6%: stop-loss closes once.
+        let down = ((e as f64) * 0.94f64.sqrt()) as u128;
+        let gross = match sim.tick(&cand, down) {
+            PaperTick::ClosedStopLoss(p) => p,
+            other => panic!("{other:?}"),
+        };
+        let c = sim.last_close.unwrap();
+        let parts = c.cost.fee_lamports
+            + c.cost.entry_impact_lamports
+            + c.cost.exit_impact_lamports
+            + c.cost.latency_lamports
+            + c.cost.network_lamports;
+        assert_eq!(c.cost.total_lamports, parts, "total = sum of its parts");
+        assert_eq!(
+            c.net_pnl_lamports,
+            gross - parts as i64,
+            "net = gross - costs, once"
+        );
+        assert_eq!(sim.net_pnl_lamports, c.net_pnl_lamports);
+        assert_eq!(sim.costs_lamports, parts);
+        // Further ticks without a position (same or worse price) book nothing.
+        for _ in 0..3 {
+            sim.tick(&cand, down / 2);
+        }
+        assert_eq!(sim.net_pnl_lamports, c.net_pnl_lamports);
+        assert_eq!(sim.costs_lamports, parts);
+        assert_eq!(sim.exits_stop_loss, 1);
     }
 
     #[test]
