@@ -34,6 +34,9 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+      - name: Report script tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Check deploy scripts
         run: |
           bash -n deploy/install_release.sh deploy/rollback.sh \

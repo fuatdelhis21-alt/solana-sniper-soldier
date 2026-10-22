@@ -6,11 +6,15 @@ prints its own summary. All of them append to the same decision log
 (<data_dir>/decisions/decisions.jsonl); this script aggregates it.
 
 Usage:
-  python3 scripts/sniper_report.py [DATA_DIR] [--hours N]
+  python3 scripts/sniper_report.py [DATA_DIR] [--hours N] [--stress-exit-bps N]
 DATA_DIR defaults to /var/lib/solana-hft; --hours limits to the last N hours.
+--stress-exit-bps (default 200) prices a conservative stress case: every paper
+exit filling that much worse than modelled (a failed/late exit, MEV). It is a
+labelled assumption, not a prediction.
 """
 import collections
 import json
+import math
 import re
 import sys
 import time
@@ -20,6 +24,11 @@ hours = None
 if "--hours" in args:
     i = args.index("--hours")
     hours = float(args[i + 1])
+    del args[i:i + 2]
+stress_bps = 200
+if "--stress-exit-bps" in args:
+    i = args.index("--stress-exit-bps")
+    stress_bps = int(args[i + 1])
     del args[i:i + 2]
 data_dir = args[0] if args else "/var/lib/solana-hft"
 path = f"{data_dir}/decisions/decisions.jsonl"
@@ -36,6 +45,10 @@ excursions = []  # (mode, action, net, mfe_bps, mae_bps) of paper exits that rec
 entry_conf = {}  # pool -> signal confidence of its last entry
 conf_trades = collections.defaultdict(list)  # confidence bucket -> nets
 latencies = collections.defaultdict(list)
+bad_latency = 0  # non-numeric, negative or non-finite durations (never counted as 0)
+last_event = {}  # pool -> "enter" / "exit": a second exit without re-entry is a duplicate
+duplicate_exits = 0
+stress = collections.Counter()  # mode -> extra cost of the exit stress case (lamports)
 lines = bad = 0
 
 try:
@@ -67,16 +80,28 @@ with f:
         if action == "enter":
             p["enter"] += 1
             entry_conf[r.get("pool_id", "")] = ctx.get("signal_confidence")
+            last_event[r.get("pool_id", "")] = "enter"
         pnl = None
         lat = ctx.get("latency_ms") if isinstance(ctx, dict) else None
         if isinstance(lat, dict):
             for stage, ms in lat.items():
-                if isinstance(ms, (int, float)):
+                if (isinstance(ms, (int, float)) and not isinstance(ms, bool)
+                        and math.isfinite(ms) and ms >= 0):
                     latencies[stage].append(ms)
+                else:
+                    bad_latency += 1
         if action == "quoted" and isinstance(ctx.get("edge"), dict):
             quoted_edges.append(ctx["edge"])
-        if action.startswith("exit_"):
+        if action.startswith("exit_") and last_event.get(r.get("pool_id", "")) == "exit":
+            # Same position closed twice in the log (no entry in between):
+            # count it once.
+            duplicate_exits += 1
+        elif action.startswith("exit_"):
+            last_event[r.get("pool_id", "")] = "exit"
             pnl = ctx.get("realized_simulated_pnl_lamports")
+            size = ctx.get("position_size_lamports")
+            if pnl is not None and isinstance(size, int) and size > 0:
+                stress[mode] += size * stress_bps // 10_000
             if pnl is not None:
                 cost = ctx.get("cost") or {}
                 if isinstance(ctx.get("mfe_bps"), int) and isinstance(ctx.get("mae_bps"), int):
@@ -120,8 +145,10 @@ for mode, pnl in pnl_by_mode.items():
 
 
 def pct(values, q):
+    """Nearest-rank percentile: the smallest sample with at least q % of the
+    samples at or below it. Callers never pass an empty list."""
     v = sorted(values)
-    return v[min(len(v) - 1, int(round(q / 100 * (len(v) - 1))))]
+    return v[max(0, math.ceil(q / 100 * len(v)) - 1)]
 
 
 def sol(lamports):
@@ -157,6 +184,9 @@ for mode in sorted({c[0] for c in closed}):
         print(f"  note: {gross_only} older record(s) have no cost estimate (gross only)")
     if mode == "paper":
         print("  (paper = estimate: spot fills + modelled fees/impact/latency; failed exits are not simulated)")
+        if stress[mode]:
+            print(f"  stress case:    net {sol(sum(nets) - stress[mode])} if every exit filled "
+                  f"{stress_bps} bps worse (assumption, not a prediction)")
     if len(trades) < 15:
         print(f"  sample too small: {len(trades)} < 15 closed trades — no conclusion")
 
@@ -166,10 +196,26 @@ if quoted_edges:
     print(f"\nExact quotes: {len(e)}  net edge bps p50={pct(e, 50)} min={min(e)}  "
           f"exit cost bps p50={pct(x, 50)}")
 
-if latencies:
-    print("\nLatency (ms):")
-    for stage, v in sorted(latencies.items()):
-        print(f"  {stage:14} n={len(v):5} p50={pct(v, 50):8.0f} p95={pct(v, 95):8.0f} p99={pct(v, 99):8.0f}")
+# Stages the decision records carry; the rest is in the
+# sniper_stage_latency_ms histogram on /metrics.
+RECORDED_STAGES = ("quote_sim", "exit")
+if latencies or bad_latency or any(m in ("live", "dry_run") for m, _ in actions):
+    print("\nLatency (ms, nearest-rank percentiles):")
+    for stage in sorted(set(RECORDED_STAGES) | set(latencies)):
+        v = latencies.get(stage, [])
+        if v:
+            print(f"  {stage:14} n={len(v):5} p50={pct(v, 50):8.0f} p95={pct(v, 95):8.0f} p99={pct(v, 99):8.0f}")
+        else:
+            print(f"  {stage:14} no samples")
+    if bad_latency:
+        print(f"  ignored invalid durations: {bad_latency}")
+
+open_entries = [pool for pool, ev in last_event.items() if ev == "enter"]
+if open_entries:
+    print(f"\nEntries without a recorded exit: {len(open_entries)} (still open, or the process"
+          " stopped first, e.g. a restart) — excluded from the performance figures")
+if duplicate_exits:
+    print(f"\nDuplicate exit records ignored: {duplicate_exits}")
 
 if conf_trades:
     print("\nPaper outcome by entry signal confidence (score, not a probability):")

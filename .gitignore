@@ -68,3 +68,7 @@ send_transfer_*.txt
 # ===== HSM cert generation logs =====
 tools/hsm_server/certs/gen_log.txt
 tools/hsm_server/certs/listing.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
