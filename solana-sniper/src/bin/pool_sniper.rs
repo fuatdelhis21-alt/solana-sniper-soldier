@@ -429,6 +429,43 @@ fn send_sigterm(pid: u32) {
 /// Background thread: CLMM program logs → CreatePool signatures. Reconnects
 /// with backoff; a silent socket (no message for 120 s on a program this
 /// busy) counts as dead.
+/// The stream counts as down for an alarm after this much silence; the
+/// alarm repeats at the same interval while it lasts.
+const STREAM_DOWN_ALARM_MS: u64 = 600_000;
+
+/// Silence (ms) to report when an ERROR alarm is due: the stream has been
+/// silent (or never delivered since `started_ms`) for at least
+/// `STREAM_DOWN_ALARM_MS` and the previous alarm is at least as old.
+fn silence_alarm_due(
+    last_msg_ms: u64,
+    started_ms: u64,
+    last_alarm_ms: u64,
+    now: u64,
+) -> Option<u64> {
+    let since = if last_msg_ms == 0 {
+        started_ms
+    } else {
+        last_msg_ms
+    };
+    let silent = now.saturating_sub(since);
+    (silent >= STREAM_DOWN_ALARM_MS && now.saturating_sub(last_alarm_ms) >= STREAM_DOWN_ALARM_MS)
+        .then_some(silent)
+}
+
+/// An error with its whole source chain ("websocket error: HTTP error: 429
+/// Too Many Requests"): the pubsub client's own message hides the cause.
+/// Secrets in URLs are redacted.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    solana_sniper::redact::redact_secrets(&out)
+}
+
 fn spawn_log_listener(
     ws: String,
     program: Pubkey,
@@ -438,7 +475,23 @@ fn spawn_log_listener(
 ) {
     std::thread::spawn(move || {
         let mut backoff = 1u64;
+        let started_ms = now_ms();
+        let mut last_alarm_ms = 0u64;
         while !shutdown.load(Ordering::SeqCst) {
+            if let Some(silent_ms) = silence_alarm_due(
+                status.ws_ms.load(Ordering::SeqCst),
+                started_ms,
+                last_alarm_ms,
+                now_ms(),
+            ) {
+                last_alarm_ms = now_ms();
+                tracing::error!(
+                    target: "discovery",
+                    silent_minutes = silent_ms / 60_000,
+                    reconnect_attempts = status.stream_reconnects.load(Ordering::Relaxed),
+                    "CLMM log stream DOWN — no new pools are being discovered (check the RPC/WS provider: quota, plan, key)"
+                );
+            }
             let sub = solana_client::pubsub_client::PubsubClient::logs_subscribe(
                 &ws,
                 RpcTransactionLogsFilter::Mentions(vec![program.to_string()]),
@@ -450,7 +503,7 @@ fn spawn_log_listener(
                 Ok(v) => v,
                 Err(e) => {
                     gap(&status, &status.stream_reconnects);
-                    tracing::warn!(target: "discovery", error = %e, backoff, "logsSubscribe failed — retrying");
+                    tracing::warn!(target: "discovery", error = %error_chain(&e), backoff, "logsSubscribe failed — retrying");
                     std::thread::sleep(Duration::from_secs(backoff));
                     backoff = (backoff * 2).min(60);
                     continue;
@@ -1026,6 +1079,45 @@ mod tests {
         st2.state_persist_failed.store(true, Ordering::SeqCst);
         assert!(ready_verdict(&st2, now).is_err());
         assert!(render_status(&st2, now).contains("pool_sniper_ready 0"));
+    }
+
+    #[test]
+    fn stream_down_alarm_fires_after_ten_minutes_and_repeats() {
+        let m = STREAM_DOWN_ALARM_MS;
+        // Never received anything since start.
+        assert_eq!(silence_alarm_due(0, 1_000, 0, 1_000 + m - 1), None);
+        assert_eq!(silence_alarm_due(0, 1_000, 0, 1_000 + m), Some(m));
+        // Last message long ago; previous alarm too recent, then due again.
+        let last = 5_000_000;
+        assert_eq!(silence_alarm_due(last, 0, last + m, last + m + 1), None);
+        assert_eq!(
+            silence_alarm_due(last, 0, last + m, last + 2 * m),
+            Some(2 * m)
+        );
+        // A live stream never alarms.
+        assert_eq!(silence_alarm_due(last, 0, 0, last + 1_000), None);
+    }
+
+    #[test]
+    fn error_chain_shows_the_cause_and_redacts_keys() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "websocket error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::other(
+            "HTTP error: 429 Too Many Requests for wss://x.example/?api-key=SECRET123",
+        ));
+        let s = error_chain(&e);
+        assert!(s.starts_with("websocket error: HTTP error: 429"), "{s}");
+        assert!(!s.contains("SECRET123"), "{s}");
     }
 
     #[test]

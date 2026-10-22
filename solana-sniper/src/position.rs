@@ -99,6 +99,11 @@ pub struct LivePosition {
     /// liquidity-drop exit. 0 = unknown (records written before it existed).
     #[serde(default)]
     pub entry_liquidity_lamports: u64,
+    /// Best value ratio (current value / amount swapped in, scaled by
+    /// `strategy::RATIO_SCALE`, saturated to u64) seen since entry, for the
+    /// trailing stop. 0 = none yet (and records written before it existed).
+    #[serde(default)]
+    pub peak_value_ratio: u64,
 }
 
 impl LivePosition {
@@ -281,6 +286,7 @@ mod tests {
             entry_signature: "sig".into(),
             opened_at_ms: 1,
             entry_liquidity_lamports: 50_000_000_000,
+            peak_value_ratio: 0,
         }
     }
 

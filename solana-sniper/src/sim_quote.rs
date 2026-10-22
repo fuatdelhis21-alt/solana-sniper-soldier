@@ -455,4 +455,71 @@ mod tests {
         let e = simulate_swap_output(&rpc, &tx, &acct, 0).unwrap_err();
         assert!(e.contains("no output account"), "{e}");
     }
+
+    fn sim_response(err: serde_json::Value, account: Option<serde_json::Value>) -> RpcClient {
+        let mut m = solana_rpc_client::mock_sender::MocksMap::default();
+        m.insert(
+            solana_rpc_client_api::request::RpcRequest::SimulateTransaction,
+            serde_json::json!({
+                "context": {"slot": 1},
+                "value": {
+                    "err": err,
+                    "logs": ["Program log: test"],
+                    "accounts": account.map(|a| vec![a]),
+                    "unitsConsumed": 70_000,
+                    "returnData": null
+                }
+            }),
+        );
+        RpcClient::new_mock_with_mocks_map("succeeds", m)
+    }
+
+    fn token_account_json(amount: u64) -> serde_json::Value {
+        let mut d = vec![0u8; 165];
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        serde_json::json!({
+            "lamports": 2_039_280,
+            "data": [base64::engine::general_purpose::STANDARD.encode(&d), "base64"],
+            "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "executable": false,
+            "rentEpoch": 0,
+            "space": 165
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_simulation_fixture_success_and_rejections() {
+        let tx = Transaction::new_unsigned(solana_sdk::message::Message::new(&[], None));
+        let acct = Pubkey::new_unique();
+        // Success: the output account grew from 100 to 600.
+        let rpc = sim_response(serde_json::Value::Null, Some(token_account_json(600)));
+        let q = simulate_swap_output(&rpc, &tx, &acct, 100).unwrap();
+        assert_eq!(q.amount_out, 500);
+        assert_eq!(q.compute_units, Some(70_000));
+        // Nothing delivered (balance unchanged or lower): rejected.
+        for post in [100, 50] {
+            let rpc = sim_response(serde_json::Value::Null, Some(token_account_json(post)));
+            let e = simulate_swap_output(&rpc, &tx, &acct, 100).unwrap_err();
+            assert!(e.contains("no output tokens"), "{e}");
+        }
+        // The program rejected the swap (e.g. slippage / missing tick array).
+        let rpc = sim_response(
+            serde_json::json!({"InstructionError": [2, {"Custom": 6022}]}),
+            Some(token_account_json(600)),
+        );
+        let e = simulate_swap_output(&rpc, &tx, &acct, 0).unwrap_err();
+        assert!(e.contains("rejected"), "{e}");
+        // Output account missing from the simulated state.
+        let rpc = sim_response(serde_json::Value::Null, None);
+        assert!(simulate_swap_output(&rpc, &tx, &acct, 0).is_err());
+        // Not a token account (too short to hold an amount).
+        let mut short = token_account_json(600);
+        short["data"] = serde_json::json!([
+            base64::engine::general_purpose::STANDARD.encode([0u8; 40]),
+            "base64"
+        ]);
+        let rpc = sim_response(serde_json::Value::Null, Some(short));
+        let e = simulate_swap_output(&rpc, &tx, &acct, 0).unwrap_err();
+        assert!(e.contains("not an SPL token account"), "{e}");
+    }
 }
