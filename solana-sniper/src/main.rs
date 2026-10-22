@@ -4569,6 +4569,28 @@ mod tests {
     }
 
     #[test]
+    fn runbook_launch_pool_dry_run_command_parses() {
+        // docs/VPS_RUNBOOK.md §12 — keep in sync.
+        let a = Args::try_parse_from([
+            "solana-sniper",
+            "--dry-run",
+            "--pool-id",
+            "11111111111111111111111111111111",
+            "--input-mint",
+            "So11111111111111111111111111111111111111112",
+            "--output-mint",
+            "11111111111111111111111111111111",
+            "--iterations",
+            "3",
+            "--signal-gate",
+            "false",
+        ])
+        .unwrap();
+        assert!(a.dry_run && !a.live && !a.paper && !a.signal_gate);
+        assert_eq!(a.iterations, 3);
+    }
+
+    #[test]
     fn trailing_stop_settings_are_validated() {
         assert!(validate_trailing_stop(0, 0).is_ok(), "off");
         assert!(validate_trailing_stop(300, 500).is_ok());

@@ -166,6 +166,7 @@ curl -s http://127.0.0.1:9898/ready   # -> ready:true (200)
 | Kill switch (`hft_kill_switch_active 1`) | Yeni giriş yok, exit devam eder. Tetikleyiciyi audit logda bul (ör. "entry outcome unknown" → cüzdanı explorer'da kontrol et, `pending_entry.json` bir sonraki başlangıçta zincirden uzlaştırılır). |
 | `state_verified 0` | risk_state.json okunamadı ya da yazılamadı (disk dolu / izin). Yeni giriş yok. Disk/izni düzelt, dosyayı incele, sonra restart. |
 | `another trading process holds …/trading.lock` | Aynı data dir için ikinci live süreç. İkinci servisi durdur (`solana-hft` ve `solana-hft-sniper` aynı anda çalışmaz). |
+| Log `CLMM log stream DOWN` (ERROR, every 10 min) / `logsSubscribe failed … 429` | The RPC/WS provider refuses requests (quota/plan). Discovery and paper stop (fail-closed, no trades). Check with the commands under "Provider quota" below; fix the plan/key or switch `SNIPER_RPC` / `SNIPER_WS`, then `systemctl restart solana-hft-sniper`. |
 | pool-sniper `/ready` 503 ("possible discovery gap") | WS yeniden bağlandı / kuyruk taştı / CreatePool çözülemedi: o pencerede yeni havuz kaçmış olabilir (backfill yok). 5 dk sonra kendiliğinden düzelir; sürekli tekrarlıyorsa WS/RPC sağlayıcısını kontrol et. |
 | pool-sniper "corrupt discovery state" ile başlamıyor | `/var/lib/solana-hft/discovery_state.json` bozuk: incele, sil (günlük havuz sayacı sıfırlanır — bilinçli karar). |
 | Breaker Open | Cooldown + probe akışını bekle; probe başarısızsa RPC/HSM'i kontrol et. |
@@ -190,3 +191,55 @@ sudo -u solana-bot test -f /var/lib/solana-hft/risk_state.json && echo "state pe
 # 4. (Opsiyonel) Servisleri devre dışı bırak
 sudo systemctl disable solana-sniper solana-hsm
 ```
+
+---
+
+## 11. Provider quota (HTTP 429)
+
+The bot's JSON logs all reach journald at priority "info", so `journalctl
+-p warning` does not show them: filter on the JSON level instead.
+
+```bash
+journalctl -u solana-hft-sniper --since "1 hour ago" | grep -E '"level":"(ERROR|WARN)"' | tail -20
+set -a; . /etc/solana-hft/solana-hft.env; set +a      # nothing is printed
+curl -s -o /dev/null -w "getSlot http=%{http_code}\n" -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' "$SNIPER_RPC"
+curl -s -o /dev/null --max-time 5 --http1.1 -w "ws handshake=%{http_code}\n" \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" "${SNIPER_WS/wss:/https:}"
+```
+
+`200` / `101` = fine, `429` = quota or rate limit, `401`/`403` = key or plan.
+
+## 12. Collecting real measurements (operator)
+
+Nothing below sends a transaction.
+
+```bash
+# Latency per stage (histogram) and readiness. The bot's /metrics exists
+# only while a trading process runs (SNIPER_METRICS_ADDR).
+curl -s 127.0.0.1:9091/metrics | grep -E "ready|gap|ws_last|reconnects"
+curl -s 127.0.0.1:9090/metrics | grep -E "sniper_stage_latency_ms_(sum|count)|hft_hsm_latency_ms_(sum|count)"
+# Paper performance, MFE/MAE, stress case, latency percentiles from the records
+python3 /opt/solana-hft/sniper_report.py /var/lib/solana-hft --hours 72
+# RPC calls actually made: the provider dashboard, a day before and after
+# deploying the RPC-reduction build.
+```
+
+One-off **dry-run on a launch pool** (never broadcasts; the exit is also
+simulated as an existing token holder). Use a pool pool-sniper reported
+(`new wSOL pool on watch list`), a separate data dir, and the signal gate
+off only for this check (otherwise the ~70 s warm-up stops it before the
+quote):
+
+```bash
+sudo -u solana bash -c 'set -a; . /etc/solana-hft/solana-hft.env; set +a
+  SNIPER_DATA_DIR=/tmp/dryrun-check /opt/solana-hft/bin/solana-sniper --dry-run \
+    --pool-id <POOL> --input-mint So11111111111111111111111111111111111111112 \
+    --output-mint <TOKEN> --iterations 3 --signal-gate false' 2>&1 \
+  | grep -E "exact entry quote|EXIT simulation|rejected|error" | sed -E 's/(api-key=)[^"&]*/\1***/g'
+```
+
+Expected: `exact entry quote (on-chain simulation)` and
+`EXIT simulation as token holder <wallet>: OK`. A rejection (liquidity,
+authority, edge, impact) is also a valid, safe outcome — paste it.
