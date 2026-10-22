@@ -409,21 +409,39 @@ fn resolve_paper_market_data(
     //    transaction, so the user ATA's are unused — the dummy owner only
     //    derives them deterministically (the dry-run path uses the same
     //    all-zero-owner pattern).
+    //    Paper uses only the pool's identity from it (vaults, orientation,
+    //    fee tier), which does not change, so it is cached briefly instead
+    //    of costing 3-4 RPC calls every iteration (see PaperAccountsCache).
     let dummy_user = Pubkey::new_from_array([0u8; 32]);
-    let (accounts, pool) = amm::account_resolver::resolve_swap_accounts(
-        rpc_client,
-        &pool_id,
-        &dummy_user,
-        &input_mint,
-        &output_mint,
-        &program_id,
-    )
-    .map_err(|e| PaperDataError::Unavailable(format!("swap account resolution failed: {e}")))?;
+    let key = (pool_id, input_mint, output_mint);
+    let now = marketdata::now_ms() as u64;
+    let cached = paper_accounts_cache().lock().unwrap().get(&key, now);
+    let (accounts, pool) = match cached {
+        Some(v) => v,
+        None => {
+            let v = amm::account_resolver::resolve_swap_accounts(
+                rpc_client,
+                &pool_id,
+                &dummy_user,
+                &input_mint,
+                &output_mint,
+                &program_id,
+            )
+            .map_err(|e| {
+                PaperDataError::Unavailable(format!("swap account resolution failed: {e}"))
+            })?;
+            paper_accounts_cache()
+                .lock()
+                .unwrap()
+                .put(key, now, v.clone());
+            v
+        }
+    };
 
     // 4) Mint/freeze authority rug-check — same as live: a present mint or
     //    freeze authority rejects the trade (fail-closed).
     for mint in [input_mint, output_mint] {
-        match onchain_risk::fetch_mint_authority_risk(rpc_client, &mint) {
+        match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint) {
             Ok(risk_info) if risk_info.is_risky() => {
                 return Err(PaperDataError::Rejected(
                     risk::RejectReason::TokenAuthorityRisk,
@@ -517,6 +535,49 @@ fn resolve_paper_market_data(
         // Unknown fee = the highest CLMM tier (never underestimate costs).
         trade_fee_ppm: pool.trade_fee_rate.map(u64::from).unwrap_or(10_000),
     })
+}
+
+/// How long paper reuses a pool's resolved accounts. Only identity data is
+/// used from them (vault addresses, mints, AmmConfig fee tier); the price
+/// and the vault balance are read fresh every iteration.
+const PAPER_ACCOUNTS_TTL_MS: u64 = 300_000;
+
+type PaperAccountsKey = (Pubkey, Pubkey, Pubkey);
+type PaperAccounts = (
+    amm::raydium_v4::SwapAccounts,
+    amm::account_resolver::ResolvedPool,
+);
+
+/// Single-entry time-limited cache (one paper process trades one pool).
+/// Failures are never stored; a different key or an expired entry misses.
+struct TtlSlot<K, V> {
+    slot: Option<(K, u64, V)>,
+    ttl_ms: u64,
+}
+
+impl<K: PartialEq, V: Clone> TtlSlot<K, V> {
+    const fn new(ttl_ms: u64) -> Self {
+        Self { slot: None, ttl_ms }
+    }
+
+    fn get(&self, key: &K, now_ms: u64) -> Option<V> {
+        match &self.slot {
+            Some((k, at, v)) if k == key && now_ms >= *at && now_ms - at < self.ttl_ms => {
+                Some(v.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, key: K, now_ms: u64, value: V) {
+        self.slot = Some((key, now_ms, value));
+    }
+}
+
+fn paper_accounts_cache() -> &'static std::sync::Mutex<TtlSlot<PaperAccountsKey, PaperAccounts>> {
+    static CACHE: std::sync::Mutex<TtlSlot<PaperAccountsKey, PaperAccounts>> =
+        std::sync::Mutex::new(TtlSlot::new(PAPER_ACCOUNTS_TTL_MS));
+    &CACHE
 }
 
 /// HFT Platform CLI arguments.
@@ -2765,7 +2826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // can mint more supply or freeze accounts at will — reject
                 // fail-closed.
                 for (label, mint) in [("input", input_mint), ("output", output_mint)] {
-                    match onchain_risk::fetch_mint_authority_risk(&rpc_client, &mint) {
+                    match onchain_risk::fetch_mint_authority_risk_cached(&rpc_client, &mint) {
                         Ok(risk) if risk.is_risky() => {
                             tracing::warn!(
                                 mode = mode_target,
@@ -4435,6 +4496,19 @@ mod tests {
                 "{pct}"
             );
         }
+    }
+
+    #[test]
+    fn ttl_slot_hits_only_same_key_within_ttl() {
+        let mut c: TtlSlot<u8, &str> = TtlSlot::new(1_000);
+        assert_eq!(c.get(&1, 0), None, "empty");
+        c.put(1, 10_000, "a");
+        assert_eq!(c.get(&1, 10_000), Some("a"));
+        assert_eq!(c.get(&1, 10_999), Some("a"));
+        assert_eq!(c.get(&1, 11_000), None, "expired");
+        assert_eq!(c.get(&2, 10_500), None, "other pool / mints");
+        assert_eq!(c.get(&1, 9_000), None, "clock went back: no hit");
+        assert_eq!(PAPER_ACCOUNTS_TTL_MS, 300_000);
     }
 
     #[test]

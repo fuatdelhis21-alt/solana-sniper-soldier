@@ -334,6 +334,58 @@ pub fn fetch_mint_authority_risk(
     classify_mint(mint, &account.owner, &account.data)
 }
 
+/// Mints whose mint AND freeze authority were seen revoked. Revocation is
+/// permanent for a classic SPL mint (an authority set to `None` can never be
+/// set again, and a classic mint account cannot be closed), so such a mint
+/// never has to be re-read. Risky or unreadable mints are never remembered.
+/// Bounded: forgotten wholesale when full (it is only an RPC saving).
+#[derive(Debug, Default)]
+pub struct RevokedMints {
+    set: HashSet<Pubkey>,
+}
+
+impl RevokedMints {
+    pub const MAX: usize = 10_000;
+
+    pub fn contains(&self, mint: &Pubkey) -> bool {
+        self.set.contains(mint)
+    }
+
+    /// Remember `mint` only when its result is clean.
+    pub fn record(&mut self, mint: Pubkey, risk: &MintAuthorityRisk) {
+        if risk.is_risky() {
+            return;
+        }
+        if self.set.len() >= Self::MAX {
+            self.set.clear();
+        }
+        self.set.insert(mint);
+    }
+}
+
+fn revoked_mints() -> &'static std::sync::Mutex<RevokedMints> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<RevokedMints>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// `fetch_mint_authority_risk`, skipping the RPC call for a mint already
+/// seen with both authorities revoked (see [`RevokedMints`]). Same
+/// fail-closed contract: an error or a risky mint is returned as fetched.
+pub fn fetch_mint_authority_risk_cached(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+) -> Result<MintAuthorityRisk, String> {
+    if revoked_mints().lock().unwrap().contains(mint) {
+        return Ok(MintAuthorityRisk {
+            mint_authority_present: false,
+            freeze_authority_present: false,
+        });
+    }
+    let risk = fetch_mint_authority_risk(rpc, mint)?;
+    revoked_mints().lock().unwrap().record(*mint, &risk);
+    Ok(risk)
+}
+
 /// Classic SPL Token program id.
 pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
@@ -718,4 +770,46 @@ fn simulation_holder_must_be_an_on_curve_ata_with_enough_tokens() {
     let mut ok = accounts.clone();
     ok.push((ata(&wallet), acct(&wallet, 500)));
     assert_eq!(pick_simulation_holder(&mint, &ok, 100), Some(wallet));
+}
+
+#[test]
+fn only_clean_mints_are_remembered_and_the_cache_is_bounded() {
+    let clean = MintAuthorityRisk {
+        mint_authority_present: false,
+        freeze_authority_present: false,
+    };
+    let mut c = RevokedMints::default();
+    let (a, b, f) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
+    c.record(a, &clean);
+    c.record(
+        b,
+        &MintAuthorityRisk {
+            mint_authority_present: true,
+            freeze_authority_present: false,
+        },
+    );
+    c.record(
+        f,
+        &MintAuthorityRisk {
+            mint_authority_present: false,
+            freeze_authority_present: true,
+        },
+    );
+    assert!(c.contains(&a));
+    assert!(
+        !c.contains(&b),
+        "mint authority present: re-read every time"
+    );
+    assert!(
+        !c.contains(&f),
+        "freeze authority present: re-read every time"
+    );
+    for _ in 0..RevokedMints::MAX + 1 {
+        c.record(Pubkey::new_unique(), &clean);
+    }
+    assert!(c.set.len() <= RevokedMints::MAX);
 }
