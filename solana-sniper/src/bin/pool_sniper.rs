@@ -238,8 +238,25 @@ const GAP_READY_WINDOW_MS: u64 = 300_000;
 
 /// Bound of the queue of listed pools awaiting on-chain verification.
 const LISTED_POOLS_CAP: usize = 256;
-/// Verification attempts of a listed pool before it is dropped.
-const LISTED_POOL_ATTEMPTS: u8 = 3;
+/// Waits before re-reading a listed pool after the n-th failed read (RPC
+/// errors such as HTTP 429 are usually temporary). About 32 min in all,
+/// the length of the default watch window; then the pool is dropped.
+const LISTED_POOL_RETRY_MS: [u64; 4] = [30_000, 120_000, 600_000, 1_200_000];
+
+/// Delay before the next read of a listed pool after `failures` failed
+/// reads; `None` once the retries are used up.
+fn listed_retry_delay_ms(failures: u8) -> Option<u64> {
+    failures
+        .checked_sub(1)
+        .and_then(|i| LISTED_POOL_RETRY_MS.get(i as usize).copied())
+}
+
+/// A read failure that may succeed later (the RPC call itself failed:
+/// rate limit, timeout, network), as opposed to an account that was read
+/// and is not a CLMM pool, which is final.
+fn transient_pool_read_error(e: &str) -> bool {
+    e.starts_with("failed to fetch pool state")
+}
 
 /// Bound of the listener → supervisor signature channel.
 const SIGNATURE_CHANNEL_CAP: usize = 1_024;
@@ -955,7 +972,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Pools named by GeckoTerminal, waiting for on-chain verification
     // (bounded; a pool whose state cannot be read yet is retried a few times).
-    let mut listed_pools: std::collections::VecDeque<(Pubkey, u8)> = Default::default();
+    // (pool, failed reads, earliest next read ms)
+    let mut listed_pools: std::collections::VecDeque<(Pubkey, u8, u64)> = Default::default();
 
     let mut pending = PendingSignatures::default();
     let mut watch = WatchList::new(
@@ -1055,16 +1073,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         listed_pools.pop_front();
                         gap(&status, &status.signatures_evicted);
                     }
-                    listed_pools.push_back((pk, 0));
+                    listed_pools.push_back((pk, 0, 0));
                 }
             }
         }
         // GeckoTerminal is only a hint: the pool account itself must be a
         // CLMM PoolState (owner + discriminator) before anything uses it.
-        for _ in 0..listed_pools.len().min(5) {
-            let Some((pk, attempts)) = listed_pools.pop_front() else {
+        let mut reads = 0;
+        for _ in 0..listed_pools.len() {
+            if reads >= 5 {
+                break;
+            }
+            let Some((pk, failures, next_ms)) = listed_pools.pop_front() else {
                 break;
             };
+            if next_ms > now_ms() {
+                listed_pools.push_back((pk, failures, next_ms));
+                continue;
+            }
+            reads += 1;
             match account_resolver::fetch_pool_state(&rpc, &pk, &program) {
                 Ok(state) => {
                     let p = NewPool {
@@ -1082,13 +1109,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => bump(&status.pools_not_wsol),
                     }
                 }
-                Err(e) if attempts + 1 < LISTED_POOL_ATTEMPTS => {
-                    tracing::debug!(target: "discovery", pool = %pk, error = %e, "listed pool not readable yet — will retry");
-                    listed_pools.push_back((pk, attempts + 1));
+                Err(e) if transient_pool_read_error(&e) => {
+                    let failures = failures.saturating_add(1);
+                    match listed_retry_delay_ms(failures) {
+                        Some(delay) => {
+                            tracing::warn!(target: "discovery", pool = %pk, error = %e, retry_in_secs = delay / 1000, "listed pool could not be read (RPC) — will retry");
+                            listed_pools.push_back((pk, failures, now_ms() + delay));
+                        }
+                        None => {
+                            gap(&status, &status.signatures_unresolved);
+                            tracing::warn!(target: "discovery", pool = %pk, error = %e, "listed pool still unreadable after all retries — dropped");
+                        }
+                    }
                 }
                 Err(e) => {
-                    gap(&status, &status.signatures_unresolved);
-                    tracing::warn!(target: "discovery", pool = %pk, error = %e, "listed pool failed on-chain verification — dropped");
+                    // Read fine but not a CLMM PoolState: final, not a gap.
+                    bump(&status.pools_rejected);
+                    tracing::warn!(target: "discovery", pool = %pk, error = %e, "listed pool failed on-chain verification — rejected");
                 }
             }
         }
@@ -1393,6 +1430,22 @@ mod tests {
         ] {
             assert!(validate(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn listed_pool_reads_are_retried_spaced_then_dropped() {
+        assert_eq!(listed_retry_delay_ms(0), None, "no failure yet: no delay");
+        assert_eq!(listed_retry_delay_ms(1), Some(30_000));
+        assert_eq!(listed_retry_delay_ms(4), Some(1_200_000));
+        assert_eq!(listed_retry_delay_ms(5), None, "retries used up");
+        assert_eq!(LISTED_POOL_RETRY_MS.iter().sum::<u64>(), 1_950_000);
+        // RPC failures retry; a pool that was read and is not a CLMM pool is final.
+        assert!(transient_pool_read_error(
+            "failed to fetch pool state X: AccountNotFound: pubkey=X: HTTP status client error (429 Too Many Requests)"
+        ));
+        assert!(!transient_pool_read_error(
+            "PoolState X is owned by Y, not the CLMM program"
+        ));
     }
 
     #[test]
