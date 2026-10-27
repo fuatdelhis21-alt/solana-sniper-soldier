@@ -355,6 +355,113 @@ impl DiscoveryState {
     }
 }
 
+/// GeckoTerminal's DEX id of Raydium CLMM.
+pub const GECKO_CLMM_DEX_ID: &str = "raydium-clmm";
+
+/// One page of a GeckoTerminal pools listing, reduced to what discovery
+/// needs. GeckoTerminal is only a *hint*: every pool it names is fetched
+/// and verified on-chain (owner + discriminator, mints, liquidity) before
+/// it is watched, exactly like a pool found in the CLMM logs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GeckoPage {
+    /// Pools of the wanted DEX created at most `max_age_ms` ago.
+    pub pools: Vec<Pubkey>,
+    /// Creation time (ms) of the oldest pool on the page, any DEX: when it
+    /// is newer than the previous poll, pools beyond the polled pages may
+    /// have been missed (a gap).
+    pub oldest_created_ms: Option<u64>,
+    /// Entries skipped because a field was missing or malformed.
+    pub malformed: usize,
+}
+
+/// Parse a GeckoTerminal pools response (`data[].attributes.address`,
+/// `.pool_created_at`, `relationships.dex.data.id`). A body that is not
+/// such a listing is an error; malformed entries are skipped and counted.
+pub fn parse_gecko_pools(
+    body: &str,
+    dex_id: &str,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> Result<GeckoPage, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("not JSON: {e}"))?;
+    let data = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or("response has no data array")?;
+    let mut page = GeckoPage::default();
+    for item in data {
+        let attrs = item.get("attributes");
+        let address = attrs
+            .and_then(|a| a.get("address"))
+            .and_then(|a| a.as_str())
+            .and_then(|a| a.parse::<Pubkey>().ok());
+        let created_ms = attrs
+            .and_then(|a| a.get("pool_created_at"))
+            .and_then(|t| t.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .and_then(|t| u64::try_from(t.timestamp_millis()).ok());
+        let dex = item
+            .get("relationships")
+            .and_then(|r| r.get("dex"))
+            .and_then(|d| d.get("data"))
+            .and_then(|d| d.get("id"))
+            .and_then(|d| d.as_str());
+        let (Some(address), Some(created_ms), Some(dex)) = (address, created_ms, dex) else {
+            page.malformed += 1;
+            continue;
+        };
+        page.oldest_created_ms = Some(
+            page.oldest_created_ms
+                .map_or(created_ms, |o| o.min(created_ms)),
+        );
+        if dex == dex_id && now_ms.saturating_sub(created_ms) <= max_age_ms {
+            page.pools.push(address);
+        }
+    }
+    Ok(page)
+}
+
+/// Bounded set of recently seen keys (oldest forgotten first): the poller
+/// emits each pool once even though every poll returns it again.
+#[derive(Debug)]
+pub struct BoundedSet {
+    set: HashSet<Pubkey>,
+    order: VecDeque<Pubkey>,
+    cap: usize,
+}
+
+impl BoundedSet {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// True when `key` was not in the set (and is now).
+    pub fn insert(&mut self, key: Pubkey) -> bool {
+        if !self.set.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +652,62 @@ mod tests {
             w.mark_seen(Pubkey::new_unique());
         }
         assert_eq!(w.seen_len(), WatchList::MAX_SEEN);
+    }
+
+    fn gecko_item(addr: &str, created: &str, dex: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("solana_{addr}"),
+            "type": "pool",
+            "attributes": {"address": addr, "pool_created_at": created, "name": "X / SOL"},
+            "relationships": {"dex": {"data": {"id": dex, "type": "dex"}}}
+        })
+    }
+
+    #[test]
+    fn gecko_page_keeps_recent_clmm_pools_only() {
+        let a = pk(1).to_string();
+        let b = pk(2).to_string();
+        let c = pk(3).to_string();
+        // now = 2026-10-27T06:50:00Z
+        let now = 1793083800000u64;
+        let body = serde_json::json!({"data": [
+            gecko_item(&a, "2026-10-27T06:49:00Z", "raydium-clmm"),
+            gecko_item(&b, "2026-10-27T06:49:30Z", "pump-fun"),
+            gecko_item(&c, "2026-10-27T05:00:00Z", "raydium-clmm"),
+            {"attributes": {"address": "not-a-key", "pool_created_at": "2026-10-27T06:49:00Z"},
+             "relationships": {"dex": {"data": {"id": "raydium-clmm"}}}},
+            {"attributes": {"address": a}}
+        ]})
+        .to_string();
+        let page = parse_gecko_pools(&body, GECKO_CLMM_DEX_ID, now, 30 * 60_000).unwrap();
+        assert_eq!(
+            page.pools,
+            vec![pk(1)],
+            "other DEX and too-old pools dropped"
+        );
+        assert_eq!(page.malformed, 2);
+        // The oldest entry of any DEX bounds the page (05:00).
+        assert_eq!(page.oldest_created_ms, Some(now - 110 * 60_000));
+    }
+
+    #[test]
+    fn gecko_page_rejects_non_listings() {
+        assert!(parse_gecko_pools("<html>rate limited</html>", "raydium-clmm", 0, 1).is_err());
+        assert!(
+            parse_gecko_pools(r#"{"errors":[{"status":"429"}]}"#, "raydium-clmm", 0, 1).is_err()
+        );
+        let empty = parse_gecko_pools(r#"{"data":[]}"#, "raydium-clmm", 0, 1).unwrap();
+        assert_eq!(empty, GeckoPage::default());
+    }
+
+    #[test]
+    fn bounded_set_emits_once_and_forgets_oldest() {
+        let mut s = BoundedSet::new(2);
+        assert!(s.insert(pk(1)));
+        assert!(!s.insert(pk(1)), "duplicate");
+        assert!(s.insert(pk(2)));
+        assert!(s.insert(pk(3)));
+        assert_eq!(s.len(), 2);
+        assert!(s.insert(pk(1)), "oldest was forgotten");
     }
 }

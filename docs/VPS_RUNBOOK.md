@@ -211,6 +211,24 @@ curl -s -o /dev/null --max-time 5 --http1.1 -w "ws handshake=%{http_code}\n" \
 
 `200` / `101` = fine, `429` = quota or rate limit, `401`/`403` = key or plan.
 
+Observed on free plans (2026-10): the `logs` discovery source (WebSocket
+logsSubscribe on the whole CLMM program) used up Helius' monthly and
+QuickNode's daily request limit within hours to days
+(`-32003 request limit reached`); Chainstack's free plan refuses
+`getProgramAccounts`. On a free plan use the GeckoTerminal source:
+
+```bash
+# /etc/solana-hft/solana-hft.env
+SNIPER_DISCOVERY_SOURCE=geckoterminal
+SNIPER_LOOP_INTERVAL_MS=5000
+# then
+systemctl restart solana-hft-sniper
+journalctl -u solana-hft-sniper -f | grep -E "GeckoTerminal|watch list|qualifies"
+```
+
+The bot then needs no WebSocket; RPC is used only to verify listed pools
+and by the paper process of a qualifying pool.
+
 ## 12. Collecting real measurements (operator)
 
 Nothing below sends a transaction.
