@@ -31,8 +31,9 @@ use solana_sdk::signature::Signature;
 use solana_sniper::amm::account_resolver;
 use solana_sniper::onchain_risk;
 use solana_sniper::pool_discovery::{
-    find_create_pools, logs_contain_create_pool, resolve_indexes, token_side, Candidate,
-    CheckOutcome, DiscoveryState, NewPool, PendingSignatures, RawInstruction, WatchList,
+    find_create_pools, logs_contain_create_pool, parse_gecko_pools, resolve_indexes, token_side,
+    BoundedSet, Candidate, CheckOutcome, DiscoveryState, NewPool, PendingSignatures,
+    RawInstruction, WatchList, GECKO_CLMM_DEX_ID,
 };
 use solana_sniper::position::{LivePosition, PendingEntry};
 use solana_sniper::redact::RedactingMakeWriter;
@@ -59,6 +60,21 @@ impl Mode {
             Mode::Live => "--live",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Source {
+    Logs,
+    Geckoterminal,
+}
+
+/// What the discovery sources hand the supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscoveryEvent {
+    /// A transaction whose logs show a CreatePool (logs source).
+    Signature(String),
+    /// A pool address named by GeckoTerminal (verified on-chain later).
+    Pool(Pubkey),
 }
 
 #[derive(Parser, Debug)]
@@ -137,6 +153,36 @@ struct Args {
     #[arg(long, env = "SNIPER_DISCOVERY_MAX_POOLS_PER_DAY", default_value_t = 20)]
     max_pools_per_day: u32,
 
+    /// Where new pools come from. `logs` subscribes to every CLMM program
+    /// log over WebSocket (fastest, but a heavy stream that exhausts free RPC
+    /// plans); `geckoterminal` polls GeckoTerminal's new-pools listing and
+    /// verifies every named pool on-chain (no WebSocket, ~1-2 min later).
+    #[arg(
+        long,
+        env = "SNIPER_DISCOVERY_SOURCE",
+        value_enum,
+        default_value = "logs"
+    )]
+    discovery_source: Source,
+
+    /// GeckoTerminal listing polled by `--discovery-source geckoterminal`;
+    /// `{page}` is replaced by the page number.
+    #[arg(
+        long,
+        env = "SNIPER_DISCOVERY_GECKO_URL",
+        default_value = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page={page}"
+    )]
+    gecko_url: String,
+
+    /// Pages fetched per poll (20 pools each; the free API allows about
+    /// 10 calls per minute).
+    #[arg(long, env = "SNIPER_DISCOVERY_GECKO_PAGES", default_value_t = 3)]
+    gecko_pages: u32,
+
+    /// Seconds between GeckoTerminal polls (min 30).
+    #[arg(long, env = "SNIPER_DISCOVERY_POLL_SECS", default_value_t = 60)]
+    poll_secs: u64,
+
     /// Health / status endpoint of the supervisor ("" disables). The
     /// trading process's own metrics server only exists while it runs.
     #[arg(
@@ -190,6 +236,11 @@ fn gap(st: &Status, c: &AtomicU64) {
 /// reported instead of silently treated as complete coverage.
 const GAP_READY_WINDOW_MS: u64 = 300_000;
 
+/// Bound of the queue of listed pools awaiting on-chain verification.
+const LISTED_POOLS_CAP: usize = 256;
+/// Verification attempts of a listed pool before it is dropped.
+const LISTED_POOL_ATTEMPTS: u8 = 3;
+
 /// Bound of the listener → supervisor signature channel.
 const SIGNATURE_CHANNEL_CAP: usize = 1_024;
 
@@ -222,7 +273,9 @@ fn health_verdict(loop_ms: u64, ws_ms: u64, now: u64) -> Result<(), String> {
         return Err("supervisor loop stalled".into());
     }
     if ws_ms == 0 || now.saturating_sub(ws_ms) > WS_SILENCE_LIMIT_MS {
-        return Err("no CLMM log stream messages (WebSocket down?)".into());
+        return Err(
+            "no data from the discovery source (CLMM log stream / GeckoTerminal down?)".into(),
+        );
     }
     Ok(())
 }
@@ -328,6 +381,17 @@ fn validate(args: &Args) -> Result<(), String> {
         return Err(
             "--mode live requires --confirm-live (SNIPER_DISCOVERY_CONFIRM_LIVE=true)".into(),
         );
+    }
+    if args.discovery_source == Source::Geckoterminal {
+        if !args.gecko_url.starts_with("https://") || !args.gecko_url.contains("{page}") {
+            return Err("--gecko-url must be an https:// URL containing {page}".into());
+        }
+        if !(1..=10).contains(&args.gecko_pages) {
+            return Err("--gecko-pages must be 1..=10".into());
+        }
+        if args.poll_secs < 30 {
+            return Err("--poll-secs must be >= 30 (free API rate limit)".into());
+        }
     }
     if let Some(d) = args.discovery_min_liquidity_sol {
         if !d.is_finite() || d < 1.0 {
@@ -469,7 +533,7 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 fn spawn_log_listener(
     ws: String,
     program: Pubkey,
-    tx: mpsc::SyncSender<String>,
+    tx: mpsc::SyncSender<DiscoveryEvent>,
     shutdown: Arc<AtomicBool>,
     status: Arc<Status>,
 ) {
@@ -522,7 +586,7 @@ fn spawn_log_listener(
                         if v.err.is_none() && logs_contain_create_pool(&v.logs) {
                             bump(&status.create_pool_seen);
                             tracing::info!(target: "discovery", signature = %v.signature, "CreatePool seen");
-                            match tx.try_send(v.signature) {
+                            match tx.try_send(DiscoveryEvent::Signature(v.signature)) {
                                 Ok(()) => {}
                                 Err(mpsc::TrySendError::Full(_)) => {
                                     gap(&status, &status.signatures_evicted);
@@ -543,6 +607,123 @@ fn spawn_log_listener(
             let _ = client.shutdown();
         }
     });
+}
+
+/// GeckoTerminal source: every `poll_secs`, fetch `pages` pages of the
+/// new-pools listing and emit each Raydium CLMM pool created within the
+/// watch window once. A poll whose oldest pool is newer than the previous
+/// poll means pools beyond the fetched pages may have been missed: counted
+/// as a gap (/ready 503 for a while). Bounded: fixed pages per poll, one
+/// HTTP request per page, a bounded channel and a bounded dedup set.
+#[allow(clippy::too_many_arguments)]
+fn spawn_gecko_poller(
+    url: String,
+    pages: u32,
+    poll_secs: u64,
+    max_age_ms: u64,
+    tx: mpsc::SyncSender<DiscoveryEvent>,
+    shutdown: Arc<AtomicBool>,
+    status: Arc<Status>,
+) {
+    std::thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent("solana-sniper-pool-discovery")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(target: "discovery", error = %e, "cannot build the GeckoTerminal client — discovery stopped");
+                return;
+            }
+        };
+        let started_ms = now_ms();
+        let mut last_alarm_ms = 0u64;
+        let mut last_poll_ms: Option<u64> = None;
+        let mut emitted = BoundedSet::new(20_000);
+        while !shutdown.load(Ordering::SeqCst) {
+            if let Some(silent_ms) = silence_alarm_due(
+                status.ws_ms.load(Ordering::SeqCst),
+                started_ms,
+                last_alarm_ms,
+                now_ms(),
+            ) {
+                last_alarm_ms = now_ms();
+                tracing::error!(
+                    target: "discovery",
+                    silent_minutes = silent_ms / 60_000,
+                    "discovery source DOWN — GeckoTerminal polls failing, no new pools are being discovered"
+                );
+            }
+            let poll_start = now_ms();
+            let mut oldest: Option<u64> = None;
+            let mut ok = true;
+            for page in 1..=pages {
+                let page_url = url.replace("{page}", &page.to_string());
+                let body = client
+                    .get(&page_url)
+                    .header("Accept", "application/json")
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.text())
+                    .map_err(|e| error_chain(&e))
+                    .and_then(|b| parse_gecko_pools(&b, GECKO_CLMM_DEX_ID, now_ms(), max_age_ms));
+                match body {
+                    Ok(p) => {
+                        if p.malformed > 0 {
+                            tracing::debug!(target: "discovery", page, malformed = p.malformed, "GeckoTerminal entries skipped");
+                        }
+                        oldest = match (oldest, p.oldest_created_ms) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                        for pool in p.pools {
+                            if !emitted.insert(pool) {
+                                continue;
+                            }
+                            bump(&status.create_pool_seen);
+                            tracing::info!(target: "discovery", pool = %pool, "new CLMM pool listed by GeckoTerminal (to verify on-chain)");
+                            match tx.try_send(DiscoveryEvent::Pool(pool)) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    gap(&status, &status.signatures_evicted);
+                                    tracing::warn!(target: "discovery", "discovery channel full — pool dropped");
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => return,
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ok = false;
+                        gap(&status, &status.stream_reconnects);
+                        tracing::warn!(target: "discovery", page, error = %e, "GeckoTerminal poll failed — retrying next interval");
+                        break;
+                    }
+                }
+            }
+            if ok {
+                status.ws_ms.store(now_ms(), Ordering::SeqCst);
+                if gecko_gap(last_poll_ms, oldest) {
+                    gap(&status, &status.signatures_unresolved);
+                    tracing::warn!(target: "discovery", pages, "all fetched pages are newer than the previous poll — pools may have been missed (raise SNIPER_DISCOVERY_GECKO_PAGES or lower SNIPER_DISCOVERY_POLL_SECS)");
+                }
+                last_poll_ms = Some(poll_start);
+            }
+            for _ in 0..poll_secs {
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+}
+
+/// True when the oldest pool of a poll was created after the previous poll
+/// started: the pages did not reach back far enough, pools may be missing.
+/// The first poll has nothing to compare with.
+fn gecko_gap(last_poll_ms: Option<u64>, oldest_created_ms: Option<u64>) -> bool {
+    matches!((last_poll_ms, oldest_created_ms), (Some(last), Some(oldest)) if oldest > last)
 }
 
 /// Fetch a CreatePool transaction and extract the new pools (top-level and
@@ -744,20 +925,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let rpc = RpcClient::new_with_commitment(args.rpc.clone(), CommitmentConfig::confirmed());
-    let (sig_tx, sig_rx) = mpsc::sync_channel::<String>(SIGNATURE_CHANNEL_CAP);
+    let (sig_tx, sig_rx) = mpsc::sync_channel::<DiscoveryEvent>(SIGNATURE_CHANNEL_CAP);
     let status = Arc::new(Status::default());
     status.loop_ms.store(now_ms(), Ordering::SeqCst);
     if !args.health_addr.trim().is_empty() {
         spawn_health_server(args.health_addr.trim(), status.clone())?;
         tracing::info!(target: "discovery", addr = %args.health_addr, "health server listening (/health, /ready, /metrics)");
     }
-    spawn_log_listener(
-        args.ws.clone(),
-        program,
-        sig_tx,
-        shutdown.clone(),
-        status.clone(),
-    );
+    match args.discovery_source {
+        Source::Logs => spawn_log_listener(
+            args.ws.clone(),
+            program,
+            sig_tx,
+            shutdown.clone(),
+            status.clone(),
+        ),
+        Source::Geckoterminal => {
+            tracing::info!(target: "discovery", pages = args.gecko_pages, poll_secs = args.poll_secs, "discovery source: GeckoTerminal new-pools listing (pools verified on-chain)");
+            spawn_gecko_poller(
+                args.gecko_url.clone(),
+                args.gecko_pages,
+                args.poll_secs,
+                args.watch_secs * 1000,
+                sig_tx,
+                shutdown.clone(),
+                status.clone(),
+            )
+        }
+    }
+    // Pools named by GeckoTerminal, waiting for on-chain verification
+    // (bounded; a pool whose state cannot be read yet is retried a few times).
+    let mut listed_pools: std::collections::VecDeque<(Pubkey, u8)> = Default::default();
 
     let mut pending = PendingSignatures::default();
     let mut watch = WatchList::new(
@@ -844,10 +1042,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 2) New CreatePool signatures → watch list.
-        while let Ok(sig) = sig_rx.try_recv() {
-            if pending.push(sig) {
-                gap(&status, &status.signatures_evicted);
-                tracing::warn!(target: "discovery", "pending signature queue full — oldest CreatePool dropped");
+        while let Ok(ev) = sig_rx.try_recv() {
+            match ev {
+                DiscoveryEvent::Signature(sig) => {
+                    if pending.push(sig) {
+                        gap(&status, &status.signatures_evicted);
+                        tracing::warn!(target: "discovery", "pending signature queue full — oldest CreatePool dropped");
+                    }
+                }
+                DiscoveryEvent::Pool(pk) => {
+                    if listed_pools.len() >= LISTED_POOLS_CAP {
+                        listed_pools.pop_front();
+                        gap(&status, &status.signatures_evicted);
+                    }
+                    listed_pools.push_back((pk, 0));
+                }
+            }
+        }
+        // GeckoTerminal is only a hint: the pool account itself must be a
+        // CLMM PoolState (owner + discriminator) before anything uses it.
+        for _ in 0..listed_pools.len().min(5) {
+            let Some((pk, attempts)) = listed_pools.pop_front() else {
+                break;
+            };
+            match account_resolver::fetch_pool_state(&rpc, &pk, &program) {
+                Ok(state) => {
+                    let p = NewPool {
+                        pool_id: pk,
+                        mint_0: state.token_mint_0,
+                        mint_1: state.token_mint_1,
+                    };
+                    match token_side(&p, &wsol) {
+                        Some(token) => {
+                            if watch.add(p, token, now_ms()) {
+                                bump(&status.pools_watched);
+                                tracing::info!(target: "discovery", pool = %p.pool_id, token = %token, watched = watch.len(), "new wSOL pool on watch list");
+                            }
+                        }
+                        None => bump(&status.pools_not_wsol),
+                    }
+                }
+                Err(e) if attempts + 1 < LISTED_POOL_ATTEMPTS => {
+                    tracing::debug!(target: "discovery", pool = %pk, error = %e, "listed pool not readable yet — will retry");
+                    listed_pools.push_back((pk, attempts + 1));
+                }
+                Err(e) => {
+                    gap(&status, &status.signatures_unresolved);
+                    tracing::warn!(target: "discovery", pool = %pk, error = %e, "listed pool failed on-chain verification — dropped");
+                }
             }
         }
         for _ in 0..pending.len().min(5) {
@@ -1118,6 +1360,54 @@ mod tests {
         let s = error_chain(&e);
         assert!(s.starts_with("websocket error: HTTP error: 429"), "{s}");
         assert!(!s.contains("SECRET123"), "{s}");
+    }
+
+    #[test]
+    fn gecko_source_is_opt_in_and_validated() {
+        let d = args(&[]);
+        assert_eq!(d.discovery_source, Source::Logs, "default unchanged");
+        assert!(validate(&d).is_ok());
+        let g = args(&["--discovery-source", "geckoterminal"]);
+        assert_eq!((g.gecko_pages, g.poll_secs), (3, 60));
+        assert!(
+            g.gecko_url.starts_with("https://api.geckoterminal.com/")
+                && g.gecko_url.contains("{page}")
+        );
+        assert!(validate(&g).is_ok());
+        for bad in [
+            &["--discovery-source", "geckoterminal", "--poll-secs", "10"][..],
+            &["--discovery-source", "geckoterminal", "--gecko-pages", "0"][..],
+            &["--discovery-source", "geckoterminal", "--gecko-pages", "11"][..],
+            &[
+                "--discovery-source",
+                "geckoterminal",
+                "--gecko-url",
+                "http://x/?page={page}",
+            ][..],
+            &[
+                "--discovery-source",
+                "geckoterminal",
+                "--gecko-url",
+                "https://x/pools",
+            ][..],
+        ] {
+            assert!(validate(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gecko_gap_when_pages_do_not_reach_the_previous_poll() {
+        assert!(!gecko_gap(None, Some(5)), "first poll");
+        assert!(!gecko_gap(Some(100), None), "empty pages");
+        assert!(
+            !gecko_gap(Some(100), Some(90)),
+            "pages reach back before the last poll"
+        );
+        assert!(!gecko_gap(Some(100), Some(100)));
+        assert!(
+            gecko_gap(Some(100), Some(101)),
+            "every listed pool is newer: some may be missing"
+        );
     }
 
     #[test]
