@@ -150,8 +150,7 @@ pub fn fetch_holder_stats(
         .iter()
         .map(|(a, _)| Pubkey::from_str(a).map_err(|e| format!("invalid token account {a}: {e}")))
         .collect::<Result<_, String>>()?;
-    let accounts = rpc
-        .get_multiple_accounts(&addrs)
+    let accounts = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &addrs)
         .map_err(|e| format!("failed to fetch largest token accounts for {mint}: {e}"))?;
     let mut program_owned: Vec<Pubkey> = Vec::new();
     for (addr, acc) in addrs.iter().zip(accounts.iter()) {
@@ -181,9 +180,40 @@ fn holder_cache() -> &'static HolderCache {
     CACHE.get_or_init(Default::default)
 }
 
+/// After a failed holder reading, the same mint is not re-queried for this
+/// long: the error is returned again (the gate stays closed) instead of
+/// sending two heavy calls every loop iteration to a provider that is
+/// refusing them.
+pub const HOLDER_STATS_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+type HolderErrors =
+    std::sync::Mutex<std::collections::HashMap<Pubkey, (std::time::Instant, String)>>;
+
+fn holder_errors() -> &'static HolderErrors {
+    static ERRORS: std::sync::OnceLock<HolderErrors> = std::sync::OnceLock::new();
+    ERRORS.get_or_init(Default::default)
+}
+
+/// A recent failure for `mint` still inside the back-off, as an error.
+fn recent_holder_error(
+    errors: &std::collections::HashMap<Pubkey, (std::time::Instant, String)>,
+    mint: &Pubkey,
+    now: std::time::Instant,
+) -> Option<String> {
+    let (at, e) = errors.get(mint)?;
+    let age = now.saturating_duration_since(*at);
+    (age < HOLDER_STATS_ERROR_BACKOFF).then(|| {
+        format!(
+            "{e} (not retried for {} s)",
+            (HOLDER_STATS_ERROR_BACKOFF - age).as_secs()
+        )
+    })
+}
+
 /// `fetch_holder_stats` with a per-mint cache of successful readings for
-/// `HOLDER_STATS_TTL`. Errors are never cached (the next iteration retries,
-/// and the gate stays fail-closed meanwhile).
+/// `HOLDER_STATS_TTL`. A failure is returned again for
+/// `HOLDER_STATS_ERROR_BACKOFF` before the next retry (the gate stays
+/// fail-closed meanwhile); errors never become a cached success.
 pub fn fetch_holder_stats_cached(
     rpc: &RpcClient,
     mint: &Pubkey,
@@ -194,7 +224,25 @@ pub fn fetch_holder_stats_cached(
             return Ok(stats.clone());
         }
     }
-    let stats = fetch_holder_stats(rpc, mint, excludes)?;
+    if let Some(e) = recent_holder_error(
+        &holder_errors().lock().unwrap(),
+        mint,
+        std::time::Instant::now(),
+    ) {
+        return Err(e);
+    }
+    let stats = match fetch_holder_stats(rpc, mint, excludes) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut errors = holder_errors().lock().unwrap();
+            if errors.len() >= 1_000 {
+                errors.clear();
+            }
+            errors.insert(*mint, (std::time::Instant::now(), e.clone()));
+            return Err(e);
+        }
+    };
+    holder_errors().lock().unwrap().remove(mint);
     holder_cache()
         .lock()
         .unwrap()
@@ -235,8 +283,7 @@ pub fn find_simulation_holder(
         .iter()
         .filter_map(|e| Pubkey::from_str(&e.address).ok())
         .collect();
-    let accs = rpc
-        .get_multiple_accounts(&addrs)
+    let accs = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &addrs)
         .map_err(|e| format!("failed to fetch token accounts for {mint}: {e}"))?;
     let pairs: Vec<(Pubkey, Option<Vec<u8>>)> = addrs
         .into_iter()
@@ -812,4 +859,32 @@ fn only_clean_mints_are_remembered_and_the_cache_is_bounded() {
         c.record(Pubkey::new_unique(), &clean);
     }
     assert!(c.set.len() <= RevokedMints::MAX);
+}
+
+#[test]
+fn holder_errors_are_backed_off_then_retried() {
+    let mint = Pubkey::new_unique();
+    let t0 = std::time::Instant::now();
+    let mut errors = std::collections::HashMap::new();
+    assert_eq!(
+        recent_holder_error(&errors, &mint, t0),
+        None,
+        "never failed"
+    );
+    errors.insert(mint, (t0, "HTTP 413".to_string()));
+    let e = recent_holder_error(&errors, &mint, t0 + std::time::Duration::from_secs(10)).unwrap();
+    assert!(
+        e.starts_with("HTTP 413") && e.contains("not retried for 20 s"),
+        "{e}"
+    );
+    assert_eq!(
+        recent_holder_error(&errors, &mint, t0 + HOLDER_STATS_ERROR_BACKOFF),
+        None,
+        "back-off over: retry"
+    );
+    assert_eq!(
+        recent_holder_error(&errors, &Pubkey::new_unique(), t0),
+        None,
+        "per mint"
+    );
 }

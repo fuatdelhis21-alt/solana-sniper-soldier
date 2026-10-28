@@ -677,14 +677,27 @@ fn spawn_gecko_poller(
             let mut ok = true;
             for page in 1..=pages {
                 let page_url = url.replace("{page}", &page.to_string());
-                let body = client
-                    .get(&page_url)
-                    .header("Accept", "application/json")
-                    .send()
-                    .and_then(|r| r.error_for_status())
-                    .and_then(|r| r.text())
-                    .map_err(|e| error_chain(&e))
-                    .and_then(|b| parse_gecko_pools(&b, GECKO_CLMM_DEX_ID, now_ms(), max_age_ms));
+                let fetch = || {
+                    client
+                        .get(&page_url)
+                        .header("Accept", "application/json")
+                        .send()
+                        .and_then(|r| r.error_for_status())
+                        .and_then(|r| r.text())
+                        .map_err(|e| error_chain(&e))
+                        .and_then(|b| {
+                            parse_gecko_pools(&b, GECKO_CLMM_DEX_ID, now_ms(), max_age_ms)
+                        })
+                };
+                // The free API answers an occasional 429; one retry a few
+                // seconds later usually passes and avoids a needless gap.
+                let body = match fetch() {
+                    Err(e) if e.contains("429") && !shutdown.load(Ordering::SeqCst) => {
+                        std::thread::sleep(Duration::from_secs(GECKO_RETRY_AFTER_429_SECS));
+                        fetch()
+                    }
+                    other => other,
+                };
                 match body {
                     Ok(p) => {
                         if p.malformed > 0 {
@@ -735,6 +748,9 @@ fn spawn_gecko_poller(
         }
     });
 }
+
+/// Wait before the single retry of a GeckoTerminal page answered with 429.
+const GECKO_RETRY_AFTER_429_SECS: u64 = 5;
 
 /// True when the oldest pool of a poll was created after the previous poll
 /// started: the pages did not reach back far enough, pools may be missing.

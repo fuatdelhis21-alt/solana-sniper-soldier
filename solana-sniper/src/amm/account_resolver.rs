@@ -478,8 +478,7 @@ pub fn resolve_swap_accounts(
     // 1) AmmConfig (fee tier) + the bitmap extension (initialized arrays
     //    beyond ±512 arrays — where most new low-spacing pools trade).
     let ext_pda = bitmap_extension_pda(pool_id, program_id);
-    let head = rpc
-        .get_multiple_accounts(&[pool.amm_config, ext_pda])
+    let head = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &[pool.amm_config, ext_pda])
         .map_err(|e| format!("failed to fetch amm config / bitmap extension for {pool_id}: {e}"))?;
     let amm_config = head
         .first()
@@ -536,8 +535,7 @@ pub fn resolve_swap_accounts(
             ))
         }
     };
-    let fetched = rpc
-        .get_multiple_accounts(&candidates)
+    let fetched = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &candidates)
         .map_err(|e| format!("failed to fetch tick arrays for {pool_id}: {e}"))?;
     let owners: Vec<Option<Pubkey>> = fetched
         .iter()
@@ -548,8 +546,7 @@ pub fn resolve_swap_accounts(
         // The bitmap named arrays that are not on-chain: never trust it
         // blindly — fall back to scanning around the current tick.
         let scan = pool.tick_array_candidates(program_id, zero_for_one, TICK_ARRAY_SCAN);
-        let fetched = rpc
-            .get_multiple_accounts(&scan)
+        let fetched = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &scan)
             .map_err(|e| format!("failed to fetch tick arrays for {pool_id}: {e}"))?;
         let owners: Vec<Option<Pubkey>> = fetched
             .iter()
