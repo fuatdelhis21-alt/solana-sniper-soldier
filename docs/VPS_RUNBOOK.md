@@ -229,6 +229,25 @@ journalctl -u solana-hft-sniper -f | grep -E "GeckoTerminal|watch list|qualifies
 The bot then needs no WebSocket; RPC is used only to verify listed pools
 and by the paper process of a qualifying pool.
 
+Token-2022 in paper (opt-in, 2026-11): many new launchpad tokens use the
+Token-2022 program and were all rejected. With `SNIPER_PAPER_TOKEN_2022=true`
+a **paper** run also accepts a Token-2022 token whose only extensions are the
+metadata pointer and token metadata; any other extension (transfer fee,
+transfer hook, permanent delegate, default account state, close authority,
+pausable, unknown new ones, ...) or a malformed layout still rejects it, and
+mint/freeze authority must be revoked as before. Dry-run and live never
+accept Token-2022: both binaries refuse to start with the setting outside
+paper. See which extensions reject pools:
+
+```bash
+journalctl -u solana-hft-sniper --since "24 hours ago" --no-pager \
+  | grep -oE 'Token-2022 extension [A-Za-z]+ \([0-9]+\)' | sort | uniq -c | sort -rn
+```
+
+Report Token-2022 paper trades separately before drawing any conclusion: the
+pool's token program is part of the pool, not of the decision record, so
+compare by pool id against the discovery log.
+
 ## 12. Collecting real measurements (operator)
 
 Nothing below sends a transaction.
