@@ -440,8 +440,11 @@ fn resolve_paper_market_data(
 
     // 4) Mint/freeze authority rug-check — same as live: a present mint or
     //    freeze authority rejects the trade (fail-closed).
+    //    Token-2022 metadata-only mints only with --paper-token-2022.
+    let token_policy = token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)
+        .map_err(PaperDataError::Unavailable)?;
     for mint in [input_mint, output_mint] {
-        match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint) {
+        match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint, token_policy) {
             Ok(risk_info) if risk_info.is_risky() => {
                 return Err(PaperDataError::Rejected(
                     risk::RejectReason::TokenAuthorityRisk,
@@ -855,6 +858,14 @@ struct Args {
     /// (0 = no limit). An open position is always managed to its exit.
     #[arg(long, env = "SNIPER_ENTRY_WINDOW_SECS", default_value_t = 0)]
     entry_window_secs: u64,
+
+    /// Paper only: also accept Token-2022 tokens whose only extensions are
+    /// token metadata (transfer fees, hooks, permanent delegates, default
+    /// frozen accounts and every other extension still reject). Refused
+    /// with --live / --dry-run: their swap path supports classic SPL tokens
+    /// only.
+    #[arg(long, env = "SNIPER_PAPER_TOKEN_2022", default_value_t = false)]
+    paper_token_2022: bool,
 }
 
 impl Args {
@@ -1031,6 +1042,26 @@ fn resolve_blockhash(
 /// AŞAMA 2/5 — paper mode runs on REAL on-chain market data, so it requires
 /// the same pool/mint arguments as live. Fail-closed: without them paper
 /// refuses to start (no synthetic paper pools anymore).
+/// Token programs this process accepts for a traded mint. Token-2022 is
+/// accepted only by a paper process with --paper-token-2022; asking for it
+/// in any other mode is a startup error, never a silent downgrade.
+fn token_policy(
+    paper_token_2022: bool,
+    paper: bool,
+    live: bool,
+    dry_run: bool,
+) -> Result<onchain_risk::TokenPolicy, String> {
+    if !paper_token_2022 {
+        return Ok(onchain_risk::TokenPolicy::ClassicOnly);
+    }
+    if !paper || live || dry_run {
+        return Err(
+            "--paper-token-2022 (SNIPER_PAPER_TOKEN_2022) is only allowed with --paper".to_string(),
+        );
+    }
+    Ok(onchain_risk::TokenPolicy::PaperToken2022)
+}
+
 fn validate_paper_args(
     pool_id: Option<&str>,
     input_mint: Option<&str>,
@@ -1891,6 +1922,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AŞAMA 2 — paper mode now trades on REAL on-chain market data, which
     // requires the same pool/mint arguments as live. Fail-closed: without
     // them paper refuses to start (no synthetic paper pools anymore).
+    token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)?;
     if args.paper {
         validate_paper_args(
             args.pool_id.as_deref(),
@@ -2832,7 +2864,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // can mint more supply or freeze accounts at will — reject
                 // fail-closed.
                 for (label, mint) in [("input", input_mint), ("output", output_mint)] {
-                    match onchain_risk::fetch_mint_authority_risk_cached(&rpc_client, &mint) {
+                    // Live and dry-run: classic SPL tokens only, always.
+                    match onchain_risk::fetch_mint_authority_risk_cached(
+                        &rpc_client,
+                        &mint,
+                        onchain_risk::TokenPolicy::ClassicOnly,
+                    ) {
                         Ok(risk) if risk.is_risky() => {
                             tracing::warn!(
                                 mode = mode_target,
@@ -3749,6 +3786,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_2022_is_paper_only_and_off_by_default() {
+        use onchain_risk::TokenPolicy::*;
+        // (flag, paper, live, dry_run)
+        assert_eq!(token_policy(false, true, false, false), Ok(ClassicOnly));
+        assert_eq!(token_policy(false, false, true, false), Ok(ClassicOnly));
+        assert_eq!(token_policy(true, true, false, false), Ok(PaperToken2022));
+        for (paper, live, dry_run) in [
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            assert!(
+                token_policy(true, paper, live, dry_run).is_err(),
+                "{paper} {live} {dry_run}"
+            );
+        }
+    }
 
     fn opt(p: &str) -> Option<PathBuf> {
         Some(PathBuf::from(p))

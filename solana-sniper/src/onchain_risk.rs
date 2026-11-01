@@ -374,39 +374,44 @@ impl MintAuthorityRisk {
 pub fn fetch_mint_authority_risk(
     rpc: &RpcClient,
     mint: &Pubkey,
+    policy: TokenPolicy,
 ) -> Result<MintAuthorityRisk, String> {
     let account = rpc
         .get_account(mint)
         .map_err(|e| format!("failed to fetch mint account {mint}: {e}"))?;
-    classify_mint(mint, &account.owner, &account.data)
+    classify_mint(mint, &account.owner, &account.data, policy)
 }
 
 /// Mints whose mint AND freeze authority were seen revoked. Revocation is
 /// permanent for a classic SPL mint (an authority set to `None` can never be
 /// set again, and a classic mint account cannot be closed), so such a mint
-/// never has to be re-read. Risky or unreadable mints are never remembered.
-/// Bounded: forgotten wholesale when full (it is only an RPC saving).
+/// never has to be re-read. The same holds for an accepted Token-2022 mint
+/// (a close authority is a rejected extension). Entries are kept per
+/// [`TokenPolicy`]: a mint accepted under the paper-only policy is never a
+/// cached pass for the classic-only policy. Risky or unreadable mints are
+/// never remembered. Bounded: forgotten wholesale when full (it is only an
+/// RPC saving).
 #[derive(Debug, Default)]
 pub struct RevokedMints {
-    set: HashSet<Pubkey>,
+    set: HashSet<(Pubkey, TokenPolicy)>,
 }
 
 impl RevokedMints {
     pub const MAX: usize = 10_000;
 
-    pub fn contains(&self, mint: &Pubkey) -> bool {
-        self.set.contains(mint)
+    pub fn contains(&self, mint: &Pubkey, policy: TokenPolicy) -> bool {
+        self.set.contains(&(*mint, policy))
     }
 
     /// Remember `mint` only when its result is clean.
-    pub fn record(&mut self, mint: Pubkey, risk: &MintAuthorityRisk) {
+    pub fn record(&mut self, mint: Pubkey, policy: TokenPolicy, risk: &MintAuthorityRisk) {
         if risk.is_risky() {
             return;
         }
         if self.set.len() >= Self::MAX {
             self.set.clear();
         }
-        self.set.insert(mint);
+        self.set.insert((mint, policy));
     }
 }
 
@@ -421,47 +426,160 @@ fn revoked_mints() -> &'static std::sync::Mutex<RevokedMints> {
 pub fn fetch_mint_authority_risk_cached(
     rpc: &RpcClient,
     mint: &Pubkey,
+    policy: TokenPolicy,
 ) -> Result<MintAuthorityRisk, String> {
-    if revoked_mints().lock().unwrap().contains(mint) {
+    if revoked_mints().lock().unwrap().contains(mint, policy) {
         return Ok(MintAuthorityRisk {
             mint_authority_present: false,
             freeze_authority_present: false,
         });
     }
-    let risk = fetch_mint_authority_risk(rpc, mint)?;
-    revoked_mints().lock().unwrap().record(*mint, &risk);
+    let risk = fetch_mint_authority_risk(rpc, mint, policy)?;
+    revoked_mints().lock().unwrap().record(*mint, policy, &risk);
     Ok(risk)
 }
 
 /// Classic SPL Token program id.
 pub const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-/// Classify a mint account (pure). The swap path derives classic SPL Token
-/// ATAs and passes the classic token program: a Token-2022 mint (transfer
-/// fees, hooks, ...) or any other owner cannot be traded safely here and is
+/// Token-2022 program id.
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+/// Which token programs a mint may belong to.
+///
+/// `ClassicOnly` is the only policy of the live and dry-run paths: their
+/// swap builder derives classic ATAs and passes the classic token program.
+/// `PaperToken2022` is used by a paper process started with
+/// `--paper-token-2022`; it additionally accepts Token-2022 mints that carry
+/// no extension except token metadata (see [`classify_mint`]). Paper never
+/// builds or sends a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenPolicy {
+    ClassicOnly,
+    PaperToken2022,
+}
+
+/// Token-2022 mint extensions accepted under [`TokenPolicy::PaperToken2022`]:
+/// only the metadata pointer and the metadata itself (name, symbol, URI).
+/// They cannot move, freeze, tax or block anyone's tokens. Every other
+/// extension — known or not — rejects the mint.
+const T22_ALLOWED_EXTENSIONS: &[u16] = &[18, 19];
+/// Token-2022 accounts with extensions: the 82-byte base mint padded to the
+/// 165-byte token-account size, one account-type byte, then the
+/// type-length-value extension list.
+const T22_BASE_LEN: usize = 165;
+const T22_ACCOUNT_TYPE_MINT: u8 = 1;
+
+/// Name of a Token-2022 extension type (for logs; "unknown" for new ones).
+fn t22_extension_name(ty: u16) -> &'static str {
+    match ty {
+        1 => "TransferFeeConfig",
+        3 => "MintCloseAuthority",
+        4 => "ConfidentialTransferMint",
+        6 => "DefaultAccountState",
+        9 => "NonTransferable",
+        10 => "InterestBearingConfig",
+        12 => "PermanentDelegate",
+        14 => "TransferHook",
+        16 => "ConfidentialTransferFeeConfig",
+        18 => "MetadataPointer",
+        19 => "TokenMetadata",
+        20 => "GroupPointer",
+        21 => "TokenGroup",
+        22 => "GroupMemberPointer",
+        23 => "TokenGroupMember",
+        24 => "ConfidentialMintBurn",
+        25 => "ScaledUiAmount",
+        26 => "Pausable",
+        _ => "unknown",
+    }
+}
+
+/// Check a Token-2022 mint's extension list (pure). Accepts a plain 82-byte
+/// mint or a well-formed extension list containing only
+/// [`T22_ALLOWED_EXTENSIONS`]. Anything else — an unlisted or unknown
+/// extension, a truncated entry, non-zero padding, a wrong account type —
+/// is an error. Error texts contain "Token-2022" (a permanent rejection
+/// for discovery).
+fn check_token_2022_extensions(mint: &Pubkey, data: &[u8]) -> Result<(), String> {
+    if data.len() == 82 {
+        return Ok(());
+    }
+    let malformed = |what: &str| format!("mint {mint} has a malformed Token-2022 layout ({what})");
+    if data.len() <= T22_BASE_LEN {
+        return Err(malformed("length"));
+    }
+    if data[82..T22_BASE_LEN].iter().any(|b| *b != 0) {
+        return Err(malformed("padding"));
+    }
+    if data[T22_BASE_LEN] != T22_ACCOUNT_TYPE_MINT {
+        return Err(malformed("account type"));
+    }
+    let mut i = T22_BASE_LEN + 1;
+    while i < data.len() {
+        let rest = &data[i..];
+        if rest.len() < 4 {
+            return Err(malformed("truncated extension header"));
+        }
+        let ty = u16::from_le_bytes([rest[0], rest[1]]);
+        let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+        if ty == 0 {
+            // Uninitialized entry: only trailing zero space may follow.
+            if rest.iter().all(|b| *b == 0) {
+                break;
+            }
+            return Err(malformed("data after an empty extension"));
+        }
+        if !T22_ALLOWED_EXTENSIONS.contains(&ty) {
+            return Err(format!(
+                "mint {mint} has Token-2022 extension {} ({ty}) — rejected (only token metadata is accepted)",
+                t22_extension_name(ty)
+            ));
+        }
+        i = i
+            .checked_add(4 + len)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| malformed("extension length"))?;
+    }
+    Ok(())
+}
+
+/// Classify a mint account (pure).
+///
+/// A classic SPL Token mint (exactly 82 bytes) is accepted under every
+/// policy. A Token-2022 mint is accepted only under
+/// [`TokenPolicy::PaperToken2022`] and only when its extensions pass
+/// [`check_token_2022_extensions`]; otherwise it, and any other owner, is
 /// rejected (the error text contains "Token-2022", which discovery treats
 /// as a permanent rejection). A malformed, wrong-size or uninitialized mint
-/// is an error too — never "safe".
+/// is an error too — never "safe". Mint and freeze authority are then read
+/// from the base layout, the same for both programs.
 pub fn classify_mint(
     mint: &Pubkey,
     owner: &Pubkey,
     data: &[u8],
+    policy: TokenPolicy,
 ) -> Result<MintAuthorityRisk, String> {
     let spl_token = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
-    if *owner != spl_token {
+    let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM).unwrap();
+    if *owner == spl_token {
+        // Classic SPL Mint: exactly 82 bytes.
+        if data.len() != 82 {
+            return Err(format!(
+                "mint {mint} account data is {} bytes, not an SPL Mint (82)",
+                data.len()
+            ));
+        }
+    } else if *owner == token_2022 && policy == TokenPolicy::PaperToken2022 {
+        check_token_2022_extensions(mint, data)?;
+    } else {
         return Err(format!(
-            "mint {mint} is owned by {owner} — only classic SPL Token mints are supported (Token-2022 rejected)"
+            "mint {mint} is owned by {owner} — only classic SPL Token mints are supported (Token-2022 rejected; paper accepts it only with --paper-token-2022)"
         ));
     }
-    // Classic SPL Mint: exactly 82 bytes — COption<Pubkey> mint authority
-    // (0..36), supply (36..44), decimals (44), is_initialized (45),
-    // COption<Pubkey> freeze authority (46..82).
-    if data.len() != 82 {
-        return Err(format!(
-            "mint {mint} account data is {} bytes, not an SPL Mint (82)",
-            data.len()
-        ));
-    }
+    // Base Mint layout: COption<Pubkey> mint authority (0..36), supply
+    // (36..44), decimals (44), is_initialized (45), COption<Pubkey> freeze
+    // authority (46..82).
     if data[45] != 1 {
         return Err(format!("mint {mint} is not initialized"));
     }
@@ -749,47 +867,146 @@ fn token_account_owner_parses_spl_layout_and_curve_check() {
 
 #[test]
 fn classify_mint_rejects_token_2022_and_malformed_mints() {
+    use TokenPolicy::*;
     let mint = Pubkey::new_unique();
     let spl = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
-    let token_2022 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let token_2022 = Pubkey::from_str(TOKEN_2022_PROGRAM).unwrap();
     let mut clean = vec![0u8; 82];
     clean[45] = 1;
-    let r = classify_mint(&mint, &spl, &clean).unwrap();
-    assert!(!r.is_risky());
+    for policy in [ClassicOnly, PaperToken2022] {
+        assert!(!classify_mint(&mint, &spl, &clean, policy)
+            .unwrap()
+            .is_risky());
+    }
 
-    // Token-2022 (and any other owner) is rejected with the marker text
-    // discovery relies on, even when the base layout looks clean.
-    let mut ext = clean.clone();
-    ext.resize(200, 0);
-    for owner in [token_2022, Pubkey::new_unique()] {
-        let e = classify_mint(&mint, &owner, &ext).unwrap_err();
+    // Classic-only (live / dry-run): Token-2022 and any other owner are
+    // rejected with the marker text discovery relies on, even when the
+    // layout is clean. Unknown owners stay rejected under the paper policy.
+    let ext = t22_mint(&clean, &[(19, 40)]);
+    for (owner, data) in [(token_2022, &clean), (token_2022, &ext)] {
+        let e = classify_mint(&mint, &owner, data, ClassicOnly).unwrap_err();
+        assert!(e.contains("Token-2022"), "{e}");
+    }
+    for policy in [ClassicOnly, PaperToken2022] {
+        let e = classify_mint(&mint, &Pubkey::new_unique(), &clean, policy).unwrap_err();
         assert!(e.contains("Token-2022"), "{e}");
     }
 
     let mut auth = clean.clone();
     auth[0] = 1;
     assert!(
-        classify_mint(&mint, &spl, &auth)
+        classify_mint(&mint, &spl, &auth, ClassicOnly)
             .unwrap()
             .mint_authority_present
     );
     let mut frz = clean.clone();
     frz[46] = 1;
     assert!(
-        classify_mint(&mint, &spl, &frz)
+        classify_mint(&mint, &spl, &frz, ClassicOnly)
             .unwrap()
             .freeze_authority_present
     );
 
     // Wrong size, uninitialized, malformed option tags: errors, never safe.
-    assert!(classify_mint(&mint, &spl, &clean[..81]).is_err());
-    assert!(classify_mint(&mint, &spl, &ext).is_err());
+    assert!(classify_mint(&mint, &spl, &clean[..81], ClassicOnly).is_err());
+    assert!(classify_mint(&mint, &spl, &ext, ClassicOnly).is_err());
     let mut uninit = clean.clone();
     uninit[45] = 0;
-    assert!(classify_mint(&mint, &spl, &uninit).is_err());
+    assert!(classify_mint(&mint, &spl, &uninit, ClassicOnly).is_err());
     let mut bad = clean.clone();
     bad[0] = 7;
-    assert!(classify_mint(&mint, &spl, &bad).is_err());
+    assert!(classify_mint(&mint, &spl, &bad, ClassicOnly).is_err());
+}
+
+/// A Token-2022 mint account: `base` (82 bytes) padded to 165, the mint
+/// account type, then one TLV entry per `(type, value length)`.
+#[cfg(test)]
+fn t22_mint(base: &[u8], exts: &[(u16, u16)]) -> Vec<u8> {
+    let mut d = base.to_vec();
+    d.resize(T22_BASE_LEN, 0);
+    d.push(T22_ACCOUNT_TYPE_MINT);
+    for (ty, len) in exts {
+        d.extend_from_slice(&ty.to_le_bytes());
+        d.extend_from_slice(&len.to_le_bytes());
+        d.extend(std::iter::repeat_n(0xAB, *len as usize));
+    }
+    d
+}
+
+#[test]
+fn paper_token_2022_accepts_only_metadata_extensions() {
+    let mint = Pubkey::new_unique();
+    let t22 = Pubkey::from_str(TOKEN_2022_PROGRAM).unwrap();
+    let p = TokenPolicy::PaperToken2022;
+    let mut base = vec![0u8; 82];
+    base[45] = 1;
+
+    // No extensions, metadata pointer + metadata (the usual launchpad
+    // layout), and trailing zero space: accepted.
+    for data in [base.clone(), t22_mint(&base, &[(18, 64), (19, 120)]), {
+        let mut d = t22_mint(&base, &[(18, 64)]);
+        d.extend([0u8; 12]);
+        d
+    }] {
+        assert!(!classify_mint(&mint, &t22, &data, p).unwrap().is_risky());
+    }
+    // Authorities are still read from the base layout and still reject.
+    let mut frz = base.clone();
+    frz[46] = 1;
+    assert!(
+        classify_mint(&mint, &t22, &t22_mint(&frz, &[(19, 50)]), p)
+            .unwrap()
+            .freeze_authority_present
+    );
+
+    // Every other extension rejects — dangerous ones, harmless-looking
+    // ones and unknown future ones alike — even next to metadata.
+    for ty in [
+        1u16,
+        3,
+        4,
+        6,
+        9,
+        10,
+        12,
+        14,
+        16,
+        20,
+        22,
+        25,
+        26,
+        77,
+        u16::MAX,
+    ] {
+        let data = t22_mint(&base, &[(18, 64), (ty, 8)]);
+        let e = classify_mint(&mint, &t22, &data, p).unwrap_err();
+        assert!(
+            e.contains("Token-2022") && e.contains(&format!("({ty})")),
+            "{e}"
+        );
+    }
+
+    // Malformed layouts reject.
+    let good = t22_mint(&base, &[(19, 40)]);
+    let mut short = base.clone();
+    short.resize(120, 0); // between the base mint and the extension area
+    let mut padding = good.clone();
+    padding[100] = 1;
+    let mut acct_type = good.clone();
+    acct_type[T22_BASE_LEN] = 2; // token account, not a mint
+    let mut overrun = good.clone();
+    overrun[T22_BASE_LEN + 3] = 0xFF; // length beyond the data
+    let mut junk = t22_mint(&base, &[(19, 8)]);
+    junk.extend([0, 0, 0, 0, 9]); // data after an empty entry
+    let mut stub = good.clone();
+    stub.extend([18, 0]); // half an extension header
+    let mut uninit = good.clone();
+    uninit[45] = 0;
+    for data in [
+        &short, &padding, &acct_type, &overrun, &junk, &stub, &uninit,
+    ] {
+        assert!(classify_mint(&mint, &t22, data, p).is_err());
+    }
 }
 
 #[test]
@@ -831,9 +1048,10 @@ fn only_clean_mints_are_remembered_and_the_cache_is_bounded() {
         Pubkey::new_unique(),
         Pubkey::new_unique(),
     );
-    c.record(a, &clean);
+    c.record(a, TokenPolicy::ClassicOnly, &clean);
     c.record(
         b,
+        TokenPolicy::ClassicOnly,
         &MintAuthorityRisk {
             mint_authority_present: true,
             freeze_authority_present: false,
@@ -841,22 +1059,29 @@ fn only_clean_mints_are_remembered_and_the_cache_is_bounded() {
     );
     c.record(
         f,
+        TokenPolicy::ClassicOnly,
         &MintAuthorityRisk {
             mint_authority_present: false,
             freeze_authority_present: true,
         },
     );
-    assert!(c.contains(&a));
+    assert!(c.contains(&a, TokenPolicy::ClassicOnly));
+    // A mint accepted under the paper-only policy is never a cached pass
+    // for the classic-only (live / dry-run) policy.
+    let t = Pubkey::new_unique();
+    c.record(t, TokenPolicy::PaperToken2022, &clean);
+    assert!(c.contains(&t, TokenPolicy::PaperToken2022));
+    assert!(!c.contains(&t, TokenPolicy::ClassicOnly));
     assert!(
-        !c.contains(&b),
+        !c.contains(&b, TokenPolicy::ClassicOnly),
         "mint authority present: re-read every time"
     );
     assert!(
-        !c.contains(&f),
+        !c.contains(&f, TokenPolicy::ClassicOnly),
         "freeze authority present: re-read every time"
     );
     for _ in 0..RevokedMints::MAX + 1 {
-        c.record(Pubkey::new_unique(), &clean);
+        c.record(Pubkey::new_unique(), TokenPolicy::ClassicOnly, &clean);
     }
     assert!(c.set.len() <= RevokedMints::MAX);
 }

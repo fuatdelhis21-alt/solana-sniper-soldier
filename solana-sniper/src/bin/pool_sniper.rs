@@ -145,6 +145,13 @@ struct Args {
     )]
     entry_window_secs: u64,
 
+    /// Paper only: also trade Token-2022 tokens whose only extensions are
+    /// token metadata (any other extension still rejects the pool). Refused
+    /// with --mode dry-run / live: their swap path supports classic SPL
+    /// tokens only.
+    #[arg(long, env = "SNIPER_PAPER_TOKEN_2022", default_value_t = false)]
+    paper_token_2022: bool,
+
     /// Sell an open position after this many seconds (passed to the child).
     #[arg(long, env = "SNIPER_DISCOVERY_MAX_HOLD_SECS", default_value_t = 3600)]
     max_hold_secs: u64,
@@ -399,6 +406,11 @@ fn validate(args: &Args) -> Result<(), String> {
             "--mode live requires --confirm-live (SNIPER_DISCOVERY_CONFIRM_LIVE=true)".into(),
         );
     }
+    if args.paper_token_2022 && args.mode != Mode::Paper {
+        return Err(
+            "--paper-token-2022 (SNIPER_PAPER_TOKEN_2022) is only allowed with --mode paper".into(),
+        );
+    }
     if args.discovery_source == Source::Geckoterminal {
         if !args.gecko_url.starts_with("https://") || !args.gecko_url.contains("{page}") {
             return Err("--gecko-url must be an https:// URL containing {page}".into());
@@ -441,6 +453,7 @@ const CHILD_ENV_REMOVE: &[&str] = &[
     "SNIPER_MIN_LIQUIDITY_SOL",
     "SNIPER_MAX_HOLD_SECS",
     "SNIPER_LIVE_RISK_DATA",
+    "SNIPER_PAPER_TOKEN_2022",
 ];
 
 fn child_args(args: &Args, pool: &str, input_mint: &str, output_mint: &str) -> Vec<String> {
@@ -463,7 +476,21 @@ fn child_args(args: &Args, pool: &str, input_mint: &str, output_mint: &str) -> V
     }
     v.push("--single-trade".into());
     v.push("--live-risk-data".into());
+    if token_policy(args) == onchain_risk::TokenPolicy::PaperToken2022 {
+        v.push("--paper-token-2022".into());
+    }
     v
+}
+
+/// Token programs a pool's token may use. Token-2022 only for a paper run
+/// with --paper-token-2022 (`validate` refuses the flag in other modes;
+/// this check repeats it so a bypassed `validate` still cannot widen it).
+fn token_policy(args: &Args) -> onchain_risk::TokenPolicy {
+    if args.paper_token_2022 && args.mode == Mode::Paper {
+        onchain_risk::TokenPolicy::PaperToken2022
+    } else {
+        onchain_risk::TokenPolicy::ClassicOnly
+    }
 }
 
 struct Running {
@@ -839,9 +866,10 @@ fn check_candidate(
     program: &Pubkey,
     c: &mut Candidate,
     min_liq_lamports: u64,
+    policy: onchain_risk::TokenPolicy,
 ) -> CheckOutcome {
     if !c.mint_ok {
-        match onchain_risk::fetch_mint_authority_risk(rpc, &c.token_mint) {
+        match onchain_risk::fetch_mint_authority_risk(rpc, &c.token_mint, policy) {
             Ok(r) if r.is_risky() => {
                 return CheckOutcome::Reject(format!(
                     "mint authority present: {} / freeze authority present: {}",
@@ -1237,7 +1265,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let Some(mut c) = watch.take_due(now_ms()) else {
                                 break;
                             };
-                            match check_candidate(&rpc, &program, &mut c, min_liq) {
+                            match check_candidate(
+                                &rpc,
+                                &program,
+                                &mut c,
+                                min_liq,
+                                token_policy(&args),
+                            ) {
                                 CheckOutcome::Ready => {
                                     let pool = c.pool.pool_id.to_string();
                                     tracing::info!(target: "discovery", pool = %pool, token = %c.token_mint, checks = c.checks, "pool qualifies — starting trading process");
@@ -1329,12 +1363,40 @@ mod tests {
     }
 
     #[test]
+    fn token_2022_only_reaches_paper_children() {
+        use onchain_risk::TokenPolicy::*;
+        let flag = "--paper-token-2022".to_string();
+        let a = args(&[]);
+        assert_eq!(token_policy(&a), ClassicOnly, "off by default");
+        assert!(!child_args(&a, "P", WSOL, "T").contains(&flag));
+
+        let a = args(&["--paper-token-2022"]);
+        assert!(validate(&a).is_ok());
+        assert_eq!(token_policy(&a), PaperToken2022);
+        assert!(child_args(&a, "P", WSOL, "T").contains(&flag));
+
+        for mode in [
+            &["--mode", "dry-run"][..],
+            &["--mode", "live", "--confirm-live"][..],
+        ] {
+            let mut v = mode.to_vec();
+            v.push("--paper-token-2022");
+            let a = args(&v);
+            assert!(validate(&a).is_err(), "{mode:?}");
+            // Even past `validate`, nothing outside paper gets Token-2022.
+            assert_eq!(token_policy(&a), ClassicOnly);
+            assert!(!child_args(&a, "P", WSOL, "T").contains(&flag));
+        }
+    }
+
+    #[test]
     fn child_env_overrides_cover_every_mode_switch() {
         for k in [
             "SNIPER_PAPER",
             "SNIPER_DRY_RUN",
             "SNIPER_LIVE",
             "SNIPER_CONFIRM_LIVE",
+            "SNIPER_PAPER_TOKEN_2022",
         ] {
             assert!(CHILD_ENV_REMOVE.contains(&k), "{k}");
         }
