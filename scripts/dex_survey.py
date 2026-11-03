@@ -41,6 +41,12 @@ T22_NAMES = {
 GECKO_NEW = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page={page}"
 GECKO_MULTI = "https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/{addrs}"
 MULTI_MAX = 30
+# Pause after a 429 before the next poll.
+RATE_LIMIT_BACKOFF_SECS = 120
+
+
+def is_rate_limited(err):
+    return getattr(err, "code", None) == 429 or "429" in str(err)
 
 
 def parse_time_ms(s):
@@ -217,11 +223,17 @@ def run(args):
     while time.time() < end:
         now = int(time.time() * 1000)
         oldest, ok_pages = None, 0
+        backoff = 0
         for page in range(1, args.pages + 1):
             try:
                 pools, bad = parse_listing(http_get(GECKO_NEW.format(page=page)))
             except (urllib.error.URLError, OSError, ValueError) as e:
                 append(args.out, {"kind": "gecko_error", "t": now, "err": str(e)[:120]})
+                if is_rate_limited(e):
+                    # Stop this poll: more requests only extend the limit
+                    # (the bot's own poller shares the same free quota).
+                    backoff = RATE_LIMIT_BACKOFF_SECS
+                    break
                 time.sleep(5)
                 continue
             ok_pages += 1
@@ -238,10 +250,12 @@ def run(args):
                 append(args.out, rec)
                 if p["mint"] and now - p["created_ms"] <= args.check_after_min * 60_000:
                     tracked[p["pool"]] = dict(p, first_seen=now)
-            time.sleep(2)  # stay well under the public API rate limit
+            time.sleep(3)  # stay well under the public API rate limit
         if ok_pages == args.pages and last_poll_ms and oldest and oldest > last_poll_ms:
             append(args.out, {"kind": "gap", "t": now})
-        if ok_pages:
+        if ok_pages == args.pages:
+            # Only a complete poll covers the window: after a partial one
+            # the next complete poll checks for a gap since the last full.
             last_poll_ms = now
         due = [p for p in tracked.values()
                if now - p["first_seen"] >= args.check_after_min * 60_000]
@@ -270,7 +284,7 @@ def run(args):
                     time.sleep(0.5)
                 append(args.out, rec)
             time.sleep(2)
-        time.sleep(max(0, args.poll_secs - args.pages * 2))
+        time.sleep(max(backoff, args.poll_secs - args.pages * 3))
     append(args.out, {"kind": "end", "t": int(time.time() * 1000)})
 
 
@@ -324,8 +338,8 @@ def main(argv=None):
     ap.add_argument("--out", default="/var/lib/solana-hft/dex_survey.jsonl")
     ap.add_argument("--summary", action="store_true", help="print the summary and exit")
     ap.add_argument("--hours", type=float, default=24)
-    ap.add_argument("--poll-secs", type=int, default=60)
-    ap.add_argument("--pages", type=int, default=5)
+    ap.add_argument("--poll-secs", type=int, default=120)
+    ap.add_argument("--pages", type=int, default=3)
     ap.add_argument("--min-sol", type=float, default=50)
     ap.add_argument("--check-after-min", type=int, default=30)
     ap.add_argument("--env-file", default="/etc/solana-hft/solana-hft.env")
