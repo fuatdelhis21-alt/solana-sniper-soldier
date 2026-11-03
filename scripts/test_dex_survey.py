@@ -65,6 +65,13 @@ class ListingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ds.parse_listing("<html>")
 
+    def test_rate_limit_detection(self):
+        import urllib.error
+        e = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+        self.assertTrue(ds.is_rate_limited(e))
+        self.assertTrue(ds.is_rate_limited(ValueError("HTTP Error 429")))
+        self.assertFalse(ds.is_rate_limited(OSError("timed out")))
+
     def test_sol_estimate(self):
         self.assertEqual(ds.sol_side_estimate(20000, 200), 50)
         self.assertIsNone(ds.sol_side_estimate(None, 200))
