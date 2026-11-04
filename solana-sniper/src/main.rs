@@ -337,6 +337,158 @@ enum PaperDataError {
     Rejected(risk::RejectReason),
 }
 
+/// Paper token gates shared by every AMM, the same functions as live: the
+/// mint/freeze authority check on both mints and, with `--live-risk-data`,
+/// the holder-concentration gate on the token being bought (`vaults` are the
+/// pool's own token accounts, never counted as holders). Returns the sampled
+/// holder count and the top holder share (CLI values without live data).
+fn paper_token_gates(
+    args: &Args,
+    rpc_client: &Arc<RpcClient>,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    vaults: &[Pubkey],
+) -> Result<(u64, f64), PaperDataError> {
+    // 4) Mint/freeze authority rug-check — same as live: a present mint or
+    //    freeze authority rejects the trade (fail-closed).
+    //    Token-2022 metadata-only mints only with --paper-token-2022.
+    let token_policy = token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)
+        .map_err(PaperDataError::Unavailable)?;
+    for mint in [input_mint, output_mint] {
+        match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint, token_policy) {
+            Ok(risk_info) if risk_info.is_risky() => {
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::TokenAuthorityRisk,
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(PaperDataError::Unavailable(format!(
+                    "mint authority check failed for {mint}: {e}"
+                )));
+            }
+        }
+    }
+
+    // 5) Holder concentration with --live-risk-data (same functions as
+    //    live); otherwise the explicit CLI values.
+    let mut holders = args.pool_holders;
+    let mut top_holder_pct: f64 = 0.0;
+    if args.live_risk_data {
+        // Exclude the pool's own vaults (infrastructure accounts resolved by
+        // resolve_swap_accounts) so the pool never counts as a "holder".
+        // Holder risk is measured on the token being BOUGHT (output mint),
+        // never on the pay-side mint (wSOL has no meaningful holder set).
+        let stats = onchain_risk::fetch_holder_stats_cached(rpc_client, &output_mint, vaults)
+            .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
+        // Holder-concentration gate (operator-approved design, fail-closed):
+        // single holder >30% or combined top-20 >70% of supply rejects with
+        // an explicit reason — never a silent no_entry_signal. Unassessable
+        // data (no measurable non-excluded holders) rejects the same way.
+        match onchain_risk::holder_concentration_verdict(&stats) {
+            onchain_risk::HolderVerdict::Ok => {}
+            onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %output_mint,
+                    top_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
+                    threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
+                    "holder concentration gate: single holder exceeds threshold"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+            onchain_risk::HolderVerdict::TopHoldersConcentrated(pct) => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %output_mint,
+                    top20_holder_pct = pct,
+                    program_owned_pct = stats.program_owned_pct,
+                    threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
+                    "holder concentration gate: top-20 holders exceed threshold"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+            onchain_risk::HolderVerdict::Unassessable => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %output_mint,
+                    "holder concentration gate: no measurable holders (fail-closed reject)"
+                );
+                return Err(PaperDataError::Rejected(
+                    risk::RejectReason::HolderConcentrationExceeded,
+                ));
+            }
+        }
+        holders = stats.sampled_holders;
+        top_holder_pct = stats.top_holder_pct;
+    }
+    Ok((holders, top_holder_pct))
+}
+
+/// PumpSwap paper market data: one consistent reading of the pool, both
+/// vaults, the base mint and the fee config (`amm::pumpswap`), then the same
+/// token gates as CLMM. The price is the pool's reserve ratio expressed as a
+/// CLMM-style sqrt price, so exits and P&L run on the unchanged engine; the
+/// liquidity figure is the withdrawable SOL (fees waiting in the vault
+/// excluded) and the fee is the pool's full LP + protocol + creator rate.
+/// Paper only (`validate_amm`); nothing is built, signed or sent.
+fn resolve_pumpswap_market_data(
+    args: &Args,
+    rpc_client: &Arc<RpcClient>,
+    blocklist: &std::collections::HashSet<Pubkey>,
+    pool_id: Pubkey,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+) -> Result<PaperMarketSnapshot, PaperDataError> {
+    let snap = amm::pumpswap::fetch_snapshot(rpc_client, &pool_id)
+        .map_err(|e| PaperDataError::Unavailable(format!("PumpSwap pool read failed: {e}")))?;
+    if input_mint != snap.pool.quote_mint || output_mint != snap.pool.base_mint {
+        return Err(PaperDataError::Unavailable(format!(
+            "PumpSwap pool {pool_id} trades {} for {}; --input-mint must be its quote (wSOL) and --output-mint its base mint",
+            snap.pool.base_mint, snap.pool.quote_mint
+        )));
+    }
+    let current_sqrt_price = amm::pumpswap::sqrt_price_x64(snap.base_reserve, snap.effective_quote)
+        .ok_or_else(|| {
+            PaperDataError::Unavailable("PumpSwap pool has no usable price".to_string())
+        })?;
+    let (holders, top_holder_pct) = paper_token_gates(
+        args,
+        rpc_client,
+        input_mint,
+        output_mint,
+        &[
+            snap.pool.pool_base_token_account,
+            snap.pool.pool_quote_token_account,
+        ],
+    )?;
+    let liquidity_lamports = if args.live_risk_data {
+        snap.real_quote
+    } else {
+        args.pool_liquidity
+    };
+    let live_blocklisted = blocklist.contains(&input_mint) || blocklist.contains(&output_mint);
+    let fee_bps = snap.fees.lp_bps + snap.fees.protocol_bps + snap.fees.creator_bps;
+    Ok(PaperMarketSnapshot {
+        current_sqrt_price,
+        liquidity_lamports,
+        market_cap_lamports: args.pool_market_cap,
+        holders,
+        is_blocklisted: args.pool_blocklisted
+            || live_blocklisted
+            || (args.live_risk_data && top_holder_pct > args.max_top_holder_pct),
+        source: "rpc_poll",
+        // Base is token0 and the paid quote (wSOL) token1.
+        input_is_token0: false,
+        trade_fee_ppm: fee_bps.saturating_mul(100),
+    })
+}
+
 /// AŞAMA 2 — fetch real market data for a paper iteration. Fail-closed: a
 /// fetch error or a stale price never produces a "simulated success"; the
 /// iteration is rejected with the real reason. Paper mode never builds,
@@ -366,6 +518,17 @@ fn resolve_paper_market_data(
         .map_err(|e| PaperDataError::Unavailable(format!("invalid --input-mint: {e}")))?;
     let output_mint = Pubkey::from_str(output_mint_str)
         .map_err(|e| PaperDataError::Unavailable(format!("invalid --output-mint: {e}")))?;
+
+    if args.amm == AmmKind::Pumpswap {
+        return resolve_pumpswap_market_data(
+            args,
+            rpc_client,
+            blocklist,
+            pool_id,
+            input_mint,
+            output_mint,
+        );
+    }
 
     // Same cluster switch as the live path: devnet CLMM program id when the
     // RPC is devnet, the mainnet program id otherwise.
@@ -438,90 +601,22 @@ fn resolve_paper_market_data(
         }
     };
 
-    // 4) Mint/freeze authority rug-check — same as live: a present mint or
-    //    freeze authority rejects the trade (fail-closed).
-    //    Token-2022 metadata-only mints only with --paper-token-2022.
-    let token_policy = token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)
-        .map_err(PaperDataError::Unavailable)?;
-    for mint in [input_mint, output_mint] {
-        match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint, token_policy) {
-            Ok(risk_info) if risk_info.is_risky() => {
-                return Err(PaperDataError::Rejected(
-                    risk::RejectReason::TokenAuthorityRisk,
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(PaperDataError::Unavailable(format!(
-                    "mint authority check failed for {mint}: {e}"
-                )));
-            }
-        }
-    }
-
-    // 5) Real vault liquidity + holder concentration with --live-risk-data
-    //    (same functions as live); otherwise the explicit CLI values.
-    let mut liquidity_lamports = args.pool_liquidity;
-    let mut holders = args.pool_holders;
-    let mut top_holder_pct: f64 = 0.0;
-    if args.live_risk_data {
-        liquidity_lamports = onchain_risk::fetch_vault_liquidity(rpc_client, &accounts.input_vault)
-            .map_err(|e| {
-                PaperDataError::Unavailable(format!("vault liquidity fetch failed: {e}"))
-            })?;
-        // Exclude the pool's own vaults (infrastructure accounts resolved by
-        // resolve_swap_accounts) so the pool never counts as a "holder".
-        // Holder risk is measured on the token being BOUGHT (output mint),
-        // never on the pay-side mint (wSOL has no meaningful holder set).
-        let vaults = [accounts.input_vault, accounts.output_vault];
-        let stats = onchain_risk::fetch_holder_stats_cached(rpc_client, &output_mint, &vaults)
-            .map_err(|e| PaperDataError::Unavailable(format!("holder stats fetch failed: {e}")))?;
-        // Holder-concentration gate (operator-approved design, fail-closed):
-        // single holder >30% or combined top-20 >70% of supply rejects with
-        // an explicit reason — never a silent no_entry_signal. Unassessable
-        // data (no measurable non-excluded holders) rejects the same way.
-        match onchain_risk::holder_concentration_verdict(&stats) {
-            onchain_risk::HolderVerdict::Ok => {}
-            onchain_risk::HolderVerdict::SingleHolderConcentrated(pct) => {
-                tracing::warn!(
-                    target: "paper",
-                    mint = %output_mint,
-                    top_holder_pct = pct,
-                    program_owned_pct = stats.program_owned_pct,
-                    threshold_pct = onchain_risk::MAX_SINGLE_HOLDER_PCT,
-                    "holder concentration gate: single holder exceeds threshold"
-                );
-                return Err(PaperDataError::Rejected(
-                    risk::RejectReason::HolderConcentrationExceeded,
-                ));
-            }
-            onchain_risk::HolderVerdict::TopHoldersConcentrated(pct) => {
-                tracing::warn!(
-                    target: "paper",
-                    mint = %output_mint,
-                    top20_holder_pct = pct,
-                    program_owned_pct = stats.program_owned_pct,
-                    threshold_pct = onchain_risk::MAX_TOP20_HOLDER_PCT,
-                    "holder concentration gate: top-20 holders exceed threshold"
-                );
-                return Err(PaperDataError::Rejected(
-                    risk::RejectReason::HolderConcentrationExceeded,
-                ));
-            }
-            onchain_risk::HolderVerdict::Unassessable => {
-                tracing::warn!(
-                    target: "paper",
-                    mint = %output_mint,
-                    "holder concentration gate: no measurable holders (fail-closed reject)"
-                );
-                return Err(PaperDataError::Rejected(
-                    risk::RejectReason::HolderConcentrationExceeded,
-                ));
-            }
-        }
-        holders = stats.sampled_holders;
-        top_holder_pct = stats.top_holder_pct;
-    }
+    // 4) + 5) Mint/freeze authority and holder concentration (shared with
+    //    the PumpSwap path); real vault liquidity with --live-risk-data.
+    let (holders, top_holder_pct) = paper_token_gates(
+        args,
+        rpc_client,
+        input_mint,
+        output_mint,
+        &[accounts.input_vault, accounts.output_vault],
+    )?;
+    let liquidity_lamports = if args.live_risk_data {
+        onchain_risk::fetch_vault_liquidity(rpc_client, &accounts.input_vault).map_err(|e| {
+            PaperDataError::Unavailable(format!("vault liquidity fetch failed: {e}"))
+        })?
+    } else {
+        args.pool_liquidity
+    };
     let live_blocklisted = blocklist.contains(&input_mint) || blocklist.contains(&output_mint);
     let is_blocklisted = args.pool_blocklisted
         || live_blocklisted
@@ -866,6 +961,27 @@ struct Args {
     /// only.
     #[arg(long, env = "SNIPER_PAPER_TOKEN_2022", default_value_t = false)]
     paper_token_2022: bool,
+
+    /// Pool program of --pool-id. `pumpswap` (pump.fun AMM) is paper only:
+    /// quotes and risk gates are implemented, no swap transaction is.
+    #[arg(long, env = "SNIPER_AMM", value_enum, default_value = "clmm")]
+    amm: AmmKind,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum AmmKind {
+    Clmm,
+    Pumpswap,
+}
+
+/// `--amm pumpswap` is accepted only in paper mode (no swap transaction,
+/// exact-quote simulation or exit path exists for it), and only with the
+/// wSOL input / pool base-mint output orientation.
+fn validate_amm(amm: AmmKind, paper: bool, live: bool, dry_run: bool) -> Result<(), String> {
+    if amm == AmmKind::Pumpswap && (!paper || live || dry_run) {
+        return Err("--amm pumpswap (SNIPER_AMM) is only allowed with --paper".to_string());
+    }
+    Ok(())
 }
 
 impl Args {
@@ -1923,6 +2039,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // requires the same pool/mint arguments as live. Fail-closed: without
     // them paper refuses to start (no synthetic paper pools anymore).
     token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)?;
+    validate_amm(args.amm, args.paper, args.live, args.dry_run)?;
     if args.paper {
         validate_paper_args(
             args.pool_id.as_deref(),
@@ -3786,6 +3903,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pumpswap_is_paper_only() {
+        // (amm, paper, live, dry_run)
+        assert!(validate_amm(AmmKind::Clmm, false, true, false).is_ok());
+        assert!(validate_amm(AmmKind::Pumpswap, true, false, false).is_ok());
+        for (paper, live, dry_run) in [
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            assert!(validate_amm(AmmKind::Pumpswap, paper, live, dry_run).is_err());
+        }
+        let a = Args::try_parse_from(["solana-sniper", "--amm", "pumpswap"]).unwrap();
+        assert_eq!(a.amm, AmmKind::Pumpswap);
+        let a = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert_eq!(a.amm, AmmKind::Clmm, "default stays CLMM");
+    }
 
     #[test]
     fn token_2022_is_paper_only_and_off_by_default() {

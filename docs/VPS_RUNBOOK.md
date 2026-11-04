@@ -244,6 +244,20 @@ journalctl -u solana-hft-sniper --since "24 hours ago" --no-pager \
   | grep -oE 'Token-2022 extension [A-Za-z]+ \([0-9]+\)' | sort | uniq -c | sort -rn
 ```
 
+PumpSwap paper run on one pool (2026-11, manual; discovery does not start
+PumpSwap pools yet). Paper only, nothing is sent:
+
+```bash
+# The env file supplies the RPC; per-run settings are unset so they cannot
+# switch the mode. Secrets stay out of the command line.
+systemd-run --wait --pipe --collect \
+  -p EnvironmentFile=/etc/solana-hft/solana-hft.env \
+  -p "UnsetEnvironment=SNIPER_DRY_RUN SNIPER_LIVE SNIPER_CONFIRM_LIVE SNIPER_POOL_ID SNIPER_INPUT_MINT SNIPER_OUTPUT_MINT SNIPER_ITERATIONS SNIPER_DATA_DIR SNIPER_SINGLE_TRADE SNIPER_ENTRY_WINDOW_SECS SNIPER_AMM" \
+  /opt/solana-hft/bin/solana-sniper --paper --amm pumpswap --live-risk-data \
+  --pool-id <PUMPSWAP_POOL> --input-mint So11111111111111111111111111111111111111112 \
+  --output-mint <BASE_MINT> --iterations 12 --data-dir /tmp/pumpswap-paper
+```
+
 Report Token-2022 paper trades separately before drawing any conclusion: the
 pool's token program is part of the pool, not of the decision record, so
 compare by pool id against the discovery log.

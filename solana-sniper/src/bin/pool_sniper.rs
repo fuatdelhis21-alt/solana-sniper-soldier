@@ -454,6 +454,8 @@ const CHILD_ENV_REMOVE: &[&str] = &[
     "SNIPER_MAX_HOLD_SECS",
     "SNIPER_LIVE_RISK_DATA",
     "SNIPER_PAPER_TOKEN_2022",
+    // Children trade CLMM pools; a shared env file must not switch them.
+    "SNIPER_AMM",
 ];
 
 fn child_args(args: &Args, pool: &str, input_mint: &str, output_mint: &str) -> Vec<String> {
@@ -1397,6 +1399,7 @@ mod tests {
             "SNIPER_LIVE",
             "SNIPER_CONFIRM_LIVE",
             "SNIPER_PAPER_TOKEN_2022",
+            "SNIPER_AMM",
         ] {
             assert!(CHILD_ENV_REMOVE.contains(&k), "{k}");
         }
