@@ -68,7 +68,13 @@ Remaining, by dependency path — a fix needs a Solana 3.x / warp 0.4 migration:
 
 ## Not implemented (documented, not hidden)
 
-- Discovery backfill after a stream gap; news/sentiment; other DEXes.
+- Discovery backfill after a stream gap; news/sentiment.
+- Other DEXes. PumpSwap (2026-11 survey: ~19× more liquid, mint-clean new SOL
+  pools per day than Raydium CLMM) is in progress, paper only:
+  `amm/pumpswap.rs` decodes `Pool` / pump-fees `FeeConfig` and quotes
+  exact-in buys and sells, matching the official SDK's mainnet goldens (**U**).
+  Not wired into discovery or the paper engine yet; no swap instruction, no
+  dry-run, no live.
 - Paper simulation of failed exits / MEV beyond the labelled stress case.
 - Persistence of an open **paper** position across restarts.
 
