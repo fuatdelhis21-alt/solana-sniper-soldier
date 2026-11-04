@@ -357,6 +357,8 @@ impl DiscoveryState {
 
 /// GeckoTerminal's DEX id of Raydium CLMM.
 pub const GECKO_CLMM_DEX_ID: &str = "raydium-clmm";
+/// GeckoTerminal's DEX id of PumpSwap pools.
+pub const GECKO_PUMPSWAP_DEX_ID: &str = "pumpswap";
 
 /// One page of a GeckoTerminal pools listing, reduced to what discovery
 /// needs. GeckoTerminal is only a *hint*: every pool it names is fetched

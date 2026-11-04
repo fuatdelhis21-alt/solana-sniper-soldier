@@ -467,6 +467,34 @@ pub struct PumpSnapshot {
     pub fees: Fees,
 }
 
+/// Only canonical pump.fun pools are traded: created by the pump program's
+/// `pool-authority` PDA of the base mint at migration, base = the token and
+/// quote = wSOL. Pools anyone can create by hand (any other creator, or a
+/// reversed wSOL/token pair) are rejected: their creator keeps the LP
+/// tokens and can pull the liquidity. Error texts start with "not a
+/// canonical" (a final rejection for discovery).
+pub fn require_canonical(p: &PumpPool) -> Result<(), String> {
+    if p.quote_mint != Pubkey::from_str(WSOL_MINT).unwrap() {
+        return Err(format!(
+            "not a canonical pump.fun pool: quote mint {} is not wSOL",
+            p.quote_mint
+        ));
+    }
+    if p.creator != pump_pool_authority(&p.base_mint) {
+        return Err(format!(
+            "not a canonical pump.fun pool: created by {}, not the pump pool authority",
+            p.creator
+        ));
+    }
+    Ok(())
+}
+
+/// True for a read failure worth retrying (RPC error, account not visible
+/// yet), as opposed to data that was read and is not a usable pool.
+pub fn transient_read_error(e: &str) -> bool {
+    e.starts_with("failed to fetch PumpSwap") || e.starts_with("PumpSwap account ")
+}
+
 /// Raw account as `(owner, data)`.
 pub type RawAccount<'a> = (&'a Pubkey, &'a [u8]);
 
@@ -480,6 +508,7 @@ pub fn build_snapshot(
     fee_config: RawAccount,
 ) -> Result<PumpSnapshot, String> {
     let p = parse_pool(pool.0, pool.1)?;
+    require_canonical(&p)?;
     let base_reserve = vault_balance(base_vault.0, base_vault.1, &p.base_mint, pool_id)?;
     let quote_vault_amount = vault_balance(quote_vault.0, quote_vault.1, &p.quote_mint, pool_id)?;
     let base_supply = mint_supply(base_mint.0, base_mint.1)?;
@@ -523,12 +552,17 @@ pub fn fetch_snapshot(
                 .get_account(pool_id)
                 .map_err(|e| format!("failed to fetch PumpSwap pool {pool_id}: {e}"))?;
             let p = parse_pool(&acc.owner, &acc.data)?;
+            require_canonical(&p)?;
             let v = (
                 p.pool_base_token_account,
                 p.pool_quote_token_account,
                 p.base_mint,
             );
-            vault_cache().lock().unwrap().insert(*pool_id, v);
+            let mut cache = vault_cache().lock().unwrap();
+            if cache.len() >= 10_000 {
+                cache.clear(); // only an RPC saving; bounded for long runs
+            }
+            cache.insert(*pool_id, v);
             v
         }
     };
@@ -911,6 +945,37 @@ mod tests {
             (&fp, &cfg)
         )
         .is_err());
+        // Hand-made pools (other creator, or reversed wSOL/token) rejected.
+        let mut hand_made = pd.clone();
+        hand_made[11..43].copy_from_slice(Pubkey::new_unique().as_ref());
+        let e = build_snapshot(
+            &pool_id,
+            (&amm, &hand_made),
+            (&spl, &base),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg),
+        )
+        .unwrap_err();
+        assert!(e.starts_with("not a canonical"), "{e}");
+        let mut reversed = pd.clone();
+        reversed[43..75].copy_from_slice(wsol.as_ref());
+        reversed[75..107].copy_from_slice(base_mint.as_ref());
+        let e = build_snapshot(
+            &pool_id,
+            (&amm, &reversed),
+            (&spl, &base),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg),
+        )
+        .unwrap_err();
+        assert!(e.starts_with("not a canonical"), "{e}");
+        assert!(transient_read_error(
+            "failed to fetch PumpSwap pool X: timeout"
+        ));
+        assert!(transient_read_error("PumpSwap account X not found"));
+        assert!(!transient_read_error(&e));
         // Waiting fees larger than the vault: inconsistent data.
         let tiny = token_account(&wsol, &pool_id, 1_000_000_000);
         assert!(build_snapshot(

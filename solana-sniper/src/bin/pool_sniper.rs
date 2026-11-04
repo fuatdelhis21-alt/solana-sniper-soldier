@@ -29,11 +29,12 @@ use solana_rpc_client_api::config::{
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sniper::amm::account_resolver;
+use solana_sniper::amm::pumpswap;
 use solana_sniper::onchain_risk;
 use solana_sniper::pool_discovery::{
     find_create_pools, logs_contain_create_pool, parse_gecko_pools, resolve_indexes, token_side,
     BoundedSet, Candidate, CheckOutcome, DiscoveryState, NewPool, PendingSignatures,
-    RawInstruction, WatchList, GECKO_CLMM_DEX_ID,
+    RawInstruction, WatchList, GECKO_CLMM_DEX_ID, GECKO_PUMPSWAP_DEX_ID,
 };
 use solana_sniper::position::{LivePosition, PendingEntry};
 use solana_sniper::redact::RedactingMakeWriter;
@@ -60,6 +61,14 @@ impl Mode {
             Mode::Live => "--live",
         }
     }
+}
+
+/// Which pools discovery hands to trading processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DiscoveryAmm {
+    Clmm,
+    /// Canonical pump.fun PumpSwap pools; paper only, GeckoTerminal only.
+    Pumpswap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -151,6 +160,11 @@ struct Args {
     /// tokens only.
     #[arg(long, env = "SNIPER_PAPER_TOKEN_2022", default_value_t = false)]
     paper_token_2022: bool,
+
+    /// Pool program to trade. `pumpswap` (canonical pump.fun pools) needs
+    /// --mode paper and --discovery-source geckoterminal.
+    #[arg(long, env = "SNIPER_DISCOVERY_AMM", value_enum, default_value = "clmm")]
+    amm: DiscoveryAmm,
 
     /// Sell an open position after this many seconds (passed to the child).
     #[arg(long, env = "SNIPER_DISCOVERY_MAX_HOLD_SECS", default_value_t = 3600)]
@@ -406,6 +420,14 @@ fn validate(args: &Args) -> Result<(), String> {
             "--mode live requires --confirm-live (SNIPER_DISCOVERY_CONFIRM_LIVE=true)".into(),
         );
     }
+    if args.amm == DiscoveryAmm::Pumpswap
+        && (args.mode != Mode::Paper || args.discovery_source != Source::Geckoterminal)
+    {
+        return Err(
+            "--amm pumpswap (SNIPER_DISCOVERY_AMM) needs --mode paper and --discovery-source geckoterminal"
+                .into(),
+        );
+    }
     if args.paper_token_2022 && args.mode != Mode::Paper {
         return Err(
             "--paper-token-2022 (SNIPER_PAPER_TOKEN_2022) is only allowed with --mode paper".into(),
@@ -480,6 +502,10 @@ fn child_args(args: &Args, pool: &str, input_mint: &str, output_mint: &str) -> V
     v.push("--live-risk-data".into());
     if token_policy(args) == onchain_risk::TokenPolicy::PaperToken2022 {
         v.push("--paper-token-2022".into());
+    }
+    if args.amm == DiscoveryAmm::Pumpswap && args.mode == Mode::Paper {
+        v.push("--amm".into());
+        v.push("pumpswap".into());
     }
     v
 }
@@ -663,6 +689,7 @@ fn spawn_log_listener(
 /// HTTP request per page, a bounded channel and a bounded dedup set.
 #[allow(clippy::too_many_arguments)]
 fn spawn_gecko_poller(
+    dex_id: &'static str,
     url: String,
     pages: u32,
     poll_secs: u64,
@@ -714,9 +741,7 @@ fn spawn_gecko_poller(
                         .and_then(|r| r.error_for_status())
                         .and_then(|r| r.text())
                         .map_err(|e| error_chain(&e))
-                        .and_then(|b| {
-                            parse_gecko_pools(&b, GECKO_CLMM_DEX_ID, now_ms(), max_age_ms)
-                        })
+                        .and_then(|b| parse_gecko_pools(&b, dex_id, now_ms(), max_age_ms))
                 };
                 // The free API answers an occasional 429; one retry a few
                 // seconds later usually passes and avoids a needless gap.
@@ -862,6 +887,71 @@ fn resolve_signature(
     Ok(Some(find_create_pools(program, &raw)))
 }
 
+/// Verify a pool named by GeckoTerminal on-chain: a CLMM PoolState, or a
+/// canonical pump.fun PumpSwap pool (owner, discriminator, vaults, mint).
+fn read_listed_pool(
+    rpc: &RpcClient,
+    program: &Pubkey,
+    amm: DiscoveryAmm,
+    pk: &Pubkey,
+) -> Result<NewPool, String> {
+    match amm {
+        DiscoveryAmm::Clmm => {
+            let state = account_resolver::fetch_pool_state(rpc, pk, program)?;
+            Ok(NewPool {
+                pool_id: *pk,
+                mint_0: state.token_mint_0,
+                mint_1: state.token_mint_1,
+            })
+        }
+        DiscoveryAmm::Pumpswap => {
+            let snap = pumpswap::fetch_snapshot(rpc, pk)?;
+            Ok(NewPool {
+                pool_id: *pk,
+                mint_0: snap.pool.base_mint,
+                mint_1: snap.pool.quote_mint,
+            })
+        }
+    }
+}
+
+/// SOL-side liquidity of a watched pool: the wSOL vault of a CLMM pool, the
+/// withdrawable SOL of a PumpSwap pool. `Err(Ok(reason))` = retry later,
+/// `Err(Err(reason))` = reject.
+fn candidate_sol_liquidity(
+    rpc: &RpcClient,
+    program: &Pubkey,
+    amm: DiscoveryAmm,
+    c: &Candidate,
+) -> Result<u64, Result<String, String>> {
+    let wsol = Pubkey::from_str(WSOL).unwrap();
+    match amm {
+        DiscoveryAmm::Pumpswap => match pumpswap::fetch_snapshot(rpc, &c.pool.pool_id) {
+            Ok(s) if s.pool.base_mint == c.token_mint => Ok(s.real_quote),
+            Ok(_) => Err(Err(
+                "PumpSwap pool base mint does not match the listing".into()
+            )),
+            Err(e) if pumpswap::transient_read_error(&e) => Err(Ok(e)),
+            Err(e) => Err(Err(e)),
+        },
+        DiscoveryAmm::Clmm => {
+            let pool =
+                account_resolver::fetch_pool_state(rpc, &c.pool.pool_id, program).map_err(Ok)?;
+            let sol_vault = if pool.token_mint_0 == wsol && pool.token_mint_1 == c.token_mint {
+                pool.token_vault_0
+            } else if pool.token_mint_1 == wsol && pool.token_mint_0 == c.token_mint {
+                pool.token_vault_1
+            } else {
+                return Err(Err("pool state mints do not match CreatePool".into()));
+            };
+            if pool.liquidity == 0 {
+                return Err(Ok("no in-range liquidity yet".into()));
+            }
+            onchain_risk::fetch_vault_liquidity(rpc, &sol_vault).map_err(Ok)
+        }
+    }
+}
+
 /// Pre-filter one watched pool (cheap; the child re-checks everything).
 fn check_candidate(
     rpc: &RpcClient,
@@ -869,6 +959,7 @@ fn check_candidate(
     c: &mut Candidate,
     min_liq_lamports: u64,
     policy: onchain_risk::TokenPolicy,
+    amm: DiscoveryAmm,
 ) -> CheckOutcome {
     if !c.mint_ok {
         match onchain_risk::fetch_mint_authority_risk(rpc, &c.token_mint, policy) {
@@ -883,29 +974,15 @@ fn check_candidate(
             Err(e) => return CheckOutcome::Retry(e),
         }
     }
-    let pool = match account_resolver::fetch_pool_state(rpc, &c.pool.pool_id, program) {
-        Ok(p) => p,
-        Err(e) => return CheckOutcome::Retry(e),
-    };
-    let wsol = Pubkey::from_str(WSOL).unwrap();
-    let sol_vault = if pool.token_mint_0 == wsol && pool.token_mint_1 == c.token_mint {
-        pool.token_vault_0
-    } else if pool.token_mint_1 == wsol && pool.token_mint_0 == c.token_mint {
-        pool.token_vault_1
-    } else {
-        return CheckOutcome::Reject("pool state mints do not match CreatePool".into());
-    };
-    if pool.liquidity == 0 {
-        return CheckOutcome::Retry("no in-range liquidity yet".into());
-    }
-    match onchain_risk::fetch_vault_liquidity(rpc, &sol_vault) {
+    match candidate_sol_liquidity(rpc, program, amm, c) {
         Ok(l) if l >= min_liq_lamports => CheckOutcome::Ready,
         Ok(l) => CheckOutcome::Retry(format!(
             "SOL liquidity {:.2} < {:.2}",
             l as f64 / 1e9,
             min_liq_lamports as f64 / 1e9
         )),
-        Err(e) => CheckOutcome::Retry(e),
+        Err(Ok(e)) => CheckOutcome::Retry(e),
+        Err(Err(e)) => CheckOutcome::Reject(e),
     }
 }
 
@@ -1006,6 +1083,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Source::Geckoterminal => {
             tracing::info!(target: "discovery", pages = args.gecko_pages, poll_secs = args.poll_secs, "discovery source: GeckoTerminal new-pools listing (pools verified on-chain)");
             spawn_gecko_poller(
+                match args.amm {
+                    DiscoveryAmm::Clmm => GECKO_CLMM_DEX_ID,
+                    DiscoveryAmm::Pumpswap => GECKO_PUMPSWAP_DEX_ID,
+                },
                 args.gecko_url.clone(),
                 args.gecko_pages,
                 args.poll_secs,
@@ -1138,24 +1219,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             reads += 1;
-            match account_resolver::fetch_pool_state(&rpc, &pk, &program) {
-                Ok(state) => {
-                    let p = NewPool {
-                        pool_id: pk,
-                        mint_0: state.token_mint_0,
-                        mint_1: state.token_mint_1,
-                    };
-                    match token_side(&p, &wsol) {
-                        Some(token) => {
-                            if watch.add(p, token, now_ms()) {
-                                bump(&status.pools_watched);
-                                tracing::info!(target: "discovery", pool = %p.pool_id, token = %token, watched = watch.len(), "new wSOL pool on watch list");
-                            }
+            match read_listed_pool(&rpc, &program, args.amm, &pk) {
+                Ok(p) => match token_side(&p, &wsol) {
+                    Some(token) => {
+                        if watch.add(p, token, now_ms()) {
+                            bump(&status.pools_watched);
+                            tracing::info!(target: "discovery", pool = %p.pool_id, token = %token, watched = watch.len(), "new wSOL pool on watch list");
                         }
-                        None => bump(&status.pools_not_wsol),
                     }
-                }
-                Err(e) if transient_pool_read_error(&e) => {
+                    None => bump(&status.pools_not_wsol),
+                },
+                Err(e) if transient_pool_read_error(&e) || pumpswap::transient_read_error(&e) => {
                     let failures = failures.saturating_add(1);
                     match listed_retry_delay_ms(failures) {
                         Some(delay) => {
@@ -1273,6 +1347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &mut c,
                                 min_liq,
                                 token_policy(&args),
+                                args.amm,
                             ) {
                                 CheckOutcome::Ready => {
                                     let pool = c.pool.pool_id.to_string();
@@ -1362,6 +1437,31 @@ mod tests {
             &v[..2],
             &["--live".to_string(), "--confirm-live".to_string()]
         );
+    }
+
+    #[test]
+    fn pumpswap_discovery_is_paper_and_geckoterminal_only() {
+        let gecko = ["--discovery-source", "geckoterminal"];
+        let mut v = gecko.to_vec();
+        v.extend(["--amm", "pumpswap"]);
+        let a = args(&v);
+        assert!(validate(&a).is_ok());
+        let c = child_args(&a, "P", WSOL, "T");
+        let pos = c.iter().position(|x| x == "--amm").unwrap();
+        assert_eq!(c[pos + 1], "pumpswap");
+        assert_eq!(c[0], "--paper");
+        // Needs the GeckoTerminal source (the CLMM log stream has no PumpSwap pools).
+        assert!(validate(&args(&["--amm", "pumpswap"])).is_err());
+        // Never outside paper.
+        for mode in ["dry-run", "live"] {
+            let mut v = gecko.to_vec();
+            v.extend(["--amm", "pumpswap", "--mode", mode, "--confirm-live"]);
+            assert!(validate(&args(&v)).is_err(), "{mode}");
+        }
+        // Default: CLMM, no --amm passed to children.
+        let a = args(&gecko);
+        assert_eq!(a.amm, DiscoveryAmm::Clmm);
+        assert!(!child_args(&a, "P", WSOL, "T").contains(&"--amm".to_string()));
     }
 
     #[test]

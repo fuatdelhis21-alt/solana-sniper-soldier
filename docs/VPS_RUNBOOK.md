@@ -244,15 +244,31 @@ journalctl -u solana-hft-sniper --since "24 hours ago" --no-pager \
   | grep -oE 'Token-2022 extension [A-Za-z]+ \([0-9]+\)' | sort | uniq -c | sort -rn
 ```
 
-PumpSwap paper run on one pool (2026-11, manual; discovery does not start
-PumpSwap pools yet). Paper only, nothing is sent:
+PumpSwap in paper (2026-11, opt-in). Only canonical pump.fun pools are
+traded (created by the pump `pool-authority` PDA at migration, token/wSOL);
+hand-made pools are rejected because their creator can pull the liquidity.
+Discovery of PumpSwap pools instead of CLMM pools:
+
+```bash
+# /etc/solana-hft/solana-hft.env
+SNIPER_DISCOVERY_SOURCE=geckoterminal
+SNIPER_DISCOVERY_AMM=pumpswap        # pool-sniper refuses it outside paper
+# then
+systemctl restart solana-hft-sniper
+journalctl -u solana-hft-sniper -f | grep -E "watch list|qualifies|rejected"
+```
+
+Note: the lowest PumpSwap fee tier is 1.25 % per side (≈ 2.5 % round trip);
+the paper cost model charges the pool's full rate on both legs.
+
+Manual paper run on one pool. Paper only, nothing is sent:
 
 ```bash
 # The env file supplies the RPC; per-run settings are unset so they cannot
 # switch the mode. Secrets stay out of the command line.
 systemd-run --wait --pipe --collect \
   -p EnvironmentFile=/etc/solana-hft/solana-hft.env \
-  -p "UnsetEnvironment=SNIPER_DRY_RUN SNIPER_LIVE SNIPER_CONFIRM_LIVE SNIPER_POOL_ID SNIPER_INPUT_MINT SNIPER_OUTPUT_MINT SNIPER_ITERATIONS SNIPER_DATA_DIR SNIPER_SINGLE_TRADE SNIPER_ENTRY_WINDOW_SECS SNIPER_AMM" \
+  -p "UnsetEnvironment=SNIPER_DRY_RUN SNIPER_LIVE SNIPER_CONFIRM_LIVE SNIPER_SIMULATE_PAYER SNIPER_POOL_ID SNIPER_INPUT_MINT SNIPER_OUTPUT_MINT SNIPER_ITERATIONS SNIPER_DATA_DIR SNIPER_SINGLE_TRADE SNIPER_ENTRY_WINDOW_SECS SNIPER_AMM SNIPER_METRICS_ADDR" \
   /opt/solana-hft/bin/solana-sniper --paper --amm pumpswap --live-risk-data \
   --pool-id <PUMPSWAP_POOL> --input-mint So11111111111111111111111111111111111111112 \
   --output-mint <BASE_MINT> --iterations 12 --data-dir /tmp/pumpswap-paper

@@ -76,8 +76,13 @@ Remaining, by dependency path — a fix needs a Solana 3.x / warp 0.4 migration:
   The paper engine runs on a PumpSwap pool with `--amm pumpswap` (pool, both
   vaults, base mint and fee config read together and checked; price = reserve
   ratio; liquidity = withdrawable SOL; fee = full LP + protocol + creator
-  rate; same token gates) (**U**). **—** not run on the VPS yet. Not wired into
-  discovery yet; no swap instruction, no dry-run, no live.
+  rate; same token gates) (**U**). Only canonical pump.fun pools (pump
+  `pool-authority` creator, token/wSOL) are accepted (**U**). Discovery:
+  `SNIPER_DISCOVERY_AMM=pumpswap` with the GeckoTerminal source, paper only
+  (**U**). **O** 2026-11-04 manual paper run on two live pools: all accounts
+  read and verified; one rejected by the holder gate (top-20 76 %), one
+  rejected as a reversed (non-canonical) pool. No swap instruction, no
+  dry-run, no live.
 - Paper simulation of failed exits / MEV beyond the labelled stress case.
 - Persistence of an open **paper** position across restarts.
 
