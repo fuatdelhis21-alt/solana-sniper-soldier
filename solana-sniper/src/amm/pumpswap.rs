@@ -385,6 +385,181 @@ pub fn sell_exact_base_in(
     u64::try_from(out).map_err(|_| "quote output out of range".into())
 }
 
+/// Classic SPL Token and Token-2022 program ids (owners of token accounts
+/// and mints a PumpSwap pool may use).
+const TOKEN_PROGRAMS: [&str; 2] = [
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+];
+
+fn is_token_program(owner: &Pubkey) -> bool {
+    TOKEN_PROGRAMS
+        .iter()
+        .any(|p| Pubkey::from_str(p).unwrap() == *owner)
+}
+
+/// Balance of a pool vault, checked to be an initialized (not frozen) token
+/// account of `mint` owned by `authority` under a token program.
+pub fn vault_balance(
+    program_owner: &Pubkey,
+    data: &[u8],
+    mint: &Pubkey,
+    authority: &Pubkey,
+) -> Result<u64, String> {
+    if !is_token_program(program_owner) {
+        return Err(format!(
+            "vault is owned by {program_owner}, not a token program"
+        ));
+    }
+    if data.len() < 165 {
+        return Err("vault is not a token account (size)".into());
+    }
+    if pubkey_at(data, 0) != *mint {
+        return Err("vault holds a different mint".into());
+    }
+    if pubkey_at(data, 32) != *authority {
+        return Err("vault is not owned by the pool".into());
+    }
+    if data[108] != 1 {
+        return Err("vault is not an initialized, unfrozen token account".into());
+    }
+    Ok(u64_at(data, 64))
+}
+
+/// Supply of a mint account under a token program (base layout).
+pub fn mint_supply(program_owner: &Pubkey, data: &[u8]) -> Result<u64, String> {
+    if !is_token_program(program_owner) {
+        return Err(format!(
+            "mint is owned by {program_owner}, not a token program"
+        ));
+    }
+    if data.len() < 82 || data[45] != 1 {
+        return Err("mint account is not an initialized mint".into());
+    }
+    Ok(u64_at(data, 36))
+}
+
+/// Pool price as a CLMM-style `sqrt_price_x64` (base = token0, quote =
+/// token1, so the value is sqrt(quote per base) * 2^64). Lets the existing
+/// paper engine (price ratio, exits, P&L) run unchanged on PumpSwap.
+/// `None` when a reserve is zero or the price rounds to zero.
+pub fn sqrt_price_x64(base_reserve: u64, effective_quote: u64) -> Option<u128> {
+    if base_reserve == 0 || effective_quote == 0 {
+        return None;
+    }
+    // sqrt(q / b) * 2^64 = sqrt(q * 2^64 / b) * 2^32 (q * 2^64 fits a u128).
+    let r = ((effective_quote as u128) << 64) / base_reserve as u128;
+    (r > 0).then(|| r.isqrt() << 32)
+}
+
+/// One consistent PumpSwap reading for a paper iteration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpSnapshot {
+    pub pool: PumpPool,
+    pub base_reserve: u64,
+    pub quote_vault: u64,
+    /// Price-side quote reserves (vault + signed virtual reserves).
+    pub effective_quote: u64,
+    /// Withdrawable SOL: vault minus the fees waiting in it (what a sell is
+    /// paid from; the liquidity figure for the risk gates).
+    pub real_quote: u64,
+    pub base_supply: u64,
+    pub fees: Fees,
+}
+
+/// Raw account as `(owner, data)`.
+pub type RawAccount<'a> = (&'a Pubkey, &'a [u8]);
+
+/// Build a [`PumpSnapshot`] from accounts read together (pure, fail-closed).
+pub fn build_snapshot(
+    pool_id: &Pubkey,
+    pool: RawAccount,
+    base_vault: RawAccount,
+    quote_vault: RawAccount,
+    base_mint: RawAccount,
+    fee_config: RawAccount,
+) -> Result<PumpSnapshot, String> {
+    let p = parse_pool(pool.0, pool.1)?;
+    let base_reserve = vault_balance(base_vault.0, base_vault.1, &p.base_mint, pool_id)?;
+    let quote_vault_amount = vault_balance(quote_vault.0, quote_vault.1, &p.quote_mint, pool_id)?;
+    let base_supply = mint_supply(base_mint.0, base_mint.1)?;
+    let config = parse_fee_config(fee_config.0, fee_config.1)?;
+    let effective_quote = effective_quote_reserves(quote_vault_amount, p.virtual_quote_reserves)?;
+    let real_quote = quote_vault_amount
+        .checked_sub(p.protocol_fees.saturating_add(p.creator_fees))
+        .ok_or("fees waiting in the vault exceed its balance")?;
+    let fees = pool_fees(&p, &config, base_supply, base_reserve, effective_quote)?;
+    Ok(PumpSnapshot {
+        pool: p,
+        base_reserve,
+        quote_vault: quote_vault_amount,
+        effective_quote,
+        real_quote,
+        base_supply,
+        fees,
+    })
+}
+
+type VaultCache = std::sync::Mutex<std::collections::HashMap<Pubkey, (Pubkey, Pubkey, Pubkey)>>;
+
+fn vault_cache() -> &'static VaultCache {
+    static CACHE: std::sync::OnceLock<VaultCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Read a pool's current state in one `getMultipleAccounts` (pool, both
+/// vaults, base mint, FeeConfig). The vault and mint addresses are learned
+/// once from the pool account; every reading re-checks them against the
+/// pool read in the same call.
+pub fn fetch_snapshot(
+    rpc: &solana_rpc_client::rpc_client::RpcClient,
+    pool_id: &Pubkey,
+) -> Result<PumpSnapshot, String> {
+    let cached = vault_cache().lock().unwrap().get(pool_id).copied();
+    let (base_vault, quote_vault, base_mint) = match cached {
+        Some(v) => v,
+        None => {
+            let acc = rpc
+                .get_account(pool_id)
+                .map_err(|e| format!("failed to fetch PumpSwap pool {pool_id}: {e}"))?;
+            let p = parse_pool(&acc.owner, &acc.data)?;
+            let v = (
+                p.pool_base_token_account,
+                p.pool_quote_token_account,
+                p.base_mint,
+            );
+            vault_cache().lock().unwrap().insert(*pool_id, v);
+            v
+        }
+    };
+    let keys = [
+        *pool_id,
+        base_vault,
+        quote_vault,
+        base_mint,
+        fee_config_address(),
+    ];
+    let accs = crate::rpc_util::get_multiple_accounts_adaptive(rpc, &keys)
+        .map_err(|e| format!("failed to fetch PumpSwap accounts for {pool_id}: {e}"))?;
+    let get = |i: usize| {
+        accs[i]
+            .as_ref()
+            .map(|a| (&a.owner, a.data.as_slice()))
+            .ok_or_else(|| format!("PumpSwap account {} not found", keys[i]))
+    };
+    let snap = build_snapshot(pool_id, get(0)?, get(1)?, get(2)?, get(3)?, get(4)?)?;
+    if (
+        snap.pool.pool_base_token_account,
+        snap.pool.pool_quote_token_account,
+        snap.pool.base_mint,
+    ) != (base_vault, quote_vault, base_mint)
+    {
+        vault_cache().lock().unwrap().remove(pool_id);
+        return Err("PumpSwap pool accounts changed since they were cached".into());
+    }
+    Ok(snap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +800,142 @@ mod tests {
                 .contains("real quote reserves")
         );
         assert!(sell_exact_base_in(1, 1, 1, 0, 2, Fees::default()).is_err());
+    }
+
+    fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 165];
+        d[..32].copy_from_slice(mint.as_ref());
+        d[32..64].copy_from_slice(owner.as_ref());
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d[108] = 1;
+        d
+    }
+
+    fn mint_account(supply: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 82];
+        d[36..44].copy_from_slice(&supply.to_le_bytes());
+        d[45] = 1;
+        d
+    }
+
+    #[test]
+    fn snapshot_checks_every_account_and_prices_like_the_quotes() {
+        let spl = Pubkey::from_str(TOKEN_PROGRAMS[0]).unwrap();
+        let amm = Pubkey::from_str(PUMP_AMM_PROGRAM).unwrap();
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let wsol = Pubkey::from_str(WSOL_MINT).unwrap();
+        let (bv, qv) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut pd = vec![0u8; POOL_LEN];
+        pd[..8].copy_from_slice(&POOL_DISCRIMINATOR);
+        pd[11..43].copy_from_slice(pump_pool_authority(&base_mint).as_ref());
+        pd[43..75].copy_from_slice(base_mint.as_ref());
+        pd[75..107].copy_from_slice(wsol.as_ref());
+        pd[139..171].copy_from_slice(bv.as_ref());
+        pd[171..203].copy_from_slice(qv.as_ref());
+        pd[211..243].copy_from_slice(Pubkey::new_unique().as_ref());
+        pd[245..261].copy_from_slice(&(-2_000_000_000i128).to_le_bytes());
+        pd[271..279].copy_from_slice(&1_500_000_000u64.to_le_bytes());
+        pd[279..287].copy_from_slice(&500_000_000u64.to_le_bytes());
+        let base = token_account(&base_mint, &pool_id, 500_000_000_000_000);
+        let quote = token_account(&wsol, &pool_id, 52_000_000_000);
+        let mint = mint_account(1_000_000_000_000_000);
+        let b64 = include_str!("fixtures/pumpswap_fee_config_mainnet.b64").trim();
+        let cfg = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let fp = fee_program();
+        let snap = build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &base),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg),
+        )
+        .unwrap();
+        // 52 SOL in the vault, 2 SOL of it waiting fees.
+        assert_eq!(snap.effective_quote, 50_000_000_000);
+        assert_eq!(snap.real_quote, 50_000_000_000);
+        // Market cap 100 SOL -> first tier.
+        assert_eq!(snap.fees, fees(2, 93, 30));
+
+        // Wrong vault owner, mint, frozen vault, foreign program: errors.
+        let other = token_account(&base_mint, &Pubkey::new_unique(), 1);
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &other),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+        let wrong_mint = token_account(&Pubkey::new_unique(), &pool_id, 1);
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &wrong_mint),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+        let mut frozen = base.clone();
+        frozen[108] = 2;
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &frozen),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+        let rogue = Pubkey::new_unique();
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&rogue, &base),
+            (&spl, &quote),
+            (&spl, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &base),
+            (&spl, &quote),
+            (&rogue, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+        // Waiting fees larger than the vault: inconsistent data.
+        let tiny = token_account(&wsol, &pool_id, 1_000_000_000);
+        assert!(build_snapshot(
+            &pool_id,
+            (&amm, &pd),
+            (&spl, &base),
+            (&spl, &tiny),
+            (&spl, &mint),
+            (&fp, &cfg)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sqrt_price_follows_the_reserve_ratio() {
+        assert!(sqrt_price_x64(0, 1).is_none());
+        assert!(sqrt_price_x64(1, 0).is_none());
+        // 1 quote per base -> 2^64.
+        assert_eq!(sqrt_price_x64(1_000, 1_000), Some(1u128 << 64));
+        // Quote reserves x4 -> sqrt price x2 -> the engine's price ratio x4.
+        let a = sqrt_price_x64(500_000_000_000_000, 50_000_000_000).unwrap();
+        let b = sqrt_price_x64(500_000_000_000_000, 200_000_000_000).unwrap();
+        let ratio = crate::strategy::price_ratio_scaled(a, b).unwrap();
+        let four = 4 * crate::strategy::RATIO_SCALE;
+        assert!(ratio.abs_diff(four) * 1_000_000 < four, "{ratio}");
     }
 
     #[test]

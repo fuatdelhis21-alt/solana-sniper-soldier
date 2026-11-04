@@ -73,8 +73,11 @@ Remaining, by dependency path — a fix needs a Solana 3.x / warp 0.4 migration:
   pools per day than Raydium CLMM) is in progress, paper only:
   `amm/pumpswap.rs` decodes `Pool` / pump-fees `FeeConfig` and quotes
   exact-in buys and sells, matching the official SDK's mainnet goldens (**U**).
-  Not wired into discovery or the paper engine yet; no swap instruction, no
-  dry-run, no live.
+  The paper engine runs on a PumpSwap pool with `--amm pumpswap` (pool, both
+  vaults, base mint and fee config read together and checked; price = reserve
+  ratio; liquidity = withdrawable SOL; fee = full LP + protocol + creator
+  rate; same token gates) (**U**). **—** not run on the VPS yet. Not wired into
+  discovery yet; no swap instruction, no dry-run, no live.
 - Paper simulation of failed exits / MEV beyond the labelled stress case.
 - Persistence of an open **paper** position across restarts.
 
