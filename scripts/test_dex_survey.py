@@ -72,6 +72,16 @@ class ListingTests(unittest.TestCase):
         self.assertTrue(ds.is_rate_limited(ValueError("HTTP Error 429")))
         self.assertFalse(ds.is_rate_limited(OSError("timed out")))
 
+    def test_due_lookups_are_bounded_and_backlog_expires(self):
+        m = 60_000
+        tracked = {f"P{i}": {"pool": f"P{i}", "dex": "d", "first_seen": t}
+                   for i, t in enumerate([0, 10 * m, 25 * m, 50 * m, 55 * m])}
+        due, expired = ds.pick_due(tracked, now=70 * m, check_ms=30 * m, limit=1)
+        self.assertEqual([p["pool"] for p in expired], ["P0"])  # waited 70 > 60 min
+        self.assertEqual([p["pool"] for p in due], ["P1"])      # oldest first, limit 1
+        due, _ = ds.pick_due(tracked, now=70 * m, check_ms=30 * m, limit=10)
+        self.assertEqual([p["pool"] for p in due], ["P1", "P2"])  # P3/P4 not due yet
+
     def test_sol_estimate(self):
         self.assertEqual(ds.sol_side_estimate(20000, 200), 50)
         self.assertIsNone(ds.sol_side_estimate(None, 200))
@@ -112,12 +122,13 @@ class SummaryTests(unittest.TestCase):
             {"kind": "new", "dex": "meteora", "sol_pair": False},
             {"kind": "checked", "dex": "pumpswap", "liquid": True, "verdict": "ok_token2022"},
             {"kind": "checked", "dex": "pumpswap", "liquid": False},
-            {"kind": "gap"}, {"kind": "gecko_error"},
+            {"kind": "gap"}, {"kind": "gecko_error"}, {"kind": "unchecked", "dex": "x"},
         ]
         out = ds.summarize(recs)
         row = next(l for l in out.splitlines() if l.startswith("pumpswap"))
         self.assertEqual(row.split()[1:], ["2", "2", "2", "1", "0", "1", "0", "0", "0"])
-        self.assertIn("listing gaps (pools may have been missed): 1; GeckoTerminal errors: 1", out)
+        self.assertIn("listing gaps (pools may have been missed): 1; GeckoTerminal errors: 1; "
+                      "pools never checked (rate limit backlog): 1", out)
         self.assertIn("NOT measured", out)
 
     def test_redact_hides_rpc_url_and_host(self):

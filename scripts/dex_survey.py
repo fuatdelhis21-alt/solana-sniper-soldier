@@ -41,12 +41,25 @@ T22_NAMES = {
 GECKO_NEW = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page={page}"
 GECKO_MULTI = "https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/{addrs}"
 MULTI_MAX = 30
+# At most this many multi-pool lookups per poll (bounded request rate).
+MULTI_PER_POLL = 2
 # Pause after a 429 before the next poll.
 RATE_LIMIT_BACKOFF_SECS = 120
 
 
 def is_rate_limited(err):
     return getattr(err, "code", None) == 429 or "429" in str(err)
+
+
+def pick_due(tracked, now, check_ms, limit):
+    """Pools to look up now (oldest first, at most `limit`) and pools that
+    waited more than twice the check delay (dropped, recorded "unchecked")
+    so a rate-limited run never builds an ever-growing backlog."""
+    ready = sorted((p for p in tracked.values() if now - p["first_seen"] >= check_ms),
+                   key=lambda p: p["first_seen"])
+    expired = [p for p in ready if now - p["first_seen"] > 2 * check_ms]
+    fresh = [p for p in ready if now - p["first_seen"] <= 2 * check_ms]
+    return fresh[:limit], expired
 
 
 def parse_time_ms(s):
@@ -257,8 +270,12 @@ def run(args):
             # Only a complete poll covers the window: after a partial one
             # the next complete poll checks for a gap since the last full.
             last_poll_ms = now
-        due = [p for p in tracked.values()
-               if now - p["first_seen"] >= args.check_after_min * 60_000]
+        due, expired = pick_due(tracked, now, args.check_after_min * 60_000,
+                                MULTI_MAX * MULTI_PER_POLL)
+        for p in expired:
+            tracked.pop(p["pool"], None)
+            append(args.out, {"kind": "unchecked", "t": now, "pool": p["pool"],
+                              "dex": p["dex"]})
         for i in range(0, len(due), MULTI_MAX):
             chunk = due[i:i + MULTI_MAX]
             try:
@@ -266,6 +283,10 @@ def run(args):
                     addrs=",".join(p["pool"] for p in chunk))))
             except (urllib.error.URLError, OSError, ValueError) as e:
                 append(args.out, {"kind": "gecko_error", "t": now, "err": str(e)[:120]})
+                if is_rate_limited(e):
+                    backoff = RATE_LIMIT_BACKOFF_SECS
+                    break
+                time.sleep(5)
                 continue
             by = {p["pool"]: p for p in fresh}
             for p in chunk:
@@ -290,7 +311,7 @@ def run(args):
 
 def summarize(lines):
     """Per-DEX table from the survey records (list of dicts)."""
-    stats, gaps, errors, start = {}, 0, 0, None
+    stats, gaps, errors, unchecked, start = {}, 0, 0, 0, None
     for r in lines:
         k = r.get("kind")
         if k == "start":
@@ -299,6 +320,8 @@ def summarize(lines):
             gaps += 1
         elif k == "gecko_error":
             errors += 1
+        elif k == "unchecked":
+            unchecked += 1
         elif k in ("new", "checked"):
             s = stats.setdefault(r.get("dex", "?"), {
                 "new": 0, "sol": 0, "checked": 0, "liquid": 0, "ok_classic": 0,
@@ -326,7 +349,8 @@ def summarize(lines):
         out.append(f"{dex:<22}{s['new']:>6}{s['sol']:>6}{s['checked']:>6}{s['liquid']:>8}"
                    f"{s['ok_classic']:>6}{s['ok_token2022']:>6}{s['authority']:>6}"
                    f"{s['bad_extension']:>6}{s['other']:>6}")
-    out.append(f"listing gaps (pools may have been missed): {gaps}; GeckoTerminal errors: {errors}")
+    out.append(f"listing gaps (pools may have been missed): {gaps}; GeckoTerminal errors: {errors}; "
+               f"pools never checked (rate limit backlog): {unchecked}")
     out.append("ok = classic SPL, ok22 = Token-2022 metadata-only, both with revoked "
                "authorities. Holder concentration is NOT measured here; the bot's "
                "top-20 > 70 % gate rejects more.")
