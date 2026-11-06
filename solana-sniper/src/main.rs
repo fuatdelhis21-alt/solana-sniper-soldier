@@ -497,8 +497,9 @@ fn resolve_pumpswap_market_data(
 
 /// Outcome of one PumpSwap dry-run measurement.
 enum PumpDryRun {
-    /// A risk rule rejected the pool (same gates as paper).
-    Rejected(&'static str),
+    /// A risk rule rejected the pool (same gates as paper), with a detail
+    /// for the log (e.g. the measured liquidity).
+    Rejected(&'static str, String),
     /// Both legs simulated: decision-record context.
     Measured(serde_json::Value),
 }
@@ -543,11 +544,20 @@ fn pumpswap_dry_run(
         ],
     ) {
         Ok(_) => {}
-        Err(PaperDataError::Rejected(r)) => return Ok(PumpDryRun::Rejected(r.code())),
+        Err(PaperDataError::Rejected(r)) => {
+            return Ok(PumpDryRun::Rejected(r.code(), String::new()))
+        }
         Err(PaperDataError::Unavailable(e)) => return Err(e),
     }
     if snap.real_quote < sol_to_lamports(args.min_liquidity_sol) {
-        return Ok(PumpDryRun::Rejected("insufficient_liquidity"));
+        return Ok(PumpDryRun::Rejected(
+            "insufficient_liquidity",
+            format!(
+                "withdrawable SOL {:.2} < {:.2}",
+                snap.real_quote as f64 / 1e9,
+                args.min_liquidity_sol
+            ),
+        ));
     }
     let gc_acc = rpc
         .get_account(&ix::global_config_address())
@@ -2730,10 +2740,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!(target: "dry_run", iteration = i + 1, measurement = %ctx, "[DRY-RUN] PumpSwap entry/exit simulated (nothing sent)");
                     rec.context = ctx;
                 }
-                Ok(PumpDryRun::Rejected(code)) => {
+                Ok(PumpDryRun::Rejected(code, detail)) => {
                     *rejected_by_reason.entry(code).or_insert(0) += 1;
-                    tracing::warn!(target: "dry_run", iteration = i + 1, reject_reason = code, "[DRY-RUN] PumpSwap pool rejected by a risk rule");
-                    rec.context = serde_json::json!({ "action": "rejected", "reject_reason": code, "simulated": true });
+                    tracing::warn!(target: "dry_run", iteration = i + 1, reject_reason = code, detail = %detail, "[DRY-RUN] PumpSwap pool rejected by a risk rule");
+                    rec.context = serde_json::json!({ "action": "rejected", "reject_reason": code, "detail": detail, "simulated": true });
                 }
                 Err(e) => {
                     tracing::error!(target: "dry_run", iteration = i + 1, error = %e, "[DRY-RUN] PumpSwap simulation failed (fail-closed)");
