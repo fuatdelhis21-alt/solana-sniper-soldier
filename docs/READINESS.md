@@ -85,8 +85,13 @@ Remaining, by dependency path — a fix needs a Solana 3.x / warp 0.4 migration:
   `--simulate-payer`, never sent): the SDK's `buy` / `sell` instructions
   (IDL account order, remaining accounts, discriminators checked against
   sha256) simulated for the entry and, as a real holder, the exit; model vs
-  simulated amounts and quote latency recorded (**U**). **—** not run on the
-  VPS yet. No live path.
+  simulated amounts and quote latency recorded (**U**). **O** 2026-11-06
+  mainnet dry-run on canonical pool `5Fhn…oy3` (0.01 SOL): buy 271 355 920
+  tokens model = simulated, 9 999 999 lamports spent (0 bps); sell as a
+  real holder 9 860 724 lamports model = simulated (0 bps); 116 559 / 85 919
+  CU; fee tier 70 bps. The paper fee + impact model is exact; the 50 bps
+  per-leg latency allowance (price drift, MEV) cannot be seen by a
+  simulation and stays an assumption. No live path.
 - Paper simulation of failed exits / MEV beyond the labelled stress case.
 - Persistence of an open **paper** position across restarts.
 
