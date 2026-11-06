@@ -81,8 +81,12 @@ Remaining, by dependency path — a fix needs a Solana 3.x / warp 0.4 migration:
   `SNIPER_DISCOVERY_AMM=pumpswap` with the GeckoTerminal source, paper only
   (**U**). **O** 2026-11-04 manual paper run on two live pools: all accounts
   read and verified; one rejected by the holder gate (top-20 76 %), one
-  rejected as a reversed (non-canonical) pool. No swap instruction, no
-  dry-run, no live.
+  rejected as a reversed (non-canonical) pool. Dry-run (simulation only,
+  `--simulate-payer`, never sent): the SDK's `buy` / `sell` instructions
+  (IDL account order, remaining accounts, discriminators checked against
+  sha256) simulated for the entry and, as a real holder, the exit; model vs
+  simulated amounts and quote latency recorded (**U**). **—** not run on the
+  VPS yet. No live path.
 - Paper simulation of failed exits / MEV beyond the labelled stress case.
 - Persistence of an open **paper** position across restarts.
 

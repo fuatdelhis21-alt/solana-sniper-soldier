@@ -465,6 +465,10 @@ pub struct PumpSnapshot {
     pub real_quote: u64,
     pub base_supply: u64,
     pub fees: Fees,
+    /// Owner of the base mint (classic SPL or Token-2022).
+    pub base_token_program: Pubkey,
+    /// Pool account size (pools below 300 bytes are extended before a trade).
+    pub pool_data_len: usize,
 }
 
 /// Only canonical pump.fun pools are traded: created by the pump program's
@@ -526,6 +530,8 @@ pub fn build_snapshot(
         real_quote,
         base_supply,
         fees,
+        base_token_program: *base_mint.0,
+        pool_data_len: pool.1.len(),
     })
 }
 

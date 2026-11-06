@@ -56,3 +56,6 @@ pub mod account_resolver;
 
 /// PumpSwap (pump.fun AMM) account decoding and quotes (paper only).
 pub mod pumpswap;
+
+/// PumpSwap buy/sell instructions for simulation (`--dry-run` only).
+pub mod pumpswap_ix;

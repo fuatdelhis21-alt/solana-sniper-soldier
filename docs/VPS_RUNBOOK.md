@@ -274,6 +274,27 @@ systemd-run --wait --pipe --collect \
   --output-mint <BASE_MINT> --iterations 12 --data-dir /tmp/pumpswap-paper
 ```
 
+PumpSwap dry-run (2026-11, simulation only — nothing is signed or sent; no
+key is loaded). Measures how far the paper quote model is from what the
+program delivers: the entry `buy` of the position size is simulated as
+`--simulate-payer` (a wallet address holding ≥ 0.03 SOL; only the address is used), the
+exit `sell` of the same amount as a real holder of the token. Competition
+for the block (MEV, other snipers) is not visible to a simulation.
+
+```bash
+systemd-run --wait --pipe --collect \
+  -p EnvironmentFile=/etc/solana-hft/solana-hft.env \
+  -p "UnsetEnvironment=SNIPER_DRY_RUN SNIPER_LIVE SNIPER_CONFIRM_LIVE SNIPER_PAPER SNIPER_SIMULATE_PAYER SNIPER_POOL_ID SNIPER_INPUT_MINT SNIPER_OUTPUT_MINT SNIPER_ITERATIONS SNIPER_DATA_DIR SNIPER_SINGLE_TRADE SNIPER_ENTRY_WINDOW_SECS SNIPER_AMM SNIPER_METRICS_ADDR" \
+  /opt/solana-hft/bin/solana-sniper --dry-run --amm pumpswap --live-risk-data \
+  --simulate-payer <FUNDED_WALLET_ADDRESS> \
+  --pool-id <PUMPSWAP_POOL> --input-mint So11111111111111111111111111111111111111112 \
+  --output-mint <BASE_MINT> --iterations 3 --data-dir /tmp/pumpswap-dry 2>&1 \
+  | grep -E 'DRY-RUN' | tail -5
+```
+
+`entry.deviation_bps` / `exit.deviation_bps` near 0 = the paper fee and
+impact model matches the program; `sim_ms` is the quote round trip.
+
 Report Token-2022 paper trades separately before drawing any conclusion: the
 pool's token program is part of the pool, not of the decision record, so
 compare by pool id against the discovery log.

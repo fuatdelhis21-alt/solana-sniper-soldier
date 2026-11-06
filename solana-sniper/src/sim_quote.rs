@@ -284,9 +284,89 @@ pub fn simulate_swap_output(
     })
 }
 
+/// Simulate `tx` and return the token amount of each of `accounts` in the
+/// simulated post-state (`None` for an account that does not exist there),
+/// with the compute units used. Never sent; fail-closed on any simulation
+/// error or undecodable account.
+pub fn simulate_token_accounts(
+    rpc: &RpcClient,
+    tx: &Transaction,
+    accounts: &[Pubkey],
+) -> Result<(Vec<Option<u64>>, Option<u64>), String> {
+    let cfg = RpcSimulateTransactionConfig {
+        sig_verify: false,
+        replace_recent_blockhash: true,
+        commitment: Some(CommitmentConfig::processed()),
+        accounts: Some(RpcSimulateTransactionAccountsConfig {
+            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+            addresses: accounts.iter().map(|a| a.to_string()).collect(),
+        }),
+        ..Default::default()
+    };
+    let resp = tokio::task::block_in_place(|| {
+        rpc.simulate_transaction_with_config(tx, cfg)
+            .map_err(|e| format!("simulation failed: {e}"))
+    })?;
+    let v = resp.value;
+    if let Some(err) = v.err {
+        let tail: Vec<String> = v
+            .logs
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .take(4)
+            .collect();
+        return Err(format!("simulation rejected: {err:?} {tail:?}"));
+    }
+    let states = v.accounts.ok_or("simulation returned no account states")?;
+    if states.len() != accounts.len() {
+        return Err("simulation returned the wrong number of account states".into());
+    }
+    let amounts = states
+        .into_iter()
+        .map(|st| match st {
+            None => Ok(None),
+            Some(a) => {
+                let data = a
+                    .data
+                    .decode()
+                    .or_else(|| match &a.data {
+                        solana_account_decoder::UiAccountData::Binary(s, _) => {
+                            base64::engine::general_purpose::STANDARD.decode(s).ok()
+                        }
+                        _ => None,
+                    })
+                    .ok_or("simulation returned undecodable account data")?;
+                token_amount(&data)
+                    .map(Some)
+                    .ok_or_else(|| "simulated account is not a token account".to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((amounts, v.units_consumed))
+}
+
+/// Signed difference `(actual - model) / model` in basis points (model 0
+/// gives `None`). Positive = the chain charged / delivered more than the
+/// model said.
+pub fn deviation_bps(model: u64, actual: u64) -> Option<i64> {
+    if model == 0 {
+        return None;
+    }
+    let d = (actual as i128 - model as i128) * 10_000 / model as i128;
+    i64::try_from(d).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deviation_is_signed_bps() {
+        assert_eq!(deviation_bps(10_000, 10_050), Some(50));
+        assert_eq!(deviation_bps(10_000, 9_900), Some(-100));
+        assert_eq!(deviation_bps(0, 5), None);
+    }
 
     #[test]
     fn min_out_is_integer_and_never_zero() {
