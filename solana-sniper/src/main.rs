@@ -352,8 +352,14 @@ fn paper_token_gates(
     // 4) Mint/freeze authority rug-check — same as live: a present mint or
     //    freeze authority rejects the trade (fail-closed).
     //    Token-2022 metadata-only mints only with --paper-token-2022.
-    let token_policy = token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)
-        .map_err(PaperDataError::Unavailable)?;
+    let token_policy = token_policy(
+        args.paper_token_2022,
+        args.paper,
+        args.live,
+        args.dry_run,
+        args.amm,
+    )
+    .map_err(PaperDataError::Unavailable)?;
     for mint in [input_mint, output_mint] {
         match onchain_risk::fetch_mint_authority_risk_cached(rpc_client, &mint, token_policy) {
             Ok(risk_info) if risk_info.is_risky() => {
@@ -487,6 +493,204 @@ fn resolve_pumpswap_market_data(
         input_is_token0: false,
         trade_fee_ppm: fee_bps.saturating_mul(100),
     })
+}
+
+/// Outcome of one PumpSwap dry-run measurement.
+enum PumpDryRun {
+    /// A risk rule rejected the pool (same gates as paper).
+    Rejected(&'static str),
+    /// Both legs simulated: decision-record context.
+    Measured(serde_json::Value),
+}
+
+/// PumpSwap dry-run (simulation only — nothing is signed or sent): the
+/// paper data and token gates, then the entry `buy` of the position size
+/// simulated as `payer`, and the exit `sell` of the same token amount
+/// simulated as a real holder of the token. Both simulated amounts are
+/// compared with the integer quote model the paper engine prices with, and
+/// each simulation's round-trip time is recorded. This measures the fee /
+/// impact model and the quote latency; competition for the same block (MEV,
+/// other snipers) is invisible to a simulation and stays an assumption.
+fn pumpswap_dry_run(
+    args: &Args,
+    rpc: &Arc<RpcClient>,
+    metrics_registry: &metrics::Metrics,
+    payer: &Pubkey,
+    position: u64,
+) -> Result<PumpDryRun, String> {
+    use amm::pumpswap_ix as ix;
+    let parse = |v: Option<&str>, what: &str| {
+        v.ok_or(format!("--{what} is required"))
+            .and_then(|s| Pubkey::from_str(s).map_err(|e| format!("invalid --{what}: {e}")))
+    };
+    let pool_id = parse(args.pool_id.as_deref(), "pool-id")?;
+    let input_mint = parse(args.input_mint.as_deref(), "input-mint")?;
+    let output_mint = parse(args.output_mint.as_deref(), "output-mint")?;
+    let snap = amm::pumpswap::fetch_snapshot(rpc, &pool_id)?;
+    if input_mint != snap.pool.quote_mint || output_mint != snap.pool.base_mint {
+        return Err(
+            "--input-mint must be the pool's wSOL quote and --output-mint its base mint".into(),
+        );
+    }
+    match paper_token_gates(
+        args,
+        rpc,
+        input_mint,
+        output_mint,
+        &[
+            snap.pool.pool_base_token_account,
+            snap.pool.pool_quote_token_account,
+        ],
+    ) {
+        Ok(_) => {}
+        Err(PaperDataError::Rejected(r)) => return Ok(PumpDryRun::Rejected(r.code())),
+        Err(PaperDataError::Unavailable(e)) => return Err(e),
+    }
+    if snap.real_quote < sol_to_lamports(args.min_liquidity_sol) {
+        return Ok(PumpDryRun::Rejected("insufficient_liquidity"));
+    }
+    let gc_acc = rpc
+        .get_account(&ix::global_config_address())
+        .map_err(|e| format!("failed to fetch PumpSwap GlobalConfig: {e}"))?;
+    let gc = ix::parse_global_config(&gc_acc.owner, &gc_acc.data)?;
+
+    // Entry: model quote, then the same buy simulated on-chain.
+    let model_base = amm::pumpswap::buy_exact_quote_in(
+        position,
+        snap.base_reserve,
+        snap.effective_quote,
+        snap.fees,
+    )?;
+    let max_in = position.saturating_add(position.saturating_mul(args.max_slippage_bps) / 10_000);
+    let spl = Pubkey::from_str(ix::SPL_TOKEN_PROGRAM).unwrap();
+    let wsol = snap.pool.quote_mint;
+    let payer_wsol = ix::ata(payer, &wsol, &spl);
+    let payer_base = ix::ata(payer, &snap.pool.base_mint, &snap.base_token_program);
+    let pre_wsol = position::fetch_token_balance(rpc, &payer_wsol)?;
+    let pre_base = position::fetch_token_balance(rpc, &payer_base)?;
+    let buy = ix::swap_instructions(
+        &pool_id,
+        snap.pool_data_len,
+        &snap.pool,
+        &gc,
+        payer,
+        &snap.base_token_program,
+        ix::Side::Buy {
+            base_out: model_base,
+            max_quote_in: max_in,
+        },
+    )?;
+    let t = std::time::Instant::now();
+    let (post, buy_cu) = sim_quote::simulate_token_accounts(
+        rpc,
+        &Transaction::new_with_payer(&buy, Some(payer)),
+        &[payer_wsol, payer_base],
+    )
+    .map_err(|e| format!("entry buy {e}"))?;
+    let buy_ms = t.elapsed().as_secs_f64() * 1000.0;
+    metrics::observe_stage(metrics_registry, metrics::Stage::QuoteSim, buy_ms);
+    let spent = (pre_wsol as u128 + max_in as u128)
+        .checked_sub(post[0].unwrap_or(0) as u128)
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or("entry simulation: wSOL balance rose")?;
+    let got = post[1]
+        .unwrap_or(0)
+        .checked_sub(pre_base)
+        .filter(|v| *v > 0)
+        .ok_or("entry simulation delivered no tokens")?;
+
+    // Exit: the same token amount sold by a real holder of the token.
+    let largest = rpc
+        .get_token_largest_accounts(&snap.pool.base_mint)
+        .map_err(|e| format!("failed to fetch largest accounts: {e}"))?;
+    let addrs: Vec<Pubkey> = largest
+        .iter()
+        .filter_map(|a| Pubkey::from_str(&a.address).ok())
+        .collect();
+    let accs = solana_sniper::rpc_util::get_multiple_accounts_adaptive(rpc, &addrs)?;
+    let pairs: Vec<(Pubkey, Option<Vec<u8>>)> = addrs
+        .into_iter()
+        .zip(accs)
+        .map(|(a, acc)| (a, acc.map(|x| x.data)))
+        .collect();
+    let exit = match ix::pick_holder(
+        &snap.pool.base_mint,
+        &snap.base_token_program,
+        &pairs,
+        model_base,
+    ) {
+        None => {
+            serde_json::json!({ "simulated": false, "reason": "no wallet holds the position size" })
+        }
+        Some(holder) => {
+            let model_out = amm::pumpswap::sell_exact_base_in(
+                model_base,
+                snap.base_reserve,
+                snap.quote_vault,
+                snap.pool.virtual_quote_reserves,
+                snap.pool
+                    .protocol_fees
+                    .saturating_add(snap.pool.creator_fees),
+                snap.fees,
+            )?;
+            let holder_wsol = ix::ata(&holder, &wsol, &spl);
+            let pre = position::fetch_token_balance(rpc, &holder_wsol)?;
+            let sell = ix::swap_instructions(
+                &pool_id,
+                snap.pool_data_len,
+                &snap.pool,
+                &gc,
+                &holder,
+                &snap.base_token_program,
+                ix::Side::Sell {
+                    base_in: model_base,
+                    min_quote_out: 1,
+                },
+            )?;
+            let t = std::time::Instant::now();
+            let sim = sim_quote::simulate_token_accounts(
+                rpc,
+                &Transaction::new_with_payer(&sell, Some(&holder)),
+                &[holder_wsol],
+            );
+            let sell_ms = t.elapsed().as_secs_f64() * 1000.0;
+            metrics::observe_stage(metrics_registry, metrics::Stage::Exit, sell_ms);
+            match sim {
+                Ok((post, cu)) => {
+                    let received = post[0].unwrap_or(0).saturating_sub(pre);
+                    serde_json::json!({
+                        "simulated": true,
+                        "holder": holder.to_string(),
+                        "model_quote_out": model_out,
+                        "simulated_quote_out": received,
+                        "deviation_bps": sim_quote::deviation_bps(model_out, received),
+                        "compute_units": cu,
+                        "sim_ms": sell_ms as u64,
+                    })
+                }
+                Err(e) => {
+                    serde_json::json!({ "simulated": false, "holder": holder.to_string(), "error": e })
+                }
+            }
+        }
+    };
+    Ok(PumpDryRun::Measured(serde_json::json!({
+        "action": "pumpswap_dry_run",
+        "simulated": true,
+        "fee_bps": snap.fees.lp_bps + snap.fees.protocol_bps + snap.fees.creator_bps,
+        "liquidity_lamports": snap.real_quote,
+        "entry": {
+            "position_lamports": position,
+            "model_base_out": model_base,
+            "simulated_base_out": got,
+            "simulated_quote_spent": spent,
+            "deviation_bps": sim_quote::deviation_bps(position, spent),
+            "compute_units": buy_cu,
+            "sim_ms": buy_ms as u64,
+        },
+        "exit": exit,
+        "latency_ms": { "quote_sim": buy_ms as u64 },
+    })))
 }
 
 /// AŞAMA 2 — fetch real market data for a paper iteration. Fail-closed: a
@@ -974,12 +1178,29 @@ enum AmmKind {
     Pumpswap,
 }
 
-/// `--amm pumpswap` is accepted only in paper mode (no swap transaction,
-/// exact-quote simulation or exit path exists for it), and only with the
-/// wSOL input / pool base-mint output orientation.
-fn validate_amm(amm: AmmKind, paper: bool, live: bool, dry_run: bool) -> Result<(), String> {
-    if amm == AmmKind::Pumpswap && (!paper || live || dry_run) {
-        return Err("--amm pumpswap (SNIPER_AMM) is only allowed with --paper".to_string());
+/// `--amm pumpswap` is accepted in paper mode and in dry-run (simulation
+/// only, with `--simulate-payer`), never with --live: no PumpSwap live
+/// path exists. The input must be the pool's wSOL and the output its base.
+fn validate_amm(
+    amm: AmmKind,
+    paper: bool,
+    live: bool,
+    dry_run: bool,
+    simulate_payer: bool,
+) -> Result<(), String> {
+    if amm != AmmKind::Pumpswap {
+        return Ok(());
+    }
+    if live || !(paper || dry_run) {
+        return Err(
+            "--amm pumpswap (SNIPER_AMM) is only allowed with --paper or --dry-run".to_string(),
+        );
+    }
+    if dry_run && !simulate_payer {
+        return Err(
+            "--amm pumpswap --dry-run needs --simulate-payer (a funded wallet address; no key is loaded)"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -1166,13 +1387,17 @@ fn token_policy(
     paper: bool,
     live: bool,
     dry_run: bool,
+    amm: AmmKind,
 ) -> Result<onchain_risk::TokenPolicy, String> {
     if !paper_token_2022 {
         return Ok(onchain_risk::TokenPolicy::ClassicOnly);
     }
-    if !paper || live || dry_run {
+    // Paper, or a PumpSwap dry-run (simulation only: there is no PumpSwap
+    // live path, and `validate_amm` refuses PumpSwap with --live). Never live.
+    let simulation_only = paper || (dry_run && amm == AmmKind::Pumpswap);
+    if live || !simulation_only {
         return Err(
-            "--paper-token-2022 (SNIPER_PAPER_TOKEN_2022) is only allowed with --paper".to_string(),
+            "--paper-token-2022 (SNIPER_PAPER_TOKEN_2022) is only allowed with --paper or a PumpSwap --dry-run".to_string(),
         );
     }
     Ok(onchain_risk::TokenPolicy::PaperToken2022)
@@ -2038,8 +2263,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // AŞAMA 2 — paper mode now trades on REAL on-chain market data, which
     // requires the same pool/mint arguments as live. Fail-closed: without
     // them paper refuses to start (no synthetic paper pools anymore).
-    token_policy(args.paper_token_2022, args.paper, args.live, args.dry_run)?;
-    validate_amm(args.amm, args.paper, args.live, args.dry_run)?;
+    token_policy(
+        args.paper_token_2022,
+        args.paper,
+        args.live,
+        args.dry_run,
+        args.amm,
+    )?;
+    validate_amm(
+        args.amm,
+        args.paper,
+        args.live,
+        args.dry_run,
+        args.simulate_payer.is_some(),
+    )?;
     if args.paper {
         validate_paper_args(
             args.pool_id.as_deref(),
@@ -2474,6 +2711,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[CRITICAL] Risk check failed: {}. Stopping.", e);
                 break;
             }
+            sleep(loop_interval).await;
+            continue;
+        }
+
+        if args.dry_run && args.amm == AmmKind::Pumpswap {
+            // PumpSwap dry-run: measurement by simulation only (see
+            // `pumpswap_dry_run`). No transaction is signed or sent.
+            let payer = simulate_payer.expect("validated: PumpSwap dry-run needs --simulate-payer");
+            let mut rec = decision::DecisionRecord::new("simple_snipe", "dry_run");
+            rec.mode = "dry_run".to_string();
+            rec.pool_id = args.pool_id.clone().unwrap_or_default();
+            rec.token_in = args.input_mint.clone().unwrap_or_default();
+            rec.token_out = args.output_mint.clone().unwrap_or_default();
+            let position = sol_to_lamports(args.max_spend_sol);
+            match pumpswap_dry_run(&args, &rpc_client, &metrics_registry, &payer, position) {
+                Ok(PumpDryRun::Measured(ctx)) => {
+                    tracing::info!(target: "dry_run", iteration = i + 1, measurement = %ctx, "[DRY-RUN] PumpSwap entry/exit simulated (nothing sent)");
+                    rec.context = ctx;
+                }
+                Ok(PumpDryRun::Rejected(code)) => {
+                    *rejected_by_reason.entry(code).or_insert(0) += 1;
+                    tracing::warn!(target: "dry_run", iteration = i + 1, reject_reason = code, "[DRY-RUN] PumpSwap pool rejected by a risk rule");
+                    rec.context = serde_json::json!({ "action": "rejected", "reject_reason": code, "simulated": true });
+                }
+                Err(e) => {
+                    tracing::error!(target: "dry_run", iteration = i + 1, error = %e, "[DRY-RUN] PumpSwap simulation failed (fail-closed)");
+                    rec.context = serde_json::json!({ "action": "data_error", "error": e, "simulated": true });
+                }
+            }
+            rec.save(&args.data_dir)?;
+            total_latency_ms =
+                total_latency_ms.saturating_add(iteration_start.elapsed().as_millis());
             sleep(loop_interval).await;
             continue;
         }
@@ -3905,42 +4174,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pumpswap_is_paper_only() {
-        // (amm, paper, live, dry_run)
-        assert!(validate_amm(AmmKind::Clmm, false, true, false).is_ok());
-        assert!(validate_amm(AmmKind::Pumpswap, true, false, false).is_ok());
+    fn pumpswap_is_paper_or_simulated_dry_run_only() {
+        use AmmKind::*;
+        // (amm, paper, live, dry_run, simulate_payer)
+        assert!(validate_amm(Clmm, false, true, false, false).is_ok());
+        assert!(validate_amm(Pumpswap, true, false, false, false).is_ok());
+        assert!(validate_amm(Pumpswap, false, false, true, true).is_ok());
+        assert!(
+            validate_amm(Pumpswap, false, false, true, false).is_err(),
+            "dry-run needs a simulation payer (no key is loaded)"
+        );
         for (paper, live, dry_run) in [
             (false, true, false),
-            (false, false, true),
             (false, false, false),
             (true, true, false),
-            (true, false, true),
+            (false, true, true),
         ] {
-            assert!(validate_amm(AmmKind::Pumpswap, paper, live, dry_run).is_err());
+            assert!(validate_amm(Pumpswap, paper, live, dry_run, true).is_err());
         }
         let a = Args::try_parse_from(["solana-sniper", "--amm", "pumpswap"]).unwrap();
-        assert_eq!(a.amm, AmmKind::Pumpswap);
+        assert_eq!(a.amm, Pumpswap);
         let a = Args::try_parse_from(["solana-sniper"]).unwrap();
-        assert_eq!(a.amm, AmmKind::Clmm, "default stays CLMM");
+        assert_eq!(a.amm, Clmm, "default stays CLMM");
     }
 
     #[test]
     fn token_2022_is_paper_only_and_off_by_default() {
         use onchain_risk::TokenPolicy::*;
-        // (flag, paper, live, dry_run)
-        assert_eq!(token_policy(false, true, false, false), Ok(ClassicOnly));
-        assert_eq!(token_policy(false, false, true, false), Ok(ClassicOnly));
-        assert_eq!(token_policy(true, true, false, false), Ok(PaperToken2022));
-        for (paper, live, dry_run) in [
-            (false, true, false),
-            (false, false, true),
-            (false, false, false),
-            (true, true, false),
-            (true, false, true),
+        use AmmKind::*;
+        // (flag, paper, live, dry_run, amm)
+        assert_eq!(
+            token_policy(false, true, false, false, Clmm),
+            Ok(ClassicOnly)
+        );
+        assert_eq!(
+            token_policy(false, false, true, false, Clmm),
+            Ok(ClassicOnly)
+        );
+        assert_eq!(
+            token_policy(true, true, false, false, Clmm),
+            Ok(PaperToken2022)
+        );
+        // A PumpSwap dry-run (simulation only) may, a CLMM dry-run may not.
+        assert_eq!(
+            token_policy(true, false, false, true, Pumpswap),
+            Ok(PaperToken2022)
+        );
+        for (paper, live, dry_run, amm) in [
+            (false, true, false, Clmm),
+            (false, true, false, Pumpswap),
+            (false, false, true, Clmm),
+            (false, false, false, Clmm),
+            (true, true, false, Clmm),
+            (false, true, true, Pumpswap),
         ] {
             assert!(
-                token_policy(true, paper, live, dry_run).is_err(),
-                "{paper} {live} {dry_run}"
+                token_policy(true, paper, live, dry_run, amm).is_err(),
+                "{paper} {live} {dry_run} {amm:?}"
             );
         }
     }
