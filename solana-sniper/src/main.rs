@@ -419,6 +419,16 @@ fn paper_token_gates(
                     risk::RejectReason::HolderConcentrationExceeded,
                 ));
             }
+            onchain_risk::HolderVerdict::IdenticalBalances(n) => {
+                tracing::warn!(
+                    target: "paper",
+                    mint = %output_mint,
+                    identical_holders = n,
+                    threshold = onchain_risk::MAX_IDENTICAL_HOLDERS,
+                    "holder gate: many top holders with the very same balance (split supply)"
+                );
+                return Err(PaperDataError::Rejected(risk::RejectReason::SybilHolders));
+            }
             onchain_risk::HolderVerdict::Unassessable => {
                 tracing::warn!(
                     target: "paper",
@@ -3338,10 +3348,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 verdict = ?verdict,
                                 "holder concentration gate rejected candidate (fail-closed)"
                             );
+                            let reason = match verdict {
+                                onchain_risk::HolderVerdict::IdenticalBalances(_) => {
+                                    risk::RejectReason::SybilHolders
+                                }
+                                _ => risk::RejectReason::HolderConcentrationExceeded,
+                            };
                             metrics::record_trade_rejected(
                                 &metrics_registry,
                                 mode_label,
-                                risk::RejectReason::HolderConcentrationExceeded.code(),
+                                reason.code(),
                             );
                             sleep(loop_interval).await;
                             continue;

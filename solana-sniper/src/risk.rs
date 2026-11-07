@@ -36,6 +36,8 @@ pub enum RejectReason {
     ExposureCapExceeded,
     UnverifiableRestartState,
     ClockSkew,
+    /// Many sampled holders with exactly the same balance (split supply).
+    SybilHolders,
 }
 
 impl RejectReason {
@@ -59,6 +61,7 @@ impl RejectReason {
             RejectReason::ExposureCapExceeded => "exposure_cap_exceeded",
             RejectReason::UnverifiableRestartState => "unverifiable_restart_state",
             RejectReason::ClockSkew => "clock_skew",
+            RejectReason::SybilHolders => "sybil_holders",
         }
     }
 }
@@ -827,6 +830,7 @@ mod tests {
             Err(RejectReason::StalePrice)
         );
         assert_eq!(RejectReason::ClockSkew.code(), "clock_skew");
+        assert_eq!(RejectReason::SybilHolders.code(), "sybil_holders");
     }
 
     #[test]
