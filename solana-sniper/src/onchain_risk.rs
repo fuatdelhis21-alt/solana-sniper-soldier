@@ -40,6 +40,12 @@ pub struct HolderStats {
     /// Percentage (0-100) of supply in sampled accounts that were excluded
     /// as program-controlled (PDA owner). Reported for operator visibility.
     pub program_owned_pct: f64,
+    /// Size of the largest group of counted (non-excluded) sampled accounts
+    /// holding exactly the same raw amount. Organic holders practically
+    /// never match to the last unit; many identical balances mean one owner
+    /// split the supply across wallets to look distributed (see
+    /// [`MAX_IDENTICAL_HOLDERS`]).
+    pub max_identical_holders: u64,
 }
 
 /// Holder-concentration thresholds (operator-approved design):
@@ -50,6 +56,12 @@ pub struct HolderStats {
 /// - single largest holder (post-exclusion) > 30% of supply → reject.
 /// - combined top-20 holders (post-exclusion) > 70% of supply → reject.
 pub const MAX_SINGLE_HOLDER_PCT: f64 = 30.0;
+/// Reject when this many (or more) of the sampled top holders hold the very
+/// same raw amount. Observed 2026-11-06 (PumpSwap pool FudwRS…, token
+/// ZajZXL…pump): ~2 000 wallets held exactly 478 536 tokens each, so the
+/// top-20 showed ~1 % of supply; 5 s after the paper entry they were swept
+/// into one wallet (98 % of supply) and sold, draining 936 of 941 SOL.
+pub const MAX_IDENTICAL_HOLDERS: u64 = 5;
 pub const MAX_TOP20_HOLDER_PCT: f64 = 70.0;
 /// SPL JSON-RPC cap on `getTokenLargestAccounts` results.
 pub const LARGEST_ACCOUNTS_CAP: usize = 20;
@@ -63,6 +75,9 @@ pub enum HolderVerdict {
     SingleHolderConcentrated(f64),
     /// Combined top-20 (post-exclusion) holds more than 70% of supply.
     TopHoldersConcentrated(f64),
+    /// At least [`MAX_IDENTICAL_HOLDERS`] sampled holders hold exactly the
+    /// same amount: a split (sybil) distribution hiding one owner.
+    IdenticalBalances(u64),
     /// No measurable non-excluded holder accounts — the gate cannot be
     /// assessed, so it fails closed (a reject, never a silent pass).
     Unassessable,
@@ -73,6 +88,9 @@ pub enum HolderVerdict {
 pub fn holder_concentration_verdict(stats: &HolderStats) -> HolderVerdict {
     if stats.sampled_holders == 0 || stats.total_supply == 0 {
         return HolderVerdict::Unassessable;
+    }
+    if stats.max_identical_holders >= MAX_IDENTICAL_HOLDERS {
+        return HolderVerdict::IdenticalBalances(stats.max_identical_holders);
     }
     if stats.top_holder_pct > MAX_SINGLE_HOLDER_PCT {
         return HolderVerdict::SingleHolderConcentrated(stats.top_holder_pct);
@@ -314,6 +332,7 @@ fn compute_holder_stats(
     let mut top_amount: u64 = 0;
     let mut combined_amount: u64 = 0;
     let mut program_amount: u64 = 0;
+    let mut same_amount: std::collections::HashMap<u64, u64> = Default::default();
     for (address, amount) in entries {
         let owner_pubkey = Pubkey::from_str(address)
             .map_err(|e| format!("invalid token account address {address}: {e}"))?;
@@ -325,6 +344,9 @@ fn compute_holder_stats(
             continue;
         }
         sampled_holders += 1;
+        if *amount > 0 {
+            *same_amount.entry(*amount).or_insert(0) += 1;
+        }
         combined_amount = combined_amount.saturating_add(*amount);
         if *amount > top_amount {
             top_amount = *amount;
@@ -342,6 +364,7 @@ fn compute_holder_stats(
         top20_holder_pct,
         total_supply,
         program_owned_pct: pct(program_amount),
+        max_identical_holders: same_amount.values().copied().max().unwrap_or(0),
     })
 }
 
@@ -727,10 +750,11 @@ fn holder_stats_excludes_pool_vaults_before_concentration() {
 
 #[test]
 fn concentration_gate_accepts_under_both_thresholds() {
-    // 10 holders of 1% each => single 1%, top-20 10%: passes.
+    // 10 holders of ~1% each (distinct amounts 0.6%..1.5%, 10.5% combined):
+    // passes. Distinct, since identical balances are the sybil gate's case.
     let mut es = Vec::new();
     for i in 1..=10u8 {
-        es.push(entry(i, 10));
+        es.push(entry(i, 5 + i as u64));
     }
     let stats = compute_holder_stats(1_000, &es, &[], &[]).unwrap();
     assert_eq!(holder_concentration_verdict(&stats), HolderVerdict::Ok);
@@ -755,10 +779,11 @@ fn concentration_gate_rejects_single_holder_over_30pct() {
 
 #[test]
 fn concentration_gate_rejects_top20_over_70pct_even_if_single_under_30() {
-    // 19 holders at 4% each = 76% combined, single 4%: top-20 breach.
+    // 19 holders at ~4% each (distinct 3.1%..4.9%) = 76% combined, single
+    // 4.9%: top-20 breach.
     let mut es = Vec::new();
     for i in 1..=19u8 {
-        es.push(entry(i, 40));
+        es.push(entry(i, 30 + i as u64));
     }
     let stats = compute_holder_stats(1_000, &es, &[], &[]).unwrap();
     assert_eq!(stats.sampled_holders, 19);
@@ -805,6 +830,7 @@ fn concentration_gate_unassessable_fails_closed() {
         top20_holder_pct: 5.0,
         total_supply: 0,
         program_owned_pct: 0.0,
+        max_identical_holders: 0,
     };
     assert_eq!(
         holder_concentration_verdict(&stats),
@@ -1111,5 +1137,49 @@ fn holder_errors_are_backed_off_then_retried() {
         recent_holder_error(&errors, &Pubkey::new_unique(), t0),
         None,
         "per mint"
+    );
+}
+
+#[test]
+fn identical_balances_reveal_a_split_supply() {
+    // The 2026-11-06 rug: every sampled holder had exactly 478 536 tokens
+    // (6 decimals), ~1 % of supply in the top-20 — under both thresholds.
+    let supply = 999_655_783_471_697u64;
+    let sybil: Vec<(String, u64)> = (0..20)
+        .map(|_| (Pubkey::new_unique().to_string(), 478_536_000_000))
+        .collect();
+    let stats = compute_holder_stats(supply, &sybil, &[], &[]).unwrap();
+    assert!(stats.top20_holder_pct < 2.0 && stats.top_holder_pct < 1.0);
+    assert_eq!(stats.max_identical_holders, 20);
+    assert_eq!(
+        holder_concentration_verdict(&stats),
+        HolderVerdict::IdenticalBalances(20)
+    );
+
+    // Organic spread: distinct amounts pass; 4 equal ones are tolerated,
+    // the 5th rejects. Excluded vaults never count.
+    let mut organic: Vec<(String, u64)> = (1..=20u64)
+        .map(|i| (Pubkey::new_unique().to_string(), 1_000_000 * i + i))
+        .collect();
+    let s = compute_holder_stats(supply, &organic, &[], &[]).unwrap();
+    assert_eq!(s.max_identical_holders, 1);
+    assert_eq!(holder_concentration_verdict(&s), HolderVerdict::Ok);
+    for e in organic.iter_mut().take(4) {
+        e.1 = 777;
+    }
+    let s = compute_holder_stats(supply, &organic, &[], &[]).unwrap();
+    assert_eq!(holder_concentration_verdict(&s), HolderVerdict::Ok);
+    let vault = Pubkey::new_unique();
+    organic[4] = (vault.to_string(), 777);
+    let s = compute_holder_stats(supply, &organic, &[vault], &[]).unwrap();
+    assert_eq!(
+        s.max_identical_holders, 4,
+        "an excluded vault is not a holder"
+    );
+    organic[5].1 = 777;
+    let s = compute_holder_stats(supply, &organic, &[vault], &[]).unwrap();
+    assert_eq!(
+        holder_concentration_verdict(&s),
+        HolderVerdict::IdenticalBalances(5)
     );
 }
