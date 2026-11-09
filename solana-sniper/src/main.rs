@@ -950,6 +950,14 @@ struct Args {
     #[arg(long, env = "SNIPER_LOOP_INTERVAL_MS", default_value_t = 200)]
     loop_interval_ms: u64,
 
+    /// Pause between iterations while a position (paper or live) is open,
+    /// in milliseconds (minimum 200, never longer than the loop interval).
+    /// Stops and targets are checked once per iteration, so a long interval
+    /// lets the price gap far past the stop (2026-11 paper: -5 % stops
+    /// filled at -16 % and -23 % with a 5 s interval).
+    #[arg(long, env = "SNIPER_POSITION_POLL_MS", default_value_t = 1000)]
+    position_poll_ms: u64,
+
     /// Optional blockhash (base58) to use for dry-run. When set, dry-run does
     /// not contact the RPC for a blockhash (deterministic / offline smoke tests).
     #[arg(long)]
@@ -1542,6 +1550,12 @@ fn entry_window_expired(elapsed_secs: u64, window_secs: u64, position_open: bool
 
 fn native_mint() -> Pubkey {
     Pubkey::from_str(amm::raydium_v4::NATIVE_MINT).expect("valid native mint")
+}
+
+/// Iteration pause while a position is open: `position_poll_ms`, at least
+/// 200 ms and never longer than the normal loop interval.
+fn position_poll_interval(position_poll_ms: u64, base: Duration) -> Duration {
+    Duration::from_millis(position_poll_ms.max(200)).min(base)
 }
 
 /// Upper bound for the escalated exit slippage (5%).
@@ -2501,7 +2515,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pause between iterations (and after every rejected/failed one). Each
     // iteration makes several RPC calls, so raise this on rate-limited RPC
     // plans (public mainnet RPC answers 429 at the 200 ms default).
-    let loop_interval = Duration::from_millis(args.loop_interval_ms.max(50));
+    let base_loop_interval = Duration::from_millis(args.loop_interval_ms.max(50));
+    let position_poll = position_poll_interval(args.position_poll_ms, base_loop_interval);
     // Jito: a bundle only lands with a tip transfer to one of the Block
     // Engine's tip accounts inside the transaction itself (signed with it).
     // Read the accounts live at startup; refuse to run LIVE through Jito
@@ -2560,6 +2575,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_start = std::time::Instant::now();
     let mut single_trade_done = false;
     'main_loop: for i in 0..max_iterations {
+        // Faster polling while a position is open (exits checked sooner).
+        let mut loop_interval = if paper_sim.has_open_position() || live_position.is_some() {
+            position_poll
+        } else {
+            base_loop_interval
+        };
         metrics_registry.heartbeat();
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -3038,6 +3059,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // real gates; no unconditional counting).
                     let entry_sqrt = snapshot.current_sqrt_price;
                     paper_sim.confirm_entry(entry_sqrt, signal.clone());
+                    loop_interval = position_poll;
                     total_trades += 1;
                     successful_trades += 1;
                     metrics::record_trade_executed(&metrics_registry, "paper");
@@ -4028,6 +4050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tracing::warn!(mode = mode_target, error = %e, "pending entry not cleared (harmless: the position record exists)");
                             }
                             live_position = Some(pos);
+                            loop_interval = position_poll;
                             metrics::record_trade_executed(&metrics_registry, mode_label);
                             metrics::record_trade(
                                 &metrics_registry,
@@ -4198,6 +4221,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_poll_is_bounded() {
+        let base = Duration::from_millis(5_000);
+        assert_eq!(
+            position_poll_interval(1_000, base),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            position_poll_interval(10, base),
+            Duration::from_millis(200),
+            "floor"
+        );
+        assert_eq!(
+            position_poll_interval(9_000, base),
+            base,
+            "never slower than the loop"
+        );
+        let a = Args::try_parse_from(["solana-sniper"]).unwrap();
+        assert_eq!(a.position_poll_ms, 1_000);
+    }
 
     #[test]
     fn pumpswap_is_paper_or_simulated_dry_run_only() {
