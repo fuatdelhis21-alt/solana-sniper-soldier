@@ -1,8 +1,34 @@
 # Readiness — evidence-based status
 
-Verdict: **PAPER-TRADING READY — NOT LIVE-READY.** Nothing here claims
-profitability. The live decision is the operator's; nothing in this
-repository switches to live by itself.
+Verdict: **STOPPED (2026-11-15) — the strategy did not cover its costs in
+paper. NOT LIVE-READY.** Nothing here claims profitability. The live
+decision is the operator's; nothing in this repository switches to live by
+itself.
+
+## Outcome (2026-11-15): stopped by the operator
+
+Three PumpSwap paper samples, each collected without changes during it,
+all ended negative after costs (estimates: spot fills plus the modelled
+fees, impact, latency allowance and network fees):
+
+| Sample (UTC) | Rules in force | Closed | Win rate | Net | Profit factor | Stress (exits 200 bps worse) |
+|---|---|---|---|---|---|---|
+| 11-04 08:20 → 11-07 | holder 30/70 gates | 28 | 68 % | −0.0033 SOL | 0.79 | −0.0089 SOL |
+| 11-07 08:34 → 11-09 | + `sybil_holders` | 13 | 54 % | −0.0022 SOL | 0.74 | −0.0048 SOL |
+| 11-09 06:47 → 11-15 | + 1 s exit polling | 38 | 53 % | −0.0031 SOL | 0.84 | −0.0107 SOL |
+
+In the last sample the gross move averaged about +2.6 % per trade against
+about 3.4 % of costs per round trip (2 × 1.25 % PumpSwap fees on new pools,
+2 × 0.5 % latency allowance, network fees); even with no slippage at all
+the fees alone leave roughly nothing. The signal confidence score showed no
+consistent ordering across samples. The software side held up: no data
+errors, no quota stops, the dry-run matched the program's amounts to
+0 bps, and the sybil gate rejected 1 420 split-supply attempts in the last
+sample. The operator stopped the services; nothing traded live at any time.
+
+Re-opening this needs a new, written-down hypothesis that lowers the cost
+structure (not a parameter tweak on these samples), a fixed success and
+stop rule, and a fresh paper sample.
 
 Evidence kinds: **U** unit test (offline, runs in CI) · **L** local
 integration (run in the dev container, no network) · **O** operator/VPS
